@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 -define(SHARED_SUB_SHARD, emqx_shared_sub_shard).
 -define(CM_SHARD, emqx_cm_shard).
 -define(ROUTE_SHARD, route_shard).
--define(PERSISTENT_SESSION_SHARD, emqx_persistent_session_shard).
+-define(PS_ROUTER_SHARD, persistent_session_router_shard).
 
 %% Banner
 %%--------------------------------------------------------------------
@@ -39,9 +39,6 @@
 %% System topic
 -define(SYSTOP, <<"$SYS/">>).
 
-%% Queue topic
--define(QUEUE, <<"$queue/">>).
-
 %%--------------------------------------------------------------------
 %% alarms
 %%--------------------------------------------------------------------
@@ -55,29 +52,7 @@
 
 -record(subscription, {topic, subid, subopts}).
 
-%% See 'Application Message' in MQTT Version 5.0
--record(message, {
-    %% Global unique message ID
-    id :: binary(),
-    %% Message QoS
-    qos = 0,
-    %% Message from
-    from :: atom() | binary(),
-    %% Message flags
-    flags = #{} :: emqx_types:flags(),
-    %% Message headers. May contain any metadata. e.g. the
-    %% protocol version number, username, peerhost or
-    %% the PUBLISH properties (MQTT 5.0).
-    headers = #{} :: emqx_types:headers(),
-    %% Topic that the message is published to
-    topic :: emqx_types:topic(),
-    %% Message Payload
-    payload :: emqx_types:payload(),
-    %% Timestamp (Unit: millisecond)
-    timestamp :: integer(),
-    %% not used so far, for future extension
-    extra = [] :: term()
-}).
+-include_lib("emqx_utils/include/emqx_message.hrl").
 
 -record(delivery, {
     %% Sender of the delivery
@@ -90,9 +65,20 @@
 %% Route
 %%--------------------------------------------------------------------
 
+-record(share_dest, {
+    session_id :: emqx_session:session_id(),
+    group :: emqx_types:group()
+}).
+
 -record(route, {
     topic :: binary(),
-    dest :: node() | {binary(), node()} | emqx_session:sessionID()
+    dest ::
+        node()
+        | {binary(), node()}
+        | emqx_session:session_id()
+        %% One session can also have multiple subscriptions to the same topic through different groups
+        | #share_dest{}
+        | emqx_external_broker:dest()
 }).
 
 %%--------------------------------------------------------------------
@@ -113,30 +99,22 @@
 %%--------------------------------------------------------------------
 
 -record(banned, {
-    who ::
-        {clientid, binary()}
-        | {peerhost, inet:ip_address()}
-        | {username, binary()},
+    who :: emqx_types:banned_who(),
     by :: binary(),
     reason :: binary(),
     at :: integer(),
-    until :: integer()
+    until :: integer() | infinity
 }).
 
 %%--------------------------------------------------------------------
-%% Authentication
+%% Configurations
 %%--------------------------------------------------------------------
+-define(KIND_REPLICATE, replicate).
+-define(KIND_INITIATE, initiate).
 
--record(authenticator, {
-    id :: binary(),
-    provider :: module(),
-    enable :: boolean(),
-    state :: map()
-}).
-
--record(chain, {
-    name :: atom(),
-    authenticators :: [#authenticator{}]
-}).
+%%--------------------------------------------------------------------
+%% Client Attributes
+%%--------------------------------------------------------------------
+-define(CLIENT_ATTR_NAME_TNS, <<"tns">>).
 
 -endif.

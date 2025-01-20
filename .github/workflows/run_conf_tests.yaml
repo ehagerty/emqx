@@ -7,16 +7,16 @@ concurrency:
 on:
   workflow_call:
     inputs:
-      runner:
-        required: true
-        type: string
       builder:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   run_conf_tests:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ endsWith(github.repository, '/emqx') && 'ubuntu-22.04' || fromJSON('["self-hosted","ephemeral","linux","x64"]') }}
     container: ${{ inputs.builder }}
     env:
       PROFILE: ${{ matrix.profile }}
@@ -27,23 +27,23 @@ jobs:
           - emqx
           - emqx-enterprise
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ matrix.profile }}
       - name: extract artifact
         run: |
           unzip -o -q ${{ matrix.profile }}.zip
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: make ${{ matrix.profile }}
       - run: ./scripts/test/check-example-configs.sh
       - run: ./scripts/conf-test/run.sh
       - name: print erlang log
         if: failure()
         run: |
-          cat _build/${{ matrix.profile }}/rel/emqx/logs/erlang.log.*
-      - uses: actions/upload-artifact@v3
+          cat _build/${{ matrix.profile }}/rel/emqx/log/erlang.log.*
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         if: failure()
         with:
-          name: logs-${{ matrix.profile }}
-          path: _build/${{ matrix.profile }}/rel/emqx/logs
-
+          name: conftest-logs-${{ matrix.profile }}
+          path: _build/${{ matrix.profile }}/rel/emqx/log
+          retention-days: 7

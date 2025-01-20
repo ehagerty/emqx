@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,11 +18,11 @@
 
 -compile(nowarn_export_all).
 -compile(export_all).
+-compile(nowarn_update_literal).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(CONF_DEFAULT, <<"rule_engine {rules {}}">>).
 -define(SIMPLE_RULE(NAME_SUFFIX), #{
     <<"description">> => <<"A simple rule">>,
     <<"enable">> => true,
@@ -36,13 +36,19 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    application:load(emqx_conf),
-    ok = emqx_common_test_helpers:load_config(emqx_rule_engine_schema, ?CONF_DEFAULT),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_rule_engine]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_conf, emqx_rule_engine]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(t_crud_rule_api, Config) ->
@@ -309,6 +315,30 @@ t_rule_engine(_) ->
         body => #{<<"rules">> => #{<<"some_rule">> => SomeRule}}
     }),
     {400, _} = emqx_rule_engine_api:'/rule_engine'(put, #{body => #{<<"something">> => <<"weird">>}}).
+
+t_dont_downgrade_bridge_type(_) ->
+    case emqx_release:edition() of
+        ee ->
+            do_t_dont_downgrade_bridge_type();
+        ce ->
+            %% downgrade is not supported in CE
+            ok
+    end.
+
+do_t_dont_downgrade_bridge_type() ->
+    %% Create a rule using a bridge V1 ID
+    #{id := RuleId} = create_rule((?SIMPLE_RULE(<<>>))#{<<"actions">> => [<<"kafka:name">>]}),
+    ?assertMatch(
+        %% returns an action ID
+        {200, #{data := [#{actions := [<<"kafka_producer:name">>]}]}},
+        emqx_rule_engine_api:'/rules'(get, #{query_string => #{}})
+    ),
+    ?assertMatch(
+        %% returns an action ID
+        {200, #{actions := [<<"kafka_producer:name">>]}},
+        emqx_rule_engine_api:'/rules/:id'(get, #{bindings => #{id => RuleId}})
+    ),
+    ok.
 
 rules_fixture(N) ->
     lists:map(

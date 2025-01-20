@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,6 +16,10 @@
 
 -module(emqx_tls_lib).
 
+-feature(maybe_expr, enable).
+
+-elvis([{elvis_style, atom_naming_convention, #{regex => "^([a-z][a-z0-9A-Z]*_?)*(_SUITE)?$"}}]).
+
 %% version & cipher suites
 -export([
     available_versions/1,
@@ -28,14 +32,14 @@
 
 %% SSL files
 -export([
+    ensure_ssl_files_in_mutable_certs_dir/2,
+    ensure_ssl_files_in_mutable_certs_dir/3,
     ensure_ssl_files/2,
     ensure_ssl_files/3,
     drop_invalid_certs/1,
     ssl_file_conf_keypaths/0,
     pem_dir/1,
-    is_managed_ssl_file/1,
-    is_valid_pem_file/1,
-    is_pem/1
+    is_managed_ssl_file/1
 ]).
 
 -export([
@@ -44,23 +48,37 @@
     to_client_opts/2
 ]).
 
+-export([maybe_inject_ssl_fun/2]).
+
+%% ssl:tls_version/0 is not exported.
+-type tls_version() :: tlsv1 | 'tlsv1.1' | 'tlsv1.2' | 'tlsv1.3'.
+
 -include("logger.hrl").
+-include("emqx_schema.hrl").
 
 -define(IS_TRUE(Val), ((Val =:= true) orelse (Val =:= <<"true">>))).
 -define(IS_FALSE(Val), ((Val =:= false) orelse (Val =:= <<"false">>))).
 
 -define(SSL_FILE_OPT_PATHS, [
+    %% common ssl options
     [<<"keyfile">>],
     [<<"certfile">>],
     [<<"cacertfile">>],
-    [<<"ocsp">>, <<"issuer_pem">>]
+    %% OCSP
+    [<<"ocsp">>, <<"issuer_pem">>],
+    %% SSO
+    [<<"sp_public_key">>],
+    [<<"sp_private_key">>]
 ]).
+
 -define(SSL_FILE_OPT_PATHS_A, [
     [keyfile],
     [certfile],
     [cacertfile],
     [ocsp, issuer_pem]
 ]).
+
+-define(ALLOW_EMPTY_PEM, [[<<"cacertfile">>], [cacertfile]]).
 
 %% non-empty string
 -define(IS_STRING(L), (is_list(L) andalso L =/= [] andalso is_integer(hd(L)))).
@@ -115,8 +133,8 @@
 %% @doc Validate a given list of desired tls versions.
 %% raise an error exception if non of them are available.
 %% The input list can be a string/binary of comma separated versions.
--spec integral_versions(tls | dtls, undefined | string() | binary() | [ssl:tls_version()]) ->
-    [ssl:tls_version()].
+-spec integral_versions(tls | dtls, undefined | string() | binary() | [tls_version()]) ->
+    [tls_version()].
 integral_versions(Type, undefined) ->
     available_versions(Type);
 integral_versions(Type, []) ->
@@ -156,7 +174,7 @@ all_ciphers() ->
     all_ciphers(available_versions(all)).
 
 %% @hidden Return a list of (openssl string format) cipher suites.
--spec all_ciphers([ssl:tls_version()]) -> [string()].
+-spec all_ciphers([tls_version()]) -> [string()].
 all_ciphers(['tlsv1.3']) ->
     %% When it's only tlsv1.3 wanted, use 'exclusive' here
     %% because 'all' returns legacy cipher suites too,
@@ -204,7 +222,7 @@ do_selected_ciphers(_) ->
     ?SELECTED_CIPHERS.
 
 %% @doc Ensure version & cipher-suites integrity.
--spec integral_ciphers([ssl:tls_version()], binary() | string() | [string()]) -> [string()].
+-spec integral_ciphers([tls_version()], binary() | string() | [string()]) -> [string()].
 integral_ciphers(Versions, Ciphers) when Ciphers =:= [] orelse Ciphers =:= undefined ->
     %% not configured
     integral_ciphers(Versions, selected_ciphers(Versions));
@@ -295,17 +313,28 @@ trim_space(Bin) ->
 %% or file path.
 %% When PEM format key or certificate is given, it tries to to save them in the given
 %% sub-dir in emqx's data_dir, and replace saved file paths for SSL options.
--spec ensure_ssl_files(file:name_all(), undefined | map()) ->
+-spec ensure_ssl_files_in_mutable_certs_dir(file:name_all(), undefined | map()) ->
     {ok, undefined | map()} | {error, map()}.
-ensure_ssl_files(Dir, SSL) ->
-    ensure_ssl_files(Dir, SSL, #{dry_run => false, required_keys => []}).
+ensure_ssl_files_in_mutable_certs_dir(Dir, SSL) ->
+    ensure_ssl_files_in_mutable_certs_dir(Dir, SSL, #{dry_run => false, required_keys => []}).
 
-ensure_ssl_files(_Dir, undefined, _Opts) ->
+ensure_ssl_files_in_mutable_certs_dir(_Dir, undefined, _Opts) ->
     {ok, undefined};
-ensure_ssl_files(_Dir, #{<<"enable">> := False} = SSL, _Opts) when ?IS_FALSE(False) ->
+ensure_ssl_files_in_mutable_certs_dir(_Dir, #{<<"enable">> := False} = SSL, _Opts) when
+    ?IS_FALSE(False)
+->
     {ok, SSL};
-ensure_ssl_files(_Dir, #{enable := False} = SSL, _Opts) when ?IS_FALSE(False) ->
+ensure_ssl_files_in_mutable_certs_dir(_Dir, #{enable := False} = SSL, _Opts) when
+    ?IS_FALSE(False)
+->
     {ok, SSL};
+ensure_ssl_files_in_mutable_certs_dir(Dir, SSL, Opts) ->
+    %% NOTE:
+    %% Pass Raw Dir to keep the file name hash consistent with the previous version
+    ensure_ssl_files(pem_dir(Dir), SSL, Opts#{raw_dir => Dir}).
+
+ensure_ssl_files(Dir, SSL) ->
+    ensure_ssl_files(Dir, SSL, #{dry_run => false, required_keys => [], raw_dir => Dir}).
 ensure_ssl_files(Dir, SSL, Opts) ->
     RequiredKeys = maps:get(required_keys, Opts, []),
     case ensure_ssl_file_key(SSL, RequiredKeys) of
@@ -325,42 +354,61 @@ ensure_ssl_files_per_key(Dir, SSL, [KeyPath | KeyPaths], Opts) ->
         {ok, NewSSL} ->
             ensure_ssl_files_per_key(Dir, NewSSL, KeyPaths, Opts);
         {error, Reason} ->
-            {error, Reason#{which_options => [KeyPath]}}
+            {error, Reason#{which_option => format_key_path(KeyPath)}}
     end.
 
 ensure_ssl_file(_Dir, _KeyPath, SSL, undefined, _Opts) ->
     {ok, SSL};
+ensure_ssl_file(_Dir, KeyPath, SSL, MaybePem, _Opts) when
+    MaybePem =:= "" orelse MaybePem =:= <<"">>
+->
+    case lists:member(KeyPath, ?ALLOW_EMPTY_PEM) of
+        true -> {ok, SSL};
+        false -> {error, #{reason => pem_file_path_or_string_is_required}}
+    end;
 ensure_ssl_file(Dir, KeyPath, SSL, MaybePem, Opts) ->
     case is_valid_string(MaybePem) of
         true ->
             DryRun = maps:get(dry_run, Opts, false),
-            do_ensure_ssl_file(Dir, KeyPath, SSL, MaybePem, DryRun);
+            RawDir = maps:get(raw_dir, Opts, Dir),
+            %% RawDir for backward compatibility
+            %% when RawDir is not given, it is the same as Dir
+            %% to keep the file name hash consistent with the previous version (Depends on RawDir)
+            do_ensure_ssl_file(Dir, RawDir, KeyPath, SSL, MaybePem, DryRun);
         false ->
             {error, #{reason => invalid_file_path_or_pem_string}}
     end.
 
-do_ensure_ssl_file(Dir, KeyPath, SSL, MaybePem, DryRun) ->
+do_ensure_ssl_file(Dir, RawDir, KeyPath, SSL, MaybePem, DryRun) ->
+    Type = keypath_to_type(KeyPath),
+    Password = maps:get(password, SSL, maps:get(<<"password">>, SSL, undefined)),
     case is_pem(MaybePem) of
         true ->
-            case save_pem_file(Dir, KeyPath, MaybePem, DryRun) of
-                {ok, Path} ->
-                    NewSSL = emqx_utils_maps:deep_put(KeyPath, SSL, Path),
-                    {ok, NewSSL};
-                {error, Reason} ->
-                    {error, Reason}
+            maybe
+                ok ?= try_validate_pem(MaybePem, Type, Password),
+                {ok, Path} ?= save_pem_file(Dir, RawDir, KeyPath, MaybePem, DryRun),
+                NewSSL = emqx_utils_maps:deep_put(KeyPath, SSL, Path),
+                {ok, NewSSL}
             end;
         false ->
-            case is_valid_pem_file(MaybePem) of
+            case is_valid_pem_file(MaybePem, Type, Password) of
                 true ->
                     {ok, SSL};
-                {error, enoent} when DryRun ->
+                {error, #{pem_check := enoent}} when DryRun ->
                     {ok, SSL};
                 {error, Reason} ->
-                    {error, #{
-                        pem_check => invalid_pem,
-                        file_read => Reason
-                    }}
+                    {error, Reason}
             end
+    end.
+
+keypath_to_type(KeyPath) when is_list(KeyPath) ->
+    case lists:map(fun emqx_utils_conv:bin/1, KeyPath) of
+        [<<"certfile">>] ->
+            certfile;
+        [<<"keyfile">>] ->
+            keyfile;
+        _ ->
+            undefined
     end.
 
 is_valid_string(Empty) when Empty == <<>>; Empty == "" -> false;
@@ -384,12 +432,58 @@ is_pem(MaybePem) ->
         _:_ -> false
     end.
 
+-define(catching(BODY, ON_ERROR),
+    try
+        {ok, BODY}
+    catch
+        _:_ -> ON_ERROR
+    end
+).
+-define(catching(BODY), ?catching(BODY, error)).
+try_validate_pem(PEM, certfile, _Password) ->
+    do_validate_certfile(PEM);
+try_validate_pem(PEM, keyfile, Password) ->
+    do_validate_keyfile(PEM, Password);
+try_validate_pem(_PEM, _Type, _Password) ->
+    ok.
+
+do_validate_certfile(PEM) ->
+    maybe
+        {ok, [{'Certificate' = Type, DER, not_encrypted} | _]} ?=
+            ?catching(public_key:pem_decode(PEM)),
+        {ok, _} ?= ?catching(public_key:der_decode(Type, DER)),
+        ok
+    else
+        _ -> {error, #{reason => failed_to_parse_certfile}}
+    end.
+
+do_validate_keyfile(PEM, Password) ->
+    maybe
+        {ok, [Entry]} ?= ?catching(public_key:pem_decode(PEM)),
+        {ok, _} ?= der_decode_file(Entry, Password),
+        ok
+    else
+        {error, Reason} -> {error, Reason};
+        _ -> {error, #{reason => failed_to_parse_keyfile}}
+    end.
+
+der_decode_file({Type, DER, not_encrypted}, _Password) ->
+    ?catching(public_key:der_decode(Type, DER));
+der_decode_file({_EncType, _EncDER, _EncryptionData}, undefined) ->
+    {error, #{reason => encryped_keyfile_missing_password}};
+der_decode_file({_EncType, _EncDER, _EncryptionData} = EncryptedEntry, Password) ->
+    ?catching(
+        public_key:pem_entry_decode(EncryptedEntry, emqx_secret:unwrap(Password)),
+        {error, #{reason => bad_password_or_invalid_keyfile}}
+    ).
+-undef(catching).
+
 %% Write the pem file to the given dir.
 %% To make it simple, the file is always overwritten.
 %% Also a potentially half-written PEM file (e.g. due to power outage)
 %% can be corrected with an overwrite.
-save_pem_file(Dir, KeyPath, Pem, DryRun) ->
-    Path = pem_file_name(Dir, KeyPath, Pem),
+save_pem_file(Dir, RawDir, KeyPath, Pem, DryRun) ->
+    Path = pem_file_path(Dir, RawDir, KeyPath, Pem),
     case filelib:ensure_dir(Path) of
         ok when DryRun ->
             {ok, Path};
@@ -412,16 +506,16 @@ is_managed_ssl_file(Filename) ->
         _ -> false
     end.
 
-pem_file_name(Dir, KeyPath, Pem) ->
+pem_file_path(Dir, RawDir, KeyPath, Pem) ->
     % NOTE
     % Wee need to have the same filename on every cluster node.
     Segments = lists:map(fun ensure_bin/1, KeyPath),
     Filename0 = iolist_to_binary(lists:join(<<"_">>, Segments)),
     Filename1 = binary:replace(Filename0, <<"file">>, <<>>),
-    Fingerprint = crypto:hash(md5, [Dir, Filename1, Pem]),
+    Fingerprint = crypto:hash(md5, [RawDir, Filename1, Pem]),
     Suffix = binary:encode_hex(binary:part(Fingerprint, 0, 8)),
     Filename = <<Filename1/binary, "-", Suffix/binary>>,
-    filename:join([pem_dir(Dir), Filename]).
+    filename:join([Dir, Filename]).
 
 pem_dir(Dir) ->
     filename:join([emqx:mutable_certs_dir(), Dir]).
@@ -435,12 +529,34 @@ is_hex_str(Str) ->
     end.
 
 %% @doc Returns 'true' when the file is a valid pem, otherwise {error, Reason}.
-is_valid_pem_file(Path0) ->
+is_valid_pem_file(Path0, Type, Password) ->
     Path = resolve_cert_path_for_read(Path0),
-    case file:read_file(Path) of
-        {ok, Pem} -> is_pem(Pem) orelse {error, not_pem};
-        {error, Reason} -> {error, Reason}
+    case is_valid_filename(Path) of
+        true ->
+            case file:read_file(Path) of
+                {ok, Pem} ->
+                    case is_pem(Pem) andalso try_validate_pem(Pem, Type, Password) of
+                        ok ->
+                            true;
+                        {error, #{reason := Reason}} ->
+                            {error, #{reason => Reason, file_path => Path}};
+                        {error, Reason} ->
+                            {error, #{reason => Reason, file_path => Path}};
+                        false ->
+                            {error, #{pem_check => not_pem, file_path => Path}}
+                    end;
+                {error, Reason} ->
+                    {error, #{pem_check => Reason, file_path => Path}}
+            end;
+        false ->
+            %% do not report path because the content can be huge
+            {error, #{pem_check => not_pem, file_path => not_file_path}}
     end.
+
+%% no controle chars 0-31
+%% the input is always string for this function
+is_valid_filename(Path) ->
+    lists:all(fun(C) -> C >= 32 end, Path).
 
 %% @doc Input and output are both HOCON-checked maps, with invalid SSL
 %% file options dropped.
@@ -459,11 +575,13 @@ drop_invalid_certs(#{<<"enable">> := True} = SSL) when ?IS_TRUE(True) ->
 do_drop_invalid_certs([], SSL) ->
     SSL;
 do_drop_invalid_certs([KeyPath | KeyPaths], SSL) ->
+    Type = keypath_to_type(KeyPath),
+    Password = maps:get(password, SSL, maps:get(<<"password">>, SSL, undefined)),
     case emqx_utils_maps:deep_get(KeyPath, SSL, undefined) of
         undefined ->
             do_drop_invalid_certs(KeyPaths, SSL);
         PemOrPath ->
-            case is_pem(PemOrPath) orelse is_valid_pem_file(PemOrPath) of
+            case is_pem(PemOrPath) orelse is_valid_pem_file(PemOrPath, Type, Password) of
                 true ->
                     do_drop_invalid_certs(KeyPaths, SSL);
                 {error, _} ->
@@ -478,13 +596,15 @@ to_server_opts(Type, Opts) ->
     Versions = integral_versions(Type, maps:get(versions, Opts, undefined)),
     Ciphers = integral_ciphers(Versions, maps:get(ciphers, Opts, undefined)),
     Path = fun(Key) -> resolve_cert_path_for_read_strict(maps:get(Key, Opts, undefined)) end,
+    Password = ensure_password(maps:get(password, Opts, undefined)),
     ensure_valid_options(
         maps:to_list(Opts#{
             keyfile => Path(keyfile),
             certfile => Path(certfile),
             cacertfile => Path(cacertfile),
             ciphers => Ciphers,
-            versions => Versions
+            versions => Versions,
+            password => Password
         }),
         Versions
     ).
@@ -522,14 +642,20 @@ to_client_opts(Type, Opts) ->
                     {ciphers, Ciphers},
                     {reuse_sessions, Get(reuse_sessions)},
                     {depth, Get(depth)},
-                    {password, ensure_str(Get(password))},
+                    {password, ensure_password(Get(password))},
                     {secure_renegotiate, Get(secure_renegotiate)}
-                ],
+                ] ++ hostname_check(Verify),
                 Versions
             );
         false ->
             []
     end.
+
+hostname_check(verify_none) ->
+    [];
+hostname_check(verify_peer) ->
+    %% allow wildcard certificates
+    [{customize_hostname_check, [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}].
 
 resolve_cert_path_for_read_strict(Path) ->
     case resolve_cert_path_for_read(Path) of
@@ -561,6 +687,14 @@ ensure_valid_options(Options, Versions) ->
 
 ensure_valid_options([], _, Acc) ->
     lists:reverse(Acc);
+ensure_valid_options([{K, undefined} | T], Versions, Acc) when
+    K =:= crl_check;
+    K =:= crl_cache
+->
+    %% Note: we must set crl options to `undefined' to unset them.  Otherwise,
+    %% `esockd' will retain such options when `esockd:merge_opts/2' is called and the SSL
+    %% options were previously enabled.
+    ensure_valid_options(T, Versions, [{K, undefined} | Acc]);
 ensure_valid_options([{_, undefined} | T], Versions, Acc) ->
     ensure_valid_options(T, Versions, Acc);
 ensure_valid_options([{_, ""} | T], Versions, Acc) ->
@@ -641,6 +775,14 @@ ensure_sni(undefined) -> undefined;
 ensure_sni(L) when is_list(L) -> L;
 ensure_sni(B) when is_binary(B) -> unicode:characters_to_list(B, utf8).
 
+ensure_password(Password) ->
+    case emqx_secret:unwrap(Password) of
+        undefined ->
+            undefined;
+        S ->
+            ensure_str(S)
+    end.
+
 ensure_str(undefined) -> undefined;
 ensure_str(L) when is_list(L) -> L;
 ensure_str(B) when is_binary(B) -> unicode:characters_to_list(B, utf8).
@@ -658,6 +800,28 @@ ensure_ssl_file_key(SSL, RequiredKeyPaths) ->
         end
     end,
     case lists:filter(Filter, RequiredKeyPaths) of
-        [] -> ok;
-        Miss -> {error, #{reason => ssl_file_option_not_found, which_options => Miss}}
+        [] ->
+            ok;
+        MissingL ->
+            {error, #{
+                reason => ssl_file_option_not_found,
+                missing_options => format_key_paths(MissingL)
+            }}
+    end.
+
+format_key_paths(Paths) ->
+    lists:map(fun format_key_path/1, Paths).
+
+format_key_path(Path) ->
+    iolist_to_binary(lists:join(".", [ensure_bin(S) || S <- Path])).
+
+-spec maybe_inject_ssl_fun(root_fun | verify_fun, map()) -> map().
+maybe_inject_ssl_fun(FunName, SslOpts) ->
+    case persistent_term:get(?EMQX_SSL_FUN_MFA(FunName), undefined) of
+        undefined ->
+            SslOpts;
+        {M, F, A} ->
+            %% We should have one entry not a list of {M,F,A},
+            %% as ordering matters in validations
+            erlang:apply(M, F, [SslOpts | A])
     end.

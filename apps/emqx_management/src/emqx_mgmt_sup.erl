@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -33,7 +33,8 @@ init([]) ->
             _ ->
                 []
         end,
-    {ok, {{one_for_one, 1, 5}, Workers}}.
+    Cluster = child_spec(emqx_mgmt_cluster, 5000, worker),
+    {ok, {{one_for_one, 1, 5}, [Cluster | Workers]}}.
 
 child_spec(Mod, Shutdown, Type) ->
     #{

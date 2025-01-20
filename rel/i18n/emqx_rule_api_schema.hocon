@@ -24,6 +24,12 @@ metrics_actions_failed_unknown.desc:
 metrics_actions_failed_unknown.label:
 """Unknown Failures"""
 
+metrics_actions_discarded.desc:
+"""The number of discarded actions due to action being disabled or race condition while action is being deleted."""
+
+metrics_actions_discarded.label:
+"""Discarded"""
+
 event_server.desc:
 """The IP address (or hostname) and port of the MQTT broker, in IP:Port format"""
 
@@ -65,6 +71,12 @@ test_context.desc:
 
 test_context.label:
 """Event Conetxt"""
+
+stop_action_after_template_render.desc:
+"""Set this to true if the action should be stopped after its template has been rendered (default is true)."""
+
+stop_action_after_template_render.label:
+"""Stop Action After Template Rendering"""
 
 node_node.desc:
 """The node name"""
@@ -354,6 +366,18 @@ event_username.desc:
 event_username.label:
 """Username"""
 
+event_validation.desc:
+"""Validation"""
+
+event_validation.label:
+"""Validation"""
+
+event_transformation.desc:
+"""Transformation"""
+
+event_transformation.label:
+"""Transformation"""
+
 root_rule_info.desc:
 """Schema for rule info"""
 
@@ -377,5 +401,14 @@ event_ctx_disconnected_reason.desc:
 
 event_ctx_disconnected_reason.label:
 """Disconnect Reason"""
+
+event_is_anonymous.desc:
+"""True if this user is anonymous."""
+
+event_is_superuser.desc:
+"""True if this is a super user."""
+
+event_ctx_authn_reason_code.desc:
+"""The reason code"""
 
 }

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 ]).
 
 start(_Type, _Args) ->
+    ok = mria:wait_for_tables(emqx_delayed:create_tables()),
     {ok, Sup} = emqx_modules_sup:start_link(),
     maybe_enable_modules(),
     {ok, Sup}.

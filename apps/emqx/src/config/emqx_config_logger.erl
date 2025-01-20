@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@
 -export([tr_handlers/1, tr_level/1]).
 -export([add_handler/0, remove_handler/0, refresh_config/0]).
 -export([post_config_update/5]).
+-export([filter_audit/2]).
+
+-include("logger.hrl").
 
 -define(LOG, [log]).
 
@@ -93,6 +96,10 @@ update_log_handlers(NewHandlers) ->
     ok = application:set_env(kernel, logger, NewHandlers),
     ok.
 
+%% Don't remove audit log handler here, we need record this removed action into audit log file.
+%% we will remove audit log handler after audit log is record in emqx_audit:log/3.
+update_log_handler({removed, ?AUDIT_HANDLER}) ->
+    ok;
 update_log_handler({removed, Id}) ->
     log_to_console("Config override: ~s is removed~n", [id_for_log(Id)]),
     logger:remove_handler(Id);
@@ -133,8 +140,8 @@ tr_console_handler(Conf) ->
                 {handler, console, logger_std_h, #{
                     level => conf_get("log.console.level", Conf),
                     config => (log_handler_conf(ConsoleConf))#{type => standard_io},
-                    formatter => log_formatter(ConsoleConf),
-                    filters => log_filter(ConsoleConf)
+                    formatter => log_formatter(console, ConsoleConf),
+                    filters => log_filter(console, ConsoleConf)
                 }}
             ];
         false ->
@@ -143,29 +150,51 @@ tr_console_handler(Conf) ->
 
 %% For the file logger
 tr_file_handlers(Conf) ->
-    Handlers = logger_file_handlers(Conf),
+    Files = logger_file_handlers(Conf),
+    Audits = logger_audit_handler(Conf),
+    Handlers = Audits ++ Files,
     lists:map(fun tr_file_handler/1, Handlers).
 
 tr_file_handler({HandlerName, SubConf}) ->
+    FilePath = conf_get("path", SubConf),
+    RotationCount = conf_get("rotation_count", SubConf),
+    RotationSize = conf_get("rotation_size", SubConf),
+    Type =
+        case RotationSize of
+            infinity -> halt;
+            _ -> wrap
+        end,
+    HandlerConf = log_handler_conf(SubConf),
     {handler, atom(HandlerName), logger_disk_log_h, #{
         level => conf_get("level", SubConf),
-        config => (log_handler_conf(SubConf))#{
-            type => wrap,
-            file => conf_get("path", SubConf),
-            max_no_files => conf_get("rotation_count", SubConf),
-            max_no_bytes => conf_get("rotation_size", SubConf)
+        config => HandlerConf#{
+            type => Type,
+            file => emqx_schema:naive_env_interpolation(FilePath),
+            max_no_files => RotationCount,
+            max_no_bytes => RotationSize
         },
-        formatter => log_formatter(SubConf),
-        filters => log_filter(SubConf),
+        formatter => log_formatter(HandlerName, SubConf),
+        filters => log_filter(HandlerName, SubConf),
         filesync_repeat_interval => no_repeat
     }}.
 
+logger_audit_handler(Conf) ->
+    Handlers = [{?AUDIT_HANDLER, conf_get("log.audit", Conf, #{})}],
+    logger_handlers(Handlers).
+
 logger_file_handlers(Conf) ->
+    Handlers = maps:to_list(conf_get("log.file", Conf, #{})),
+    logger_handlers(Handlers).
+
+logger_handlers(Handlers) ->
+    keep_only_enabeld(Handlers).
+
+keep_only_enabeld(Handlers) ->
     lists:filter(
         fun({_Name, Handler}) ->
             conf_get("enable", Handler, false)
         end,
-        maps:to_list(conf_get("log.file", Conf, #{}))
+        Handlers
     ).
 
 conf_get(Key, Conf) -> emqx_schema:conf_get(Key, Conf).
@@ -190,7 +219,7 @@ log_handler_conf(Conf) ->
         burst_limit_window_time => conf_get("window_time", BurstLimit)
     }.
 
-log_formatter(Conf) ->
+log_formatter(HandlerName, Conf) ->
     CharsLimit =
         case conf_get("chars_limit", Conf) of
             unlimited -> unlimited;
@@ -204,30 +233,58 @@ log_formatter(Conf) ->
         end,
     SingleLine = conf_get("single_line", Conf),
     Depth = conf_get("max_depth", Conf),
-    do_formatter(conf_get("formatter", Conf), CharsLimit, SingleLine, TimeOffSet, Depth).
+    Format =
+        case HandlerName of
+            ?AUDIT_HANDLER ->
+                json;
+            _ ->
+                conf_get("formatter", Conf)
+        end,
+    TsFormat = timestamp_format(Conf),
+    WithMfa = conf_get("with_mfa", Conf),
+    PayloadEncode = conf_get("payload_encode", Conf, text),
+    do_formatter(
+        Format, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode
+    ).
+
+%% auto | epoch | rfc3339
+timestamp_format(Conf) ->
+    conf_get("timestamp_format", Conf).
 
 %% helpers
-do_formatter(json, CharsLimit, SingleLine, TimeOffSet, Depth) ->
+do_formatter(json, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode) ->
     {emqx_logger_jsonfmt, #{
         chars_limit => CharsLimit,
         single_line => SingleLine,
         time_offset => TimeOffSet,
-        depth => Depth
+        depth => Depth,
+        timestamp_format => TsFormat,
+        with_mfa => WithMfa,
+        payload_encode => PayloadEncode
     }};
-do_formatter(text, CharsLimit, SingleLine, TimeOffSet, Depth) ->
+do_formatter(text, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode) ->
     {emqx_logger_textfmt, #{
-        template => [time, " [", level, "] ", msg, "\n"],
+        template => ["[", level, "] ", msg, "\n"],
         chars_limit => CharsLimit,
         single_line => SingleLine,
         time_offset => TimeOffSet,
-        depth => Depth
+        depth => Depth,
+        timestamp_format => TsFormat,
+        with_mfa => WithMfa,
+        payload_encode => PayloadEncode
     }}.
 
-log_filter(Conf) ->
+%% Don't record all logger message
+%% only use it for ?AUDIT/1
+log_filter(?AUDIT_HANDLER, _Conf) ->
+    [{filter_audit, {fun ?MODULE:filter_audit/2, stop}}];
+log_filter(_, Conf) ->
     case conf_get("supervisor_reports", Conf) of
         error -> [{drop_progress_reports, {fun logger_filters:progress/2, stop}}];
         progress -> []
     end.
+
+filter_audit(_, _) -> stop.
 
 tr_level(Conf) ->
     ConsoleLevel = conf_get("log.console.level", Conf, undefined),

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -150,7 +150,7 @@ handle_cast(
             ),
             Now = erlang:system_time(second),
             Banned = #banned{
-                who = {clientid, ClientId},
+                who = emqx_banned:who(clientid, ClientId),
                 by = <<"flapping detector">>,
                 reason = <<"flapping is detected">>,
                 at = Now,

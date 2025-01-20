@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_clickhouse_connector_SUITE).
@@ -7,13 +7,14 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_connector.hrl").
+-include("../../emqx_connector/include/emqx_connector.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 -define(APP, emqx_bridge_clickhouse).
--define(CLICKHOUSE_HOST, "clickhouse").
 -define(CLICKHOUSE_RESOURCE_MOD, emqx_bridge_clickhouse_connector).
+-define(CLICKHOUSE_PASSWORD, "public").
 
 %% This test SUITE requires a running clickhouse instance. If you don't want to
 %% bring up the whole CI infrastuctucture with the `scripts/ct/run.sh` script
@@ -37,32 +38,35 @@ all() ->
 groups() ->
     [].
 
-clickhouse_url() ->
-    erlang:iolist_to_binary([
-        <<"http://">>,
-        ?CLICKHOUSE_HOST,
-        ":",
-        erlang:integer_to_list(?CLICKHOUSE_DEFAULT_PORT)
-    ]).
-
 init_per_suite(Config) ->
-    case
-        emqx_common_test_helpers:is_tcp_server_available(?CLICKHOUSE_HOST, ?CLICKHOUSE_DEFAULT_PORT)
-    of
+    Host = emqx_bridge_clickhouse_SUITE:clickhouse_host(),
+    Port = list_to_integer(emqx_bridge_clickhouse_SUITE:clickhouse_port()),
+    case emqx_common_test_helpers:is_tcp_server_available(Host, Port) of
         true ->
-            ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource, ?APP]),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_clickhouse,
+                    emqx_connector,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             %% Create the db table
             {ok, Conn} =
                 clickhouse:start_link([
-                    {url, clickhouse_url()},
+                    {url, emqx_bridge_clickhouse_SUITE:clickhouse_url()},
                     {user, <<"default">>},
-                    {key, "public"},
+                    {key, ?CLICKHOUSE_PASSWORD},
                     {pool, tmp_pool}
                 ]),
             {ok, _, _} = clickhouse:query(Conn, <<"CREATE DATABASE IF NOT EXISTS mqtt">>, #{}),
             clickhouse:stop(Conn),
-            Config;
+            [{apps, Apps} | Config];
         false ->
             case os:getenv("IS_CI") of
                 "yes" ->
@@ -72,9 +76,10 @@ init_per_suite(Config) ->
             end
     end.
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([?APP, emqx_resource]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
     Config.
@@ -91,6 +96,31 @@ t_lifecycle(_Config) ->
         <<"emqx_connector_clickhouse_SUITE">>,
         clickhouse_config()
     ).
+
+t_start_passfile(Config) ->
+    ResourceID = atom_to_binary(?FUNCTION_NAME),
+    PasswordFilename = filename:join(?config(priv_dir, Config), "passfile"),
+    ok = file:write_file(PasswordFilename, <<?CLICKHOUSE_PASSWORD>>),
+    InitialConfig = clickhouse_config(#{
+        password => iolist_to_binary(["file://", PasswordFilename])
+    }),
+    {ok, #{config := ResourceConfig}} =
+        emqx_resource:check_config(?CLICKHOUSE_RESOURCE_MOD, InitialConfig),
+    ?assertMatch(
+        {ok, #{status := connected}},
+        emqx_resource:create_local(
+            ResourceID,
+            ?CONNECTOR_RESOURCE_GROUP,
+            ?CLICKHOUSE_RESOURCE_MOD,
+            ResourceConfig,
+            #{}
+        )
+    ),
+    ?assertEqual(
+        ok,
+        emqx_resource:remove_local(ResourceID)
+    ),
+    ok.
 
 show(X) ->
     erlang:display(X),
@@ -168,25 +198,20 @@ perform_lifecycle_check(ResourceID, InitialConfig) ->
 % %%------------------------------------------------------------------------------
 
 clickhouse_config() ->
+    clickhouse_config(#{}).
+
+clickhouse_config(Overrides) ->
     Config =
         #{
             auto_reconnect => true,
             database => <<"mqtt">>,
             username => <<"default">>,
-            password => <<"public">>,
+            password => <<?CLICKHOUSE_PASSWORD>>,
             pool_size => 8,
-            url => iolist_to_binary(
-                io_lib:format(
-                    "http://~s:~b",
-                    [
-                        ?CLICKHOUSE_HOST,
-                        ?CLICKHOUSE_DEFAULT_PORT
-                    ]
-                )
-            ),
+            url => emqx_bridge_clickhouse_SUITE:clickhouse_url(),
             connect_timeout => <<"10s">>
         },
-    #{<<"config">> => Config}.
+    #{<<"config">> => maps:merge(Config, Overrides)}.
 
 test_query_no_params() ->
     {query, <<"SELECT 1">>}.

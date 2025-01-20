@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@
     collect_files/2
 ]).
 
--define(GC_INVERVAL, 5 * 60 * 1000).
+-define(GC_INTERVAL, 5 * 60 * 1000).
 
 -define(HAS_OWNER_READ(Mode), ((Mode band 8#00400) > 0)).
 -define(HAS_OWNER_WRITE(Mode), ((Mode band 8#00200) > 0)).
@@ -84,7 +84,7 @@
 -spec start_link() ->
     {ok, pid()}.
 start_link() ->
-    start_link(?GC_INVERVAL).
+    start_link(?GC_INTERVAL).
 
 -spec start_link(_Interval :: pos_integer()) ->
     {ok, pid()}.
@@ -271,8 +271,11 @@ find_config_references(Root) ->
 is_file_reference(Stack) ->
     lists:any(
         fun(KP) -> lists:prefix(lists:reverse(KP), Stack) end,
-        emqx_tls_lib:ssl_file_conf_keypaths()
+        conf_keypaths()
     ).
+
+conf_keypaths() ->
+    emqx_tls_lib:ssl_file_conf_keypaths().
 
 mk_fileref(AbsPath) ->
     case emqx_utils_fs:read_info(AbsPath) of

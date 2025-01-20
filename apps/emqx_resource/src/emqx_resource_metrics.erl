@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,6 +16,9 @@
 
 -module(emqx_resource_metrics).
 
+-include_lib("emqx/include/logger.hrl").
+-include("emqx_resource.hrl").
+
 -export([
     events/0,
     install_telemetry_handler/1,
@@ -28,6 +31,8 @@
     inflight_get/1,
     queuing_set/3,
     queuing_get/1,
+    queuing_bytes_set/3,
+    queuing_bytes_get/1,
     dropped_inc/1,
     dropped_inc/2,
     dropped_get/1,
@@ -72,7 +77,6 @@
     success_get/1
 ]).
 
--define(RES_METRICS, resource_metrics).
 -define(TELEMETRY_PREFIX, emqx, resource).
 
 -spec events() -> [telemetry:event_name()].
@@ -90,6 +94,7 @@ events() ->
             inflight,
             matched,
             queuing,
+            queuing_bytes,
             received,
             retried_failed,
             retried_success,
@@ -118,6 +123,62 @@ handle_telemetry_event(
     _Metadata = #{resource_id := ID},
     _HandlerConfig
 ) ->
+    try
+        handle_counter_telemetry_event(Event, ID, Val)
+    catch
+        Kind:Reason:Stacktrace ->
+            %% We catch errors to avoid detaching the telemetry handler function.
+            %% When restarting a resource while it's under load, there might be transient
+            %% failures while the metrics are not yet created.
+            ?SLOG_THROTTLE(
+                warning,
+                ID,
+                #{
+                    msg => handle_resource_metrics_failed,
+                    hint => "transient failures may occur when restarting a resource",
+                    kind => Kind,
+                    reason => Reason,
+                    stacktrace => Stacktrace,
+                    resource_id => ID,
+                    event => Event
+                },
+                #{tag => ?TAG}
+            ),
+            ok
+    end;
+handle_telemetry_event(
+    [?TELEMETRY_PREFIX, Event],
+    _Measurements = #{gauge_set := Val},
+    _Metadata = #{resource_id := ID, worker_id := WorkerID},
+    _HandlerConfig
+) ->
+    try
+        handle_gauge_telemetry_event(Event, ID, WorkerID, Val)
+    catch
+        Kind:Reason:Stacktrace ->
+            %% We catch errors to avoid detaching the telemetry handler function.
+            %% When restarting a resource while it's under load, there might be transient
+            %% failures while the metrics are not yet created.
+            ?SLOG_THROTTLE(
+                warning,
+                ID,
+                #{
+                    msg => handle_resource_metrics_failed,
+                    hint => "transient failures may occur when restarting a resource",
+                    kind => Kind,
+                    reason => Reason,
+                    stacktrace => Stacktrace,
+                    resource_id => ID,
+                    event => Event
+                },
+                #{tag => ?TAG}
+            ),
+            ok
+    end;
+handle_telemetry_event(_EventName, _Measurements, _Metadata, _HandlerConfig) ->
+    ok.
+
+handle_counter_telemetry_event(Event, ID, Val) ->
     case Event of
         dropped_other ->
             emqx_metrics_worker:inc(?RES_METRICS, ID, 'dropped', Val),
@@ -154,23 +215,19 @@ handle_telemetry_event(
             emqx_metrics_worker:inc(?RES_METRICS, ID, 'success', Val);
         _ ->
             ok
-    end;
-handle_telemetry_event(
-    [?TELEMETRY_PREFIX, Event],
-    _Measurements = #{gauge_set := Val},
-    _Metadata = #{resource_id := ID, worker_id := WorkerID},
-    _HandlerConfig
-) ->
+    end.
+
+handle_gauge_telemetry_event(Event, ID, WorkerID, Val) ->
     case Event of
         inflight ->
             emqx_metrics_worker:set_gauge(?RES_METRICS, ID, WorkerID, 'inflight', Val);
         queuing ->
             emqx_metrics_worker:set_gauge(?RES_METRICS, ID, WorkerID, 'queuing', Val);
+        queuing_bytes ->
+            emqx_metrics_worker:set_gauge(?RES_METRICS, ID, WorkerID, 'queuing_bytes', Val);
         _ ->
             ok
-    end;
-handle_telemetry_event(_EventName, _Measurements, _Metadata, _HandlerConfig) ->
-    ok.
+    end.
 
 %% Gauges (value can go both up and down):
 %% --------------------------------------
@@ -186,6 +243,17 @@ queuing_set(ID, WorkerID, Val) ->
 
 queuing_get(ID) ->
     emqx_metrics_worker:get_gauge(?RES_METRICS, ID, 'queuing').
+
+%% @doc Number of bytes currently queued. [Gauge]
+queuing_bytes_set(ID, WorkerID, Val) ->
+    telemetry:execute(
+        [?TELEMETRY_PREFIX, queuing_bytes],
+        #{gauge_set => Val},
+        #{resource_id => ID, worker_id => WorkerID}
+    ).
+
+queuing_bytes_get(ID) ->
+    emqx_metrics_worker:get_gauge(?RES_METRICS, ID, 'queuing_bytes').
 
 %% @doc Count of batches of messages that were sent asynchronously but
 %% ACKs are not yet received. [Gauge]
@@ -360,7 +428,7 @@ retried_failed_inc(ID, Val) ->
 retried_failed_get(ID) ->
     emqx_metrics_worker:get(?RES_METRICS, ID, 'retried.failed').
 
-%% @doc Count messages that were sucessfully sent after at least one retry
+%% @doc Count messages that were successfully sent after at least one retry
 retried_success_inc(ID) ->
     retried_success_inc(ID, 1).
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,19 +22,24 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(CONF_DEFAULT, <<"rule_engine {rules {}}">>).
-
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    application:load(emqx_conf),
-    ok = emqx_common_test_helpers:load_config(emqx_rule_engine_schema, ?CONF_DEFAULT),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_rule_engine]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine,
+            emqx_modules
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_conf, emqx_rule_engine]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 t_ctx_pub(_) ->
@@ -165,7 +170,7 @@ t_ctx_connack(_) ->
             clean_start => true,
             clientid => <<"c_emqx">>,
             event_type => client_connack,
-            reason_code => <<"sucess">>,
+            reason_code => <<"success">>,
             username => <<"u_emqx">>
         },
     Expected = check_result([clientid, username, reason_code], [node], Context),
@@ -195,6 +200,29 @@ t_ctx_check_authz_complete(_) ->
 
     do_test(SQL, Context, Expected).
 
+t_ctx_check_authn_complete(_) ->
+    SQL =
+        <<
+            "SELECT clientid, username, is_superuser, is_anonymous\n"
+            "FROM \"$events/client_check_authn_complete\""
+        >>,
+
+    Context =
+        #{
+            clientid => <<"c_emqx">>,
+            event_type => client_check_authn_complete,
+            reason_code => <<"success">>,
+            is_superuser => true,
+            is_anonymous => false
+        },
+    Expected = check_result(
+        [clientid, username, is_superuser, is_anonymous],
+        [],
+        Context
+    ),
+
+    do_test(SQL, Context, Expected).
+
 t_ctx_delivery_dropped(_) ->
     SQL =
         <<"SELECT from_clientid, from_username, reason, topic, qos FROM \"$events/delivery_dropped\"">>,
@@ -213,6 +241,57 @@ t_ctx_delivery_dropped(_) ->
         },
     Expected = check_result([from_clientid, from_username, reason, qos, topic], [], Context),
     do_test(SQL, Context, Expected).
+
+t_ctx_schema_validation_failed(_) ->
+    SQL =
+        <<"SELECT validation FROM \"$events/schema_validation_failed\"">>,
+    Context = #{
+        <<"clientid">> => <<"c_emqx">>,
+        <<"event_type">> => <<"schema_validation_failed">>,
+        <<"payload">> => <<"{\"msg\": \"hello\"}">>,
+        <<"qos">> => 1,
+        <<"topic">> => <<"t/a">>,
+        <<"username">> => <<"u_emqx">>,
+        <<"validation">> => <<"m">>
+    },
+    Expected = check_result([validation], [], Context),
+    do_test(SQL, Context, Expected).
+
+t_ctx_message_transformation_failed(_) ->
+    SQL =
+        <<"SELECT transformation FROM \"$events/message_transformation_failed\"">>,
+    Context = #{
+        <<"clientid">> => <<"c_emqx">>,
+        <<"event_type">> => <<"message_transformation_failed">>,
+        <<"payload">> => <<"{\"msg\": \"hello\"}">>,
+        <<"qos">> => 1,
+        <<"topic">> => <<"t/a">>,
+        <<"username">> => <<"u_emqx">>,
+        <<"transformation">> => <<"m">>
+    },
+    Expected = check_result([transformation], [], Context),
+    do_test(SQL, Context, Expected).
+
+t_mongo_date_function_should_return_string_in_test_env(_) ->
+    SQL =
+        <<"SELECT mongo_date() as mongo_date FROM \"$events/client_check_authz_complete\"">>,
+    Context =
+        #{
+            action => <<"publish">>,
+            clientid => <<"c_emqx">>,
+            event_type => client_check_authz_complete,
+            result => <<"allow">>,
+            topic => <<"t/1">>,
+            username => <<"u_emqx">>
+        },
+    CheckFunction = fun(Result) ->
+        MongoDate = maps:get(mongo_date, Result),
+        %% Use regex to match the expected string
+        MatchResult = re:run(MongoDate, <<"ISODate\\([0-9]{4}-[0-9]{2}-[0-9]{2}T.*\\)">>),
+        ?assertMatch({match, _}, MatchResult),
+        ok
+    end,
+    do_test(SQL, Context, CheckFunction).
 
 do_test(SQL, Context, Expected0) ->
     Res = emqx_rule_engine_api:'/rule_test'(

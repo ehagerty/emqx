@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,15 +21,17 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 t_copy_conf_override_on_restarts(Config) ->
     ct:timetrap({seconds, 120}),
-    snabbkaffe:fix_ct_logging(),
     Cluster = cluster(
-        [cluster_spec({core, 1}), cluster_spec({core, 2}), cluster_spec({core, 3})], Config
+        ?FUNCTION_NAME,
+        [cluster_spec(1), cluster_spec(2), cluster_spec(3)],
+        Config
     ),
 
     %% 1. Start all nodes
@@ -42,7 +44,7 @@ t_copy_conf_override_on_restarts(Config) ->
 
         %% 3. Restart nodes in the same order.  This should not
         %% crash and eventually all nodes should be ready.
-        start_cluster_async(Cluster),
+        restart_cluster_async(Cluster),
 
         timer:sleep(15000),
 
@@ -54,15 +56,16 @@ t_copy_conf_override_on_restarts(Config) ->
     end.
 
 t_copy_new_data_dir(Config) ->
-    net_kernel:start(['master1@127.0.0.1', longnames]),
     ct:timetrap({seconds, 120}),
-    snabbkaffe:fix_ct_logging(),
     Cluster = cluster(
-        [cluster_spec({core, 4}), cluster_spec({core, 5}), cluster_spec({core, 6})], Config
+        ?FUNCTION_NAME,
+        [cluster_spec(4), cluster_spec(5), cluster_spec(6)],
+        Config
     ),
 
     %% 1. Start all nodes
-    [First | Rest] = Nodes = start_cluster(Cluster),
+    Nodes = start_cluster(Cluster),
+    [First | Rest] = sort_highest_uptime(Nodes),
     try
         NodeDataDir = erpc:call(First, emqx, data_dir, []),
         File = NodeDataDir ++ "/configs/cluster.hocon",
@@ -72,24 +75,22 @@ t_copy_new_data_dir(Config) ->
         {[ok, ok, ok], []} = rpc:multicall(Nodes, ?MODULE, set_data_dir_env, []),
         ok = rpc:call(First, application, start, [emqx_conf]),
         {[ok, ok], []} = rpc:multicall(Rest, application, start, [emqx_conf]),
-
-        assert_data_copy_done(Nodes, File),
-        stop_cluster(Nodes),
-        ok
+        ?retry(200, 10, ok = assert_data_copy_done(Nodes, File))
     after
         stop_cluster(Nodes)
     end.
 
 t_copy_deprecated_data_dir(Config) ->
-    net_kernel:start(['master2@127.0.0.1', longnames]),
     ct:timetrap({seconds, 120}),
-    snabbkaffe:fix_ct_logging(),
     Cluster = cluster(
-        [cluster_spec({core, 7}), cluster_spec({core, 8}), cluster_spec({core, 9})], Config
+        ?FUNCTION_NAME,
+        [cluster_spec(7), cluster_spec(8), cluster_spec(9)],
+        Config
     ),
 
     %% 1. Start all nodes
-    [First | Rest] = Nodes = start_cluster(Cluster),
+    Nodes = start_cluster(Cluster),
+    [First | Rest] = sort_highest_uptime(Nodes),
     try
         NodeDataDir = erpc:call(First, emqx, data_dir, []),
         File = NodeDataDir ++ "/configs/cluster-override.conf",
@@ -99,20 +100,17 @@ t_copy_deprecated_data_dir(Config) ->
         {[ok, ok, ok], []} = rpc:multicall(Nodes, ?MODULE, set_data_dir_env, []),
         ok = rpc:call(First, application, start, [emqx_conf]),
         {[ok, ok], []} = rpc:multicall(Rest, application, start, [emqx_conf]),
-
-        assert_data_copy_done(Nodes, File),
-        stop_cluster(Nodes),
-        ok
+        ?retry(200, 10, ok = assert_data_copy_done(Nodes, File))
     after
         stop_cluster(Nodes)
     end.
 
 t_no_copy_from_newer_version_node(Config) ->
-    net_kernel:start(['master2@127.0.0.1', longnames]),
     ct:timetrap({seconds, 120}),
-    snabbkaffe:fix_ct_logging(),
     Cluster = cluster(
-        [cluster_spec({core, 10}), cluster_spec({core, 11}), cluster_spec({core, 12})], Config
+        ?FUNCTION_NAME,
+        [cluster_spec(10), cluster_spec(11), cluster_spec(12)],
+        Config
     ),
     OKs = [ok, ok, ok],
     [First | Rest] = Nodes = start_cluster(Cluster),
@@ -131,9 +129,7 @@ t_no_copy_from_newer_version_node(Config) ->
         ]),
         ok = rpc:call(First, application, start, [emqx_conf]),
         {[ok, ok], []} = rpc:multicall(Rest, application, start, [emqx_conf]),
-        ok = assert_no_cluster_conf_copied(Rest, File),
-        stop_cluster(Nodes),
-        ok
+        ok = assert_no_cluster_conf_copied(Rest, File)
     after
         stop_cluster(Nodes)
     end.
@@ -153,25 +149,29 @@ create_data_dir(File) ->
 
 set_data_dir_env() ->
     NodeDataDir = emqx:data_dir(),
-    NodeStr = atom_to_list(node()),
+    NodeConfigDir = filename:join(NodeDataDir, "configs"),
     %% will create certs and authz dir
-    ok = filelib:ensure_dir(NodeDataDir ++ "/configs/"),
-    {ok, [ConfigFile]} = application:get_env(emqx, config_files),
-    NewConfigFile = ConfigFile ++ "." ++ NodeStr,
-    ok = filelib:ensure_dir(NewConfigFile),
-    {ok, _} = file:copy(ConfigFile, NewConfigFile),
-    Bin = iolist_to_binary(io_lib:format("node.config_files = [~p]~n", [NewConfigFile])),
-    ok = file:write_file(NewConfigFile, Bin, [append]),
-    DataDir = iolist_to_binary(io_lib:format("node.data_dir = ~p~n", [NodeDataDir])),
-    ok = file:write_file(NewConfigFile, DataDir, [append]),
-    application:set_env(emqx, config_files, [NewConfigFile]),
+    ok = filelib:ensure_path(NodeConfigDir),
+    ConfigFile = filename:join(NodeConfigDir, "emqx.conf"),
+    ok = append_format(ConfigFile, "node.config_files = [~p]~n", [ConfigFile]),
+    ok = append_format(ConfigFile, "node.data_dir = ~p~n", [NodeDataDir]),
+    application:set_env(emqx, config_files, [ConfigFile]),
     %% application:set_env(emqx, data_dir, Node),
     %% We set env both cluster.hocon and cluster-override.conf, but only one will be used
-    application:set_env(emqx, cluster_hocon_file, NodeDataDir ++ "/configs/cluster.hocon"),
     application:set_env(
-        emqx, cluster_override_conf_file, NodeDataDir ++ "/configs/cluster-override.conf"
+        emqx,
+        cluster_hocon_file,
+        filename:join([NodeDataDir, "configs", "cluster.hocon"])
+    ),
+    application:set_env(
+        emqx,
+        cluster_override_conf_file,
+        filename:join([NodeDataDir, "configs", "cluster-override.conf"])
     ),
     ok.
+
+append_format(Filename, Fmt, Args) ->
+    ok = file:write_file(Filename, io_lib:format(Fmt, Args), [append]).
 
 assert_data_copy_done([_First | Rest], File) ->
     FirstDataDir = filename:dirname(filename:dirname(File)),
@@ -222,39 +222,37 @@ assert_config_load_done(Nodes) ->
     ).
 
 stop_cluster(Nodes) ->
-    emqx_utils:pmap(fun emqx_common_test_helpers:stop_slave/1, Nodes).
+    emqx_cth_cluster:stop(Nodes).
 
 start_cluster(Specs) ->
-    [emqx_common_test_helpers:start_slave(Name, Opts) || {Name, Opts} <- Specs].
+    emqx_cth_cluster:start(Specs).
 
-start_cluster_async(Specs) ->
+restart_cluster_async(Specs) ->
     [
         begin
-            Opts1 = maps:remove(join_to, Opts),
-            spawn_link(fun() -> emqx_common_test_helpers:start_slave(Name, Opts1) end),
-            timer:sleep(7_000)
+            _Pid = spawn_link(emqx_cth_cluster, restart, [Spec]),
+            timer:sleep(1_000)
         end
-     || {Name, Opts} <- Specs
+     || Spec <- Specs
     ].
 
-cluster(Specs, Config) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    Env = [
-        {emqx, boot_modules, []}
+cluster(TC, Specs, Config) ->
+    Apps = [
+        {emqx, #{override_env => [{boot_modules, [broker]}]}},
+        {emqx_conf, #{}}
     ],
-    emqx_common_test_helpers:emqx_cluster(Specs, [
-        {env, Env},
-        {apps, [emqx_conf]},
-        {load_schema, false},
-        {priv_data_dir, PrivDataDir},
-        {env_handler, fun
-            (emqx) ->
-                application:set_env(emqx, boot_modules, []),
-                ok;
-            (_) ->
-                ok
-        end}
-    ]).
+    emqx_cth_cluster:mk_nodespecs(
+        [{Name, #{apps => Apps}} || Name <- Specs],
+        #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
+    ).
 
-cluster_spec({Type, Num}) ->
-    {Type, list_to_atom(atom_to_list(?MODULE) ++ integer_to_list(Num))}.
+cluster_spec(Num) ->
+    list_to_atom(atom_to_list(?MODULE) ++ integer_to_list(Num)).
+
+sort_highest_uptime(Nodes) ->
+    Ranking = lists:sort([{-get_node_uptime(N), N} || N <- Nodes]),
+    element(2, lists:unzip(Ranking)).
+
+get_node_uptime(Node) ->
+    {Milliseconds, _} = erpc:call(Node, erlang, statistics, [wall_clock]),
+    Milliseconds.

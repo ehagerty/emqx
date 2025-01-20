@@ -1,8 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_influxdb_connector).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 
 -include_lib("hocon/include/hoconsc.hrl").
@@ -16,14 +17,20 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channel_status/3,
+    on_get_channels/1,
     on_query/3,
     on_batch_query/3,
     on_query_async/4,
     on_batch_query_async/4,
-    on_get_status/2
+    on_get_status/2,
+    on_format_query_result/1
 ]).
 -export([reply_callback/2]).
 
@@ -33,6 +40,10 @@
     fields/1,
     desc/1
 ]).
+
+-export([transform_bridge_v1_config_to_connector_config/1]).
+
+-export([precision_field/0]).
 
 %% only for test
 -export([is_unrecoverable_error/1]).
@@ -51,9 +62,53 @@
 
 -define(DEFAULT_TIMESTAMP_TMPL, "${timestamp}").
 
+-define(set_tag, set_tag).
+-define(set_field, set_field).
+
+-define(IS_HTTP_ERROR(STATUS_CODE),
+    (is_integer(STATUS_CODE) andalso
+        (STATUS_CODE < 200 orelse STATUS_CODE >= 300))
+).
+
+-define(DEFAULT_POOL_SIZE, 8).
+
 %% -------------------------------------------------------------------------------------------------
 %% resource callback
+resource_type() -> influxdb.
+
 callback_mode() -> async_if_possible.
+
+on_add_channel(
+    _InstanceId,
+    #{channels := Channels, client := Client} = OldState,
+    ChannelId,
+    #{parameters := Parameters} = ChannelConfig0
+) ->
+    #{write_syntax := WriteSytaxTmpl} = Parameters,
+    Precision = maps:get(precision, Parameters, ms),
+    ChannelConfig = maps:merge(
+        Parameters,
+        ChannelConfig0#{
+            channel_client => influxdb:update_precision(Client, Precision),
+            write_syntax => to_config(WriteSytaxTmpl, Precision)
+        }
+    ),
+    {ok, OldState#{
+        channels => maps:put(ChannelId, ChannelConfig, Channels)
+    }}.
+
+on_remove_channel(_InstanceId, #{channels := Channels} = State, ChannelId) ->
+    NewState = State#{channels => maps:remove(ChannelId, Channels)},
+    {ok, NewState}.
+
+on_get_channel_status(InstanceId, _ChannelId, State) ->
+    case on_get_status(InstanceId, State) of
+        connected -> connected;
+        _ -> connecting
+    end.
+
+on_get_channels(InstanceId) ->
+    emqx_bridge_v2:get_channels_for_connector(InstanceId).
 
 on_start(InstId, Config) ->
     %% InstID as pool would be handled by influxdb client
@@ -66,19 +121,23 @@ on_start(InstId, Config) ->
 on_stop(InstId, _State) ->
     case emqx_resource:get_allocated_resources(InstId) of
         #{?influx_client := Client} ->
-            influxdb:stop_client(Client);
+            Res = influxdb:stop_client(Client),
+            ?tp(influxdb_client_stopped, #{instance_id => InstId}),
+            Res;
         _ ->
             ok
     end.
 
-on_query(InstId, {send_message, Data}, _State = #{write_syntax := SyntaxLines, client := Client}) ->
-    case data_to_points(Data, SyntaxLines) of
+on_query(InstId, {Channel, Message}, #{channels := ChannelConf}) ->
+    #{write_syntax := SyntaxLines} = maps:get(Channel, ChannelConf),
+    #{channel_client := Client} = maps:get(Channel, ChannelConf),
+    case data_to_points(Message, SyntaxLines) of
         {ok, Points} ->
             ?tp(
                 influxdb_connector_send_query,
                 #{points => Points, batch => false, mode => sync}
             ),
-            do_query(InstId, Client, Points);
+            do_query(InstId, Channel, Client, Points);
         {error, ErrorPoints} ->
             ?tp(
                 influxdb_connector_send_query_error,
@@ -90,14 +149,17 @@ on_query(InstId, {send_message, Data}, _State = #{write_syntax := SyntaxLines, c
 
 %% Once a Batched Data trans to points failed.
 %% This batch query failed
-on_batch_query(InstId, BatchData, _State = #{write_syntax := SyntaxLines, client := Client}) ->
+on_batch_query(InstId, BatchData, #{channels := ChannelConf}) ->
+    [{Channel, _} | _] = BatchData,
+    #{write_syntax := SyntaxLines} = maps:get(Channel, ChannelConf),
+    #{channel_client := Client} = maps:get(Channel, ChannelConf),
     case parse_batch_data(InstId, BatchData, SyntaxLines) of
         {ok, Points} ->
             ?tp(
                 influxdb_connector_send_query,
                 #{points => Points, batch => true, mode => sync}
             ),
-            do_query(InstId, Client, Points);
+            do_query(InstId, Channel, Client, Points);
         {error, Reason} ->
             ?tp(
                 influxdb_connector_send_query_error,
@@ -108,17 +170,19 @@ on_batch_query(InstId, BatchData, _State = #{write_syntax := SyntaxLines, client
 
 on_query_async(
     InstId,
-    {send_message, Data},
+    {Channel, Message},
     {ReplyFun, Args},
-    _State = #{write_syntax := SyntaxLines, client := Client}
+    #{channels := ChannelConf}
 ) ->
-    case data_to_points(Data, SyntaxLines) of
+    #{write_syntax := SyntaxLines} = maps:get(Channel, ChannelConf),
+    #{channel_client := Client} = maps:get(Channel, ChannelConf),
+    case data_to_points(Message, SyntaxLines) of
         {ok, Points} ->
             ?tp(
                 influxdb_connector_send_query,
                 #{points => Points, batch => false, mode => async}
             ),
-            do_async_query(InstId, Client, Points, {ReplyFun, Args});
+            do_async_query(InstId, Channel, Client, Points, {ReplyFun, Args});
         {error, ErrorPoints} = Err ->
             ?tp(
                 influxdb_connector_send_query_error,
@@ -132,15 +196,18 @@ on_batch_query_async(
     InstId,
     BatchData,
     {ReplyFun, Args},
-    #{write_syntax := SyntaxLines, client := Client}
+    #{channels := ChannelConf}
 ) ->
+    [{Channel, _} | _] = BatchData,
+    #{write_syntax := SyntaxLines} = maps:get(Channel, ChannelConf),
+    #{channel_client := Client} = maps:get(Channel, ChannelConf),
     case parse_batch_data(InstId, BatchData, SyntaxLines) of
         {ok, Points} ->
             ?tp(
                 influxdb_connector_send_query,
                 #{points => Points, batch => true, mode => async}
             ),
-            do_async_query(InstId, Client, Points, {ReplyFun, Args});
+            do_async_query(InstId, Channel, Client, Points, {ReplyFun, Args});
         {error, Reason} ->
             ?tp(
                 influxdb_connector_send_query_error,
@@ -149,13 +216,32 @@ on_batch_query_async(
             {error, {unrecoverable_error, Reason}}
     end.
 
+on_format_query_result(Result) ->
+    emqx_bridge_http_connector:on_format_query_result(Result).
+
 on_get_status(_InstId, #{client := Client}) ->
     case influxdb:is_alive(Client) andalso ok =:= influxdb:check_auth(Client) of
         true ->
-            connected;
+            ?status_connected;
         false ->
-            disconnected
+            ?status_disconnected
     end.
+
+transform_bridge_v1_config_to_connector_config(BridgeV1Config) ->
+    IndentKeys = [username, password, database, token, bucket, org],
+    ConnConfig0 = maps:without([write_syntax, precision], BridgeV1Config),
+    ConnConfig1 =
+        case emqx_utils_maps:indent(parameters, IndentKeys, ConnConfig0) of
+            #{parameters := #{database := _} = Params} = Conf ->
+                Conf#{parameters => Params#{influxdb_type => influxdb_api_v1}};
+            #{parameters := #{bucket := _} = Params} = Conf ->
+                Conf#{parameters => Params#{influxdb_type => influxdb_api_v2}}
+        end,
+    emqx_utils_maps:update_if_present(
+        resource_opts,
+        fun emqx_connector_schema:project_to_connector_resource_opts/1,
+        ConnConfig1
+    ).
 
 %% -------------------------------------------------------------------------------------------------
 %% schema
@@ -164,47 +250,88 @@ namespace() -> connector_influxdb.
 roots() ->
     [
         {config, #{
-            type => hoconsc:union(
-                [
-                    hoconsc:ref(?MODULE, influxdb_api_v1),
-                    hoconsc:ref(?MODULE, influxdb_api_v2)
-                ]
-            )
+            type => hoconsc:ref(?MODULE, "connector")
         }}
     ].
 
+fields("connector") ->
+    [
+        server_field(),
+        pool_size_field(),
+        parameter_field()
+    ] ++ emqx_connector_schema_lib:ssl_fields();
+fields("connector_influxdb_api_v1") ->
+    [influxdb_type_field(influxdb_api_v1) | influxdb_api_v1_fields()];
+fields("connector_influxdb_api_v2") ->
+    [influxdb_type_field(influxdb_api_v2) | influxdb_api_v2_fields()];
+%% ============ begin: schema for old bridge configs ============
+fields(influxdb_api_v1) ->
+    fields(common) ++ influxdb_api_v1_fields();
+fields(influxdb_api_v2) ->
+    fields(common) ++ influxdb_api_v2_fields();
 fields(common) ->
     [
-        {server, server()},
-        {precision,
-            %% The influxdb only supports these 4 precision:
-            %% See "https://github.com/influxdata/influxdb/blob/
-            %% 6b607288439a991261307518913eb6d4e280e0a7/models/points.go#L487" for
-            %% more information.
-            mk(enum([ns, us, ms, s]), #{
-                required => false, default => ms, desc => ?DESC("precision")
-            })}
-    ];
-fields(influxdb_api_v1) ->
-    fields(common) ++
-        [
-            {database, mk(binary(), #{required => true, desc => ?DESC("database")})},
-            {username, mk(binary(), #{desc => ?DESC("username")})},
-            {password,
-                mk(binary(), #{
-                    desc => ?DESC("password"),
-                    format => <<"password">>,
-                    sensitive => true,
-                    converter => fun emqx_schema:password_converter/2
-                })}
-        ] ++ emqx_connector_schema_lib:ssl_fields();
-fields(influxdb_api_v2) ->
-    fields(common) ++
-        [
-            {bucket, mk(binary(), #{required => true, desc => ?DESC("bucket")})},
-            {org, mk(binary(), #{required => true, desc => ?DESC("org")})},
-            {token, mk(binary(), #{required => true, desc => ?DESC("token")})}
-        ] ++ emqx_connector_schema_lib:ssl_fields().
+        server_field(),
+        precision_field(),
+        pool_size_field()
+    ] ++ emqx_connector_schema_lib:ssl_fields().
+%% ============ end: schema for old bridge configs ============
+
+influxdb_type_field(Type) ->
+    {influxdb_type, #{
+        required => true,
+        type => Type,
+        default => Type,
+        desc => ?DESC(atom_to_list(Type))
+    }}.
+
+server_field() ->
+    {server, server()}.
+
+precision_field() ->
+    {precision,
+        %% The influxdb only supports these 4 precision:
+        %% See "https://github.com/influxdata/influxdb/blob/
+        %% 6b607288439a991261307518913eb6d4e280e0a7/models/points.go#L487" for
+        %% more information.
+        mk(enum([ns, us, ms, s]), #{
+            required => false, default => ms, desc => ?DESC("precision")
+        })}.
+
+pool_size_field() ->
+    {pool_size,
+        mk(
+            integer(),
+            #{
+                required => false,
+                default => ?DEFAULT_POOL_SIZE,
+                desc => ?DESC("pool_size")
+            }
+        )}.
+
+parameter_field() ->
+    {parameters,
+        mk(
+            hoconsc:union([
+                ref(?MODULE, "connector_" ++ T)
+             || T <- ["influxdb_api_v1", "influxdb_api_v2"]
+            ]),
+            #{required => true, desc => ?DESC("influxdb_parameters")}
+        )}.
+
+influxdb_api_v1_fields() ->
+    [
+        {database, mk(binary(), #{required => true, desc => ?DESC("database")})},
+        {username, mk(binary(), #{desc => ?DESC("username")})},
+        {password, emqx_schema_secret:mk(#{desc => ?DESC("password")})}
+    ].
+
+influxdb_api_v2_fields() ->
+    [
+        {bucket, mk(binary(), #{required => true, desc => ?DESC("bucket")})},
+        {org, mk(binary(), #{required => true, desc => ?DESC("org")})},
+        {token, emqx_schema_secret:mk(#{required => true, desc => ?DESC("token")})}
+    ].
 
 server() ->
     Meta = #{
@@ -217,9 +344,19 @@ server() ->
 
 desc(common) ->
     ?DESC("common");
+desc(parameters) ->
+    ?DESC("influxdb_parameters");
+desc("influxdb_parameters") ->
+    ?DESC("influxdb_parameters");
 desc(influxdb_api_v1) ->
     ?DESC("influxdb_api_v1");
 desc(influxdb_api_v2) ->
+    ?DESC("influxdb_api_v2");
+desc("connector") ->
+    ?DESC("connector");
+desc("connector_influxdb_api_v1") ->
+    ?DESC("influxdb_api_v1");
+desc("connector_influxdb_api_v2") ->
     ?DESC("influxdb_api_v2").
 
 %% -------------------------------------------------------------------------------------------------
@@ -228,7 +365,7 @@ desc(influxdb_api_v2) ->
 start_client(InstId, Config) ->
     ClientConfig = client_config(InstId, Config),
     ?SLOG(info, #{
-        msg => "starting influxdb connector",
+        msg => "starting_influxdb_connector",
         connector => InstId,
         config => emqx_utils:redact(Config),
         client_config => emqx_utils:redact(ClientConfig)
@@ -243,7 +380,7 @@ start_client(InstId, Config) ->
         E:R:S ->
             ?tp(influxdb_connector_start_exception, #{error => {E, R}}),
             ?SLOG(warning, #{
-                msg => "start influxdb connector error",
+                msg => "start_influxdb_connector_error",
                 connector => InstId,
                 error => E,
                 reason => R,
@@ -252,24 +389,16 @@ start_client(InstId, Config) ->
             {error, R}
     end.
 
-do_start_client(
-    InstId,
-    ClientConfig,
-    Config = #{write_syntax := Lines}
-) ->
-    Precision = maps:get(precision, Config, ms),
+do_start_client(InstId, ClientConfig, Config) ->
     case influxdb:start_client(ClientConfig) of
         {ok, Client} ->
             case influxdb:is_alive(Client, true) of
                 true ->
                     case influxdb:check_auth(Client) of
                         ok ->
-                            State = #{
-                                client => Client,
-                                write_syntax => to_config(Lines, Precision)
-                            },
+                            State = #{client => Client, channels => #{}},
                             ?SLOG(info, #{
-                                msg => "starting influxdb connector success",
+                                msg => "starting_influxdb_connector_success",
                                 connector => InstId,
                                 client => redact_auth(Client),
                                 state => redact_auth(State)
@@ -286,7 +415,7 @@ do_start_client(
                             }),
                             %% no leak
                             _ = influxdb:stop_client(Client),
-                            {error, influxdb_client_auth_error}
+                            {error, connect_ok_but_auth_failed}
                     end;
                 {false, Reason} ->
                     ?tp(influxdb_connector_start_failed, #{
@@ -300,12 +429,12 @@ do_start_client(
                     }),
                     %% no leak
                     _ = influxdb:stop_client(Client),
-                    {error, influxdb_client_not_alive}
+                    {error, {connect_failed, Reason}}
             end;
         {error, {already_started, Client0}} ->
             ?tp(influxdb_connector_start_already_started, #{}),
             ?SLOG(info, #{
-                msg => "restarting influxdb connector, found already started client",
+                msg => "restarting_influxdb_connector_found_already_started_client",
                 connector => InstId,
                 old_client => redact_auth(Client0)
             }),
@@ -331,29 +460,22 @@ client_config(
     [
         {host, str(Host)},
         {port, Port},
-        {pool_size, erlang:system_info(schedulers)},
-        {pool, InstId},
-        {precision, atom_to_binary(maps:get(precision, Config, ms), utf8)}
+        {pool_size, maps:get(pool_size, Config, ?DEFAULT_POOL_SIZE)},
+        {pool, InstId}
     ] ++ protocol_config(Config).
 
 %% api v1 config
-protocol_config(
-    #{
-        database := DB,
-        ssl := SSL
-    } = Config
-) ->
+protocol_config(#{
+    parameters := #{influxdb_type := influxdb_api_v1, database := DB} = Params, ssl := SSL
+}) ->
     [
         {protocol, http},
         {version, v1},
         {database, str(DB)}
-    ] ++ username(Config) ++
-        password(Config) ++ ssl_config(SSL);
+    ] ++ username(Params) ++ password(Params) ++ ssl_config(SSL);
 %% api v2 config
 protocol_config(#{
-    bucket := Bucket,
-    org := Org,
-    token := Token,
+    parameters := #{influxdb_type := influxdb_api_v2, bucket := Bucket, org := Org, token := Token},
     ssl := SSL
 }) ->
     [
@@ -361,7 +483,8 @@ protocol_config(#{
         {version, v2},
         {bucket, str(Bucket)},
         {org, str(Org)},
-        {token, Token}
+        %% TODO: teach `influxdb` to accept 0-arity closures as passwords.
+        {token, emqx_secret:unwrap(Token)}
     ] ++ ssl_config(SSL).
 
 ssl_config(#{enable := false}) ->
@@ -381,7 +504,8 @@ username(_) ->
     [].
 
 password(#{password := Password}) ->
-    [{password, str(Password)}];
+    %% TODO: teach `influxdb` to accept 0-arity closures as passwords.
+    [{password, str(emqx_secret:unwrap(Password))}];
 password(_) ->
     [].
 
@@ -395,11 +519,12 @@ is_auth_key(_) ->
 
 %% -------------------------------------------------------------------------------------------------
 %% Query
-do_query(InstId, Client, Points) ->
+do_query(InstId, Channel, Client, Points) ->
+    emqx_trace:rendered_action_template(Channel, #{points => Points, is_async => false}),
     case influxdb:write(Client, Points) of
         ok ->
             ?SLOG(debug, #{
-                msg => "influxdb write point success",
+                msg => "influxdb_write_point_success",
                 connector => InstId,
                 points => Points
             });
@@ -414,7 +539,7 @@ do_query(InstId, Client, Points) ->
         {error, Reason} = Err ->
             ?tp(influxdb_connector_do_query_failure, #{error => Reason}),
             ?SLOG(error, #{
-                msg => "influxdb write point failed",
+                msg => "influxdb_write_point_failed",
                 connector => InstId,
                 reason => Reason
             }),
@@ -426,12 +551,13 @@ do_query(InstId, Client, Points) ->
             end
     end.
 
-do_async_query(InstId, Client, Points, ReplyFunAndArgs) ->
+do_async_query(InstId, Channel, Client, Points, ReplyFunAndArgs) ->
     ?SLOG(info, #{
-        msg => "influxdb write point async",
+        msg => "influxdb_write_point_async",
         connector => InstId,
         points => Points
     }),
+    emqx_trace:rendered_action_template(Channel, #{points => Points, is_async => true}),
     WrappedReplyFunAndArgs = {fun ?MODULE:reply_callback/2, [ReplyFunAndArgs]},
     {ok, _WorkerPid} = influxdb:write_async(Client, Points, WrappedReplyFunAndArgs).
 
@@ -448,7 +574,12 @@ reply_callback(ReplyFunAndArgs, {ok, 401, _, _}) ->
     ?tp(influxdb_connector_do_query_failure, #{error => <<"authorization failure">>}),
     Result = {error, {unrecoverable_error, <<"authorization failure">>}},
     emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result);
+reply_callback(ReplyFunAndArgs, {ok, Code, _, Body}) when ?IS_HTTP_ERROR(Code) ->
+    ?tp(influxdb_connector_do_query_failure, #{error => Body}),
+    Result = {error, {unrecoverable_error, Body}},
+    emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result);
 reply_callback(ReplyFunAndArgs, Result) ->
+    ?tp(influxdb_connector_do_query_ok, #{result => Result}),
     emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result).
 
 %% -------------------------------------------------------------------------------------------------
@@ -496,14 +627,23 @@ to_kv_config(KVfields) ->
 
 to_maps_config(K, V, Res) ->
     NK = emqx_placeholder:preproc_tmpl(bin(K)),
-    NV = emqx_placeholder:preproc_tmpl(bin(V)),
-    Res#{NK => NV}.
+    Res#{NK => preproc_quoted(V)}.
+
+preproc_quoted({quoted, V}) ->
+    {quoted, emqx_placeholder:preproc_tmpl(bin(V))};
+preproc_quoted(V) ->
+    emqx_placeholder:preproc_tmpl(bin(V)).
+
+proc_quoted({quoted, V}, Data, TransOpts) ->
+    {quoted, emqx_placeholder:proc_tmpl(V, Data, TransOpts)};
+proc_quoted(V, Data, TransOpts) ->
+    emqx_placeholder:proc_tmpl(V, Data, TransOpts).
 
 %% -------------------------------------------------------------------------------------------------
 %% Tags & Fields Data Trans
 parse_batch_data(InstId, BatchData, SyntaxLines) ->
     {Points, Errors} = lists:foldl(
-        fun({send_message, Data}, {ListOfPoints, ErrAccIn}) ->
+        fun({_, Data}, {ListOfPoints, ErrAccIn}) ->
             case data_to_points(Data, SyntaxLines) of
                 {ok, Points} ->
                     {[Points | ListOfPoints], ErrAccIn};
@@ -520,7 +660,8 @@ parse_batch_data(InstId, BatchData, SyntaxLines) ->
             {ok, lists:flatten(Points)};
         _ ->
             ?SLOG(error, #{
-                msg => io_lib:format("InfluxDB trans point failed, count: ~p", [Errors]),
+                msg => "influxdb_trans_point_failed",
+                error_count => Errors,
                 connector => InstId,
                 reason => points_trans_failed
             }),
@@ -574,8 +715,13 @@ parse_timestamp([TsBin]) ->
         {ok, binary_to_integer(TsBin)}
     catch
         _:_ ->
-            {error, TsBin}
-    end.
+            {error, {non_integer_timestamp, TsBin}}
+    end;
+parse_timestamp(InvalidTs) ->
+    %% The timestamp field must be a single integer or a single placeholder. i.e. the
+    %%   following is not allowed:
+    %%   - weather,location=us-midwest,season=summer temperature=82 ${timestamp}00
+    {error, {unsupported_placeholder_usage_for_timestamp, InvalidTs}}.
 
 continue_lines_to_points(Data, Item, Rest, ResultPointsAcc, ErrorPointsAcc) ->
     case line_to_point(Data, Item) of
@@ -597,8 +743,8 @@ line_to_point(
         precision := Precision
     } = Item
 ) ->
-    {_, EncodedTags} = maps:fold(fun maps_config_to_data/3, {Data, #{}}, Tags),
-    {_, EncodedFields} = maps:fold(fun maps_config_to_data/3, {Data, #{}}, Fields),
+    {_, EncodedTags, _} = maps:fold(fun maps_config_to_data/3, {Data, #{}, ?set_tag}, Tags),
+    {_, EncodedFields, _} = maps:fold(fun maps_config_to_data/3, {Data, #{}, ?set_field}, Fields),
     maps:without([precision], Item#{
         measurement => emqx_placeholder:proc_tmpl(Measurement, Data),
         tags => EncodedTags,
@@ -614,59 +760,127 @@ time_unit(ms) -> millisecond;
 time_unit(us) -> microsecond;
 time_unit(ns) -> nanosecond.
 
-maps_config_to_data(K, V, {Data, Res}) ->
+maps_config_to_data(K, V, {Data, Res, SetType}) ->
     KTransOptions = #{return => rawlist, var_trans => fun key_filter/1},
     VTransOptions = #{return => rawlist, var_trans => fun data_filter/1},
-    NK0 = emqx_placeholder:proc_tmpl(K, Data, KTransOptions),
-    NV = emqx_placeholder:proc_tmpl(V, Data, VTransOptions),
-    case {NK0, NV} of
+    NK = emqx_placeholder:proc_tmpl(K, Data, KTransOptions),
+    NV = proc_quoted(V, Data, VTransOptions),
+    case {NK, NV} of
         {[undefined], _} ->
-            {Data, Res};
+            {Data, Res, SetType};
         %% undefined value in normal format [undefined] or int/uint format [undefined, <<"i">>]
         {_, [undefined | _]} ->
-            {Data, Res};
+            {Data, Res, SetType};
+        {_, {quoted, [undefined | _]}} ->
+            {Data, Res, SetType};
         _ ->
-            NK = list_to_binary(NK0),
-            {Data, Res#{NK => value_type(NV)}}
+            NRes = Res#{
+                list_to_binary(NK) => value_type(NV, #{
+                    tmpl_type => tmpl_type(V), set_type => SetType
+                })
+            },
+            {Data, NRes, SetType}
     end.
 
-value_type([Int, <<"i">>]) when
-    is_integer(Int)
-->
+value_type([Number], #{set_type := ?set_tag}) when is_number(Number) ->
+    %% all `tag` values are treated as string
+    %% See also: https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/#tag-set
+    emqx_utils_conv:bin(Number);
+value_type([Str], #{set_type := ?set_tag}) when is_binary(Str) ->
+    Str;
+value_type({quoted, ValList}, _) ->
+    {string_list, ValList};
+value_type([Int, <<"i">>], #{tmpl_type := mixed}) when is_integer(Int) ->
     {int, Int};
-value_type([UInt, <<"u">>]) when
-    is_integer(UInt)
-->
+value_type([UInt, <<"u">>], #{tmpl_type := mixed}) when is_integer(UInt) ->
     {uint, UInt};
 %% write `1`, `1.0`, `-1.0` all as float
 %% see also: https://docs.influxdata.com/influxdb/v2.7/reference/syntax/line-protocol/#float
-value_type([Number]) when is_number(Number) ->
-    Number;
-value_type([<<"t">>]) ->
+value_type([Number], #{set_type := ?set_field}) when is_number(Number) ->
+    {float, Number};
+value_type([<<"t">>], _) ->
     't';
-value_type([<<"T">>]) ->
+value_type([<<"T">>], _) ->
     'T';
-value_type([true]) ->
+value_type([true], _) ->
     'true';
-value_type([<<"TRUE">>]) ->
+value_type([<<"TRUE">>], _) ->
     'TRUE';
-value_type([<<"True">>]) ->
+value_type([<<"True">>], _) ->
     'True';
-value_type([<<"f">>]) ->
+value_type([<<"f">>], _) ->
     'f';
-value_type([<<"F">>]) ->
+value_type([<<"F">>], _) ->
     'F';
-value_type([false]) ->
+value_type([false], _) ->
     'false';
-value_type([<<"FALSE">>]) ->
+value_type([<<"FALSE">>], _) ->
     'FALSE';
-value_type([<<"False">>]) ->
+value_type([<<"False">>], _) ->
     'False';
-value_type(Val) ->
-    Val.
+value_type([Str], #{tmpl_type := variable}) when is_binary(Str) ->
+    Str;
+value_type([Str], #{tmpl_type := literal, set_type := ?set_field}) when is_binary(Str) ->
+    %% if Str is a literal string suffixed with `i` or `u`, we should convert it to int/uint.
+    %% otherwise, we should convert it to float.
+    NumStr = binary:part(Str, 0, byte_size(Str) - 1),
+    case binary:part(Str, byte_size(Str), -1) of
+        <<"i">> ->
+            maybe_convert_to_integer(NumStr, Str, int);
+        <<"u">> ->
+            maybe_convert_to_integer(NumStr, Str, uint);
+        _ ->
+            maybe_convert_to_float_str(Str)
+    end;
+value_type(Str, _) ->
+    Str.
+
+tmpl_type([{str, _}]) ->
+    literal;
+tmpl_type([{var, _}]) ->
+    variable;
+tmpl_type(_) ->
+    mixed.
+
+maybe_convert_to_integer(NumStr, String, Type) ->
+    try
+        Int = binary_to_integer(NumStr),
+        {Type, Int}
+    catch
+        error:badarg ->
+            maybe_convert_to_integer_f(NumStr, String, Type)
+    end.
+
+maybe_convert_to_integer_f(NumStr, String, Type) ->
+    try
+        Float = binary_to_float(NumStr),
+        {Type, erlang:floor(Float)}
+    catch
+        error:badarg ->
+            String
+    end.
+
+maybe_convert_to_float_str(NumStr) ->
+    try
+        _ = binary_to_float(NumStr),
+        %% NOTE: return a {float, String} to avoid precision loss when converting to float
+        {float, NumStr}
+    catch
+        error:badarg ->
+            maybe_convert_to_float_str_i(NumStr)
+    end.
+
+maybe_convert_to_float_str_i(NumStr) ->
+    try
+        _ = binary_to_integer(NumStr),
+        {float, NumStr}
+    catch
+        error:badarg ->
+            NumStr
+    end.
 
 key_filter(undefined) -> undefined;
-key_filter(Value) -> emqx_utils_conv:bin(Value).
+key_filter(Value) -> bin(Value).
 
 data_filter(undefined) -> undefined;
 data_filter(Int) when is_integer(Int) -> Int;
@@ -681,7 +895,7 @@ log_error_points(InstId, Errs) ->
     lists:foreach(
         fun({error, Reason}) ->
             ?SLOG(error, #{
-                msg => "influxdb trans point failed",
+                msg => "influxdb_trans_point_failed",
                 connector => InstId,
                 reason => Reason
             })
@@ -693,7 +907,8 @@ convert_server(<<"http://", Server/binary>>, HoconOpts) ->
     convert_server(Server, HoconOpts);
 convert_server(<<"https://", Server/binary>>, HoconOpts) ->
     convert_server(Server, HoconOpts);
-convert_server(Server, HoconOpts) ->
+convert_server(Server0, HoconOpts) ->
+    Server = string:trim(Server0, trailing, "/"),
     emqx_schema:convert_servers(Server, HoconOpts).
 
 str(A) when is_atom(A) ->
@@ -704,6 +919,10 @@ str(S) when is_list(S) ->
     S.
 
 is_unrecoverable_error({error, {unrecoverable_error, _}}) ->
+    true;
+is_unrecoverable_error({error, {Code, _}}) when ?IS_HTTP_ERROR(Code) ->
+    true;
+is_unrecoverable_error({error, {Code, _, _Body}}) when ?IS_HTTP_ERROR(Code) ->
     true;
 is_unrecoverable_error(_) ->
     false.

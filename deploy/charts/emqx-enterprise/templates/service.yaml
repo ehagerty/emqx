@@ -8,6 +8,9 @@ metadata:
     helm.sh/chart: {{ include "emqx.chart" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
+  {{- if .Values.service.labels }}
+    {{- toYaml .Values.service.labels | nindent 4 }}
+  {{- end }}
   {{- if .Values.service.annotations }}
   annotations:
     {{- toYaml .Values.service.annotations | nindent 4 }}
@@ -18,6 +21,9 @@ spec:
   externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy | default "Cluster" }}
   {{- end }}
   {{- if eq .Values.service.type "LoadBalancer" }}
+  {{- if .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.service.loadBalancerClass }}
+  {{- end }}
   {{- if .Values.service.loadBalancerIP }}
   loadBalancerIP: {{ .Values.service.loadBalancerIP }}
   {{- end }}
@@ -38,17 +44,6 @@ spec:
     {{- else if eq .Values.service.type "ClusterIP" }}
     nodePort: null
     {{- end }}
-    {{- if not (empty .Values.emqxConfig.EMQX_LISTENERS__TCP__INTERNAL__BIND) }}
-  - name: internalmqtt
-    port: {{ .Values.service.internalmqtt | default 11883 }}
-    protocol: TCP
-    targetPort: internalmqtt
-    {{- if and (or (eq .Values.service.type "NodePort") (eq .Values.service.type "LoadBalancer")) (not (empty .Values.service.nodePorts.internalmqtt)) }}
-    nodePort: {{ .Values.service.nodePorts.internalmqtt }}
-    {{- else if eq .Values.service.type "ClusterIP" }}
-    nodePort: null
-    {{- end }}
-    {{ end }}
   - name: mqttssl
     port: {{ .Values.service.mqttssl | default 8883 }}
     protocol: TCP
@@ -96,6 +91,23 @@ spec:
     nodePort: null
     {{- end }}
   {{- end }}
+  {{- if not (empty .Values.service.customPorts) }}
+  {{- range $cPort := .Values.service.customPorts }}
+  - name: {{ $cPort.name }}
+    port: {{ $cPort.port }}
+    protocol: TCP
+    {{- if not (empty $cPort.targetPort) }}
+    targetPort: {{ $cPort.targetPort }}
+    {{- else }}
+    targetPort: {{ $cPort.name }}
+    {{- end }}
+    {{- if and (or (eq $.Values.service.type "NodePort") (eq $.Values.service.type "LoadBalancer")) (not (empty (get $.Values.service.customNodePorts  $cPort.name))) }}
+    nodePort: {{ (get $.Values.service.customNodePorts $cPort.name) }}
+    {{- else if eq $.Values.service.type "ClusterIP" }}
+    nodePort: null
+    {{- end }}
+  {{- end }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "emqx.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -121,12 +133,6 @@ spec:
     port: {{ .Values.service.mqtt | default 1883 }}
     protocol: TCP
     targetPort: mqtt
-    {{- if not (empty .Values.emqxConfig.EMQX_LISTENERS__TCP__INTERNAL__BIND) }}
-  - name: internalmqtt
-    port: {{ .Values.service.internalmqtt | default 11883 }}
-    protocol: TCP
-    targetPort: internalmqtt
-    {{ end }}
   - name: mqttssl
     port: {{ .Values.service.mqttssl | default 8883 }}
     protocol: TCP

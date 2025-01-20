@@ -1,5 +1,17 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
 %%--------------------------------------------------------------------
 
 -module(emqx_ldap_SUITE).
@@ -9,12 +21,14 @@
 
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("emqx/include/emqx.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("eldap/include/eldap.hrl").
 
--define(LDAP_HOST, "ldap").
 -define(LDAP_RESOURCE_MOD, emqx_ldap).
+-define(PROXY_HOST, "toxiproxy").
+-define(PROXY_PORT, 8474).
+-define(LDAP_HOST, ?PROXY_HOST).
 
 all() ->
     [
@@ -39,23 +53,30 @@ init_per_suite(Config) ->
     Port = port(tcp),
     case emqx_common_test_helpers:is_tcp_server_available(?LDAP_HOST, Port) of
         true ->
-            ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource]),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            Config;
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_ldap
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
+            [{apps, Apps} | Config];
         false ->
             {skip, no_ldap}
     end.
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_resource]),
-    _ = application:stop(emqx_connector).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
+    emqx_common_test_helpers:reset_proxy(?PROXY_HOST, ?PROXY_PORT),
     Config.
 
 end_per_testcase(_, _Config) ->
+    emqx_common_test_helpers:reset_proxy(?PROXY_HOST, ?PROXY_PORT),
     ok.
 
 % %%------------------------------------------------------------------------------
@@ -142,6 +163,31 @@ perform_lifecycle_check(ResourceId, InitialConfig) ->
     % Should not even be able to get the resource data out of ets now unlike just stopping.
     ?assertEqual({error, not_found}, emqx_resource:get_instance(ResourceId)).
 
+t_get_status(Config) ->
+    ResourceId = <<"emqx_ldap_status">>,
+    ProxyName = proxy_name(Config),
+
+    {ok, #{config := CheckedConfig}} = emqx_resource:check_config(
+        ?LDAP_RESOURCE_MOD, ldap_config(Config)
+    ),
+    {ok, _} = emqx_resource:create_local(
+        ResourceId,
+        ?CONNECTOR_RESOURCE_GROUP,
+        ?LDAP_RESOURCE_MOD,
+        CheckedConfig,
+        #{}
+    ),
+
+    ?assertEqual({ok, connected}, emqx_resource:health_check(ResourceId)),
+    emqx_common_test_helpers:with_failure(down, ProxyName, ?PROXY_HOST, ?PROXY_PORT, fun() ->
+        ?assertMatch(
+            {ok, Status} when Status =:= disconnected,
+            emqx_resource:health_check(ResourceId)
+        )
+    end),
+    ?assertEqual(ok, emqx_resource:remove_local(ResourceId)),
+    ok.
+
 % %%------------------------------------------------------------------------------
 % %% Helpers
 % %%------------------------------------------------------------------------------
@@ -154,7 +200,7 @@ ldap_config(Config) ->
             "    password = public\n"
             "    pool_size = 8\n"
             "    server = \"~s:~b\"\n"
-            "    base_object=\"uid=${username},ou=testdevice,dc=emqx,dc=io\"\n"
+            "    base_dn=\"uid=${username},ou=testdevice,dc=emqx,dc=io\"\n"
             "    filter =\"(objectClass=mqttUser)\"\n"
             "    ~ts\n"
             "",
@@ -190,5 +236,12 @@ ssl(Config) ->
             "ssl.enable=false";
         ssl ->
             "ssl.enable=true\n"
-            "ssl.cacertfile=\"etc/openldap/cacert.pem\""
+            "ssl.cacertfile=\"/etc/certs/ca.crt\""
     end.
+
+proxy_name(tcp) ->
+    "ldap_tcp";
+proxy_name(ssl) ->
+    "ldap_ssl";
+proxy_name(Config) ->
+    proxy_name(proplists:get_value(group, Config, tcp)).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,7 +24,8 @@
     register_der_crls/2,
     refresh/1,
     evict/1,
-    update_config/1
+    update_config/1,
+    info/0
 ]).
 
 %% gen_server callbacks
@@ -58,12 +59,14 @@
 -define(DEFAULT_CACHE_CAPACITY, 100).
 -define(CONF_KEY_PATH, [crl_cache]).
 
+-type duration() :: non_neg_integer().
+
 -record(state, {
-    refresh_timers = #{} :: #{binary() => timer:tref()},
-    refresh_interval = timer:minutes(15) :: timer:time(),
-    http_timeout = ?HTTP_TIMEOUT :: timer:time(),
+    refresh_timers = #{} :: #{binary() => reference()},
+    refresh_interval = timer:minutes(15) :: duration(),
+    http_timeout = ?HTTP_TIMEOUT :: duration(),
     %% keeps track of URLs by insertion time
-    insertion_times = gb_trees:empty() :: gb_trees:tree(timer:time(), url()),
+    insertion_times = gb_trees:empty() :: gb_trees:tree(duration(), url()),
     %% the set of cached URLs, for testing if an URL is already
     %% registered.
     cached_urls = sets:new([{version, 2}]) :: sets:set(url()),
@@ -71,7 +74,7 @@
     %% for future use
     extra = #{} :: map()
 }).
--type url() :: uri_string:uri_string().
+-type url() :: string().
 -type state() :: #state{}.
 
 %%--------------------------------------------------------------------
@@ -101,6 +104,11 @@ update_config(Conf) ->
 -spec register_der_crls(url(), [public_key:der_encoded()]) -> ok.
 register_der_crls(URL, CRLs) when is_list(CRLs) ->
     gen_server:cast(?MODULE, {register_der_crls, URL, CRLs}).
+
+-spec info() -> #{atom() => _}.
+info() ->
+    [state | State] = tuple_to_list(sys:get_state(?MODULE)),
+    maps:from_list(lists:zip(record_info(fields, state), State)).
 
 %%--------------------------------------------------------------------
 %% gen_server behaviour

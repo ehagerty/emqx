@@ -54,6 +54,8 @@ macros:
     value: ee
 code_reload:
   node: emqx@127.0.0.1
+formatting:
+  formatter: erlfmt
 EOF
 }
 
@@ -73,7 +75,7 @@ deps_dirs()
     for dir in _build/default/lib/*; do
         app=$(basename "${dir}")
         ## Only add applications that are not part of EMQX umbrella project:
-        [ -d "apps/${app}" ] || [ -d "lib-ce/${app}" ] || [ -d "lib-ee/${app}" ] ||
+        [ -d "apps/${app}" ] ||
             echo "  - \"${dir}\""
     done
 }
@@ -91,8 +93,6 @@ EOF
 cat <<EOF
 apps_dirs:
   - "apps/*"
-  - "lib-ce/*"
-  - "lib-ee/*"
 deps_dirs:
 $(deps_dirs)
   - "_build/test/lib/bbmustache"

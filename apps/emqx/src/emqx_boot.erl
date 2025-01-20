@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@
 
 -export([is_enabled/1]).
 
--define(BOOT_MODULES, [router, broker, listeners]).
+-define(BOOT_MODULES, [broker, listeners]).
 
--spec is_enabled(all | router | broker | listeners) -> boolean().
+-spec is_enabled(all | broker | listeners) -> boolean().
 is_enabled(Mod) ->
     (BootMods = boot_modules()) =:= all orelse lists:member(Mod, BootMods).
 

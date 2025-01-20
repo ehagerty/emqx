@@ -2,7 +2,7 @@
 {application, emqx_utils, [
     {description, "Miscellaneous utilities for EMQX apps"},
     % strict semver, bump manually!
-    {vsn, "5.0.5"},
+    {vsn, "5.4.4"},
     {modules, [
         emqx_utils,
         emqx_utils_api,
@@ -15,7 +15,9 @@
     {applications, [
         kernel,
         stdlib,
-        jiffy
+        jiffy,
+        erlang_qq,
+        emqx_http_lib
     ]},
     {env, []},
     {licenses, ["Apache-2.0"]},

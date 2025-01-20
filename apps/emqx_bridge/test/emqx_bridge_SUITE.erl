@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,19 +26,26 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    _ = application:load(emqx_conf),
-    %% to avoid inter-suite dependencies
-    application:stop(emqx_connector),
-    ok = emqx_common_test_helpers:start_apps([emqx, emqx_bridge]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_connector,
+            emqx_bridge_http,
+            emqx_bridge_mqtt,
+            emqx_bridge,
+            emqx_rule_engine
+        ],
+        #{work_dir => ?config(priv_dir, Config)}
+    ),
+    emqx_mgmt_api_test_util:init_suite(),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([
-        emqx,
-        emqx_bridge,
-        emqx_resource,
-        emqx_connector
-    ]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_mgmt_api_test_util:end_suite(),
+    ok = emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(t_get_basic_usage_info_1, Config) ->
     {ok, _} = emqx_cluster_rpc:start_link(node(), emqx_cluster_rpc, 1000),
@@ -54,9 +61,10 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(t_get_basic_usage_info_1, _Config) ->
     lists:foreach(
         fun({BridgeType, BridgeName}) ->
-            {ok, _} = emqx_bridge:remove(BridgeType, BridgeName)
+            ok = emqx_bridge:remove(BridgeType, BridgeName)
         end,
         [
+            %% Keep using the old bridge names to avoid breaking the tests
             {webhook, <<"basic_usage_info_webhook">>},
             {webhook, <<"basic_usage_info_webhook_disabled">>},
             {mqtt, <<"basic_usage_info_mqtt">>}
@@ -87,7 +95,7 @@ t_get_basic_usage_info_1(_Config) ->
         #{
             num_bridges => 3,
             count_by_type => #{
-                webhook => 1,
+                http => 1,
                 mqtt => 2
             }
         },
@@ -118,51 +126,48 @@ setup_fake_telemetry_data() ->
     HTTPConfig = #{
         url => <<"http://localhost:9901/messages/${topic}">>,
         enable => true,
-        local_topic => "emqx_webhook/#",
+        local_topic => "emqx_http/#",
         method => post,
         body => <<"${payload}">>,
         headers => #{},
         request_timeout => "15s"
     },
-    Conf =
-        #{
-            <<"bridges">> =>
-                #{
-                    <<"webhook">> =>
-                        #{
-                            <<"basic_usage_info_webhook">> => HTTPConfig,
-                            <<"basic_usage_info_webhook_disabled">> =>
-                                HTTPConfig#{enable => false}
-                        },
-                    <<"mqtt">> =>
-                        #{
-                            <<"basic_usage_info_mqtt">> => MQTTConfig1,
-                            <<"basic_usage_info_mqtt_from_select">> => MQTTConfig2
-                        }
-                }
-        },
-    ok = emqx_common_test_helpers:load_config(emqx_bridge_schema, Conf),
-
-    ok = snabbkaffe:start_trace(),
-    Predicate = fun(#{?snk_kind := K}) -> K =:= emqx_bridge_loaded end,
-    NEvents = 3,
-    BackInTime = 0,
-    Timeout = 11_000,
-    {ok, Sub} = snabbkaffe_collector:subscribe(Predicate, NEvents, Timeout, BackInTime),
-    ok = emqx_bridge:load(),
-    {ok, _} = snabbkaffe_collector:receive_events(Sub),
-    ok = snabbkaffe:stop(),
+    %% Keep use the old bridge names to test the backward compatibility
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(
+        <<"webhook">>,
+        <<"basic_usage_info_webhook">>,
+        HTTPConfig
+    ),
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(
+        <<"webhook">>,
+        <<"basic_usage_info_webhook_disabled">>,
+        HTTPConfig#{enable => false}
+    ),
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(
+        <<"mqtt">>,
+        <<"basic_usage_info_mqtt">>,
+        MQTTConfig1
+    ),
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(
+        <<"mqtt">>,
+        <<"basic_usage_info_mqtt_from_select">>,
+        MQTTConfig2
+    ),
     ok.
 
 t_update_ssl_conf(Config) ->
-    Path = proplists:get_value(config_path, Config),
-    CertDir = filename:join([emqx:mutable_certs_dir() | Path]),
+    [_Root, Type, Name] = proplists:get_value(config_path, Config),
+    CertDir = filename:join([emqx:mutable_certs_dir(), connectors, Type, Name]),
     EnableSSLConf = #{
         <<"bridge_mode">> => false,
         <<"clean_start">> => true,
         <<"keepalive">> => <<"60s">>,
         <<"proto_ver">> => <<"v4">>,
         <<"server">> => <<"127.0.0.1:1883">>,
+        <<"egress">> => #{
+            <<"local">> => #{<<"topic">> => <<"t">>},
+            <<"remote">> => #{<<"topic">> => <<"remote/t">>}
+        },
         <<"ssl">> =>
             #{
                 <<"cacertfile">> => cert_file("cafile"),
@@ -172,17 +177,75 @@ t_update_ssl_conf(Config) ->
                 <<"verify">> => <<"verify_peer">>
             }
     },
-    {ok, _} = emqx:update_config(Path, EnableSSLConf),
+    CreateCfg = [
+        {bridge_name, Name},
+        {bridge_type, Type},
+        {bridge_config, #{}}
+    ],
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(CreateCfg, EnableSSLConf),
     ?assertMatch({ok, [_, _, _]}, file:list_dir(CertDir)),
     NoSSLConf = EnableSSLConf#{<<"ssl">> := #{<<"enable">> => false}},
-    {ok, _} = emqx:update_config(Path, NoSSLConf),
+    {ok, _} = emqx_bridge_testlib:update_bridge_api(CreateCfg, NoSSLConf),
     {ok, _} = emqx_tls_certfile_gc:force(),
     ?assertMatch({error, enoent}, file:list_dir(CertDir)),
     ok.
 
+t_create_with_bad_name(_Config) ->
+    Path = [bridges, mqtt, 'test_哈哈'],
+    Conf = #{
+        <<"bridge_mode">> => false,
+        <<"clean_start">> => true,
+        <<"keepalive">> => <<"60s">>,
+        <<"proto_ver">> => <<"v4">>,
+        <<"server">> => <<"127.0.0.1:1883">>,
+        <<"ssl">> =>
+            #{
+                %% needed to trigger pre_config_update
+                <<"certfile">> => cert_file("certfile"),
+                <<"enable">> => true
+            }
+    },
+    ?assertMatch(
+        {error,
+            {pre_config_update, emqx_bridge_app, #{
+                reason := <<"Invalid name format.", _/binary>>,
+                kind := validation_error
+            }}},
+        emqx:update_config(Path, Conf)
+    ),
+    ok.
+
+t_create_with_bad_name_root(_Config) ->
+    BadBridgeName = <<"test_哈哈"/utf8>>,
+    BridgeConf = #{
+        <<"bridge_mode">> => false,
+        <<"clean_start">> => true,
+        <<"keepalive">> => <<"60s">>,
+        <<"proto_ver">> => <<"v4">>,
+        <<"server">> => <<"127.0.0.1:1883">>,
+        <<"ssl">> =>
+            #{
+                %% needed to trigger pre_config_update
+                <<"certfile">> => cert_file("certfile"),
+                <<"enable">> => true
+            }
+    },
+    Conf = #{<<"mqtt">> => #{BadBridgeName => BridgeConf}},
+    Path = [bridges],
+    ?assertMatch(
+        {error,
+            {pre_config_update, _ConfigHandlerMod, #{
+                kind := validation_error,
+                reason := bad_bridge_names,
+                bad_bridges := [#{type := <<"mqtt">>, name := BadBridgeName}]
+            }}},
+        emqx:update_config(Path, Conf)
+    ),
+    ok.
+
 data_file(Name) ->
-    Dir = code:lib_dir(emqx_bridge, test),
-    {ok, Bin} = file:read_file(filename:join([Dir, "data", Name])),
+    Dir = code:lib_dir(emqx_bridge),
+    {ok, Bin} = file:read_file(filename:join([Dir, "test", "data", Name])),
     Bin.
 
 cert_file(Name) ->

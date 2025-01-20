@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 -include("emqx_mgmt.hrl").
 -include_lib("emqx/include/emqx_cm.hrl").
+-include_lib("emqx/include/logger.hrl").
 
 -elvis([{elvis_style, invalid_dynamic_call, disable}]).
 -elvis([{elvis_style, god_modules, disable}]).
@@ -52,6 +53,7 @@
     kickout_clients/1,
     list_authz_cache/1,
     list_client_subscriptions/1,
+    list_client_msgs/3,
     client_subscriptions/2,
     clean_authz_cache/1,
     clean_authz_cache/2,
@@ -65,6 +67,9 @@
 
     do_kickout_clients/1
 ]).
+
+%% Internal exports
+-export([lookup_running_client/2]).
 
 %% Internal functions
 -export([do_call_client/2]).
@@ -107,10 +112,18 @@
 %% Common Table API
 -export([
     default_row_limit/0,
-    vm_stats/0
+    vm_stats/0,
+    vm_stats/1
 ]).
 
 -elvis([{elvis_style, god_modules, disable}]).
+
+-define(maybe_log_node_errors(LogData, Errors),
+    case Errors of
+        [] -> ok;
+        _ -> ?SLOG(error, ?MAPPEND(LogData, #{node_errors => Errors}))
+    end
+).
 
 %%--------------------------------------------------------------------
 %% Node Info
@@ -138,12 +151,10 @@ node_info() ->
         memory_used => erlang:round(Total * UsedRatio),
         process_available => erlang:system_info(process_limit),
         process_used => erlang:system_info(process_count),
-
-        max_fds => proplists:get_value(
-            max_fds, lists:usort(lists:flatten(erlang:system_info(check_io)))
-        ),
+        max_fds => esockd:ulimit(),
         connections => ets:info(?CHAN_TAB, size),
         live_connections => ets:info(?CHAN_LIVE_TAB, size),
+        cluster_sessions => ets:info(?CHAN_REG_TAB, size),
         node_status => 'running',
         uptime => proplists:get_value(uptime, BrokerInfo),
         version => iolist_to_binary(proplists:get_value(version, BrokerInfo)),
@@ -179,27 +190,50 @@ get_sys_memory() ->
     end.
 
 node_info(Nodes) ->
-    emqx_rpc:unwrap_erpc(emqx_management_proto_v4:node_info(Nodes)).
+    emqx_rpc:unwrap_erpc(emqx_management_proto_v5:node_info(Nodes)).
 
 stopped_node_info(Node) ->
     {Node, #{node => Node, node_status => 'stopped', role => core}}.
 
+%% Hide cpu stats if os_check is not supported.
 vm_stats() ->
-    Idle =
-        case cpu_sup:util([detailed]) of
-            %% Not support for Windows
-            {_, 0, 0, _} -> 0;
-            {_Num, _Use, IdleList, _} -> proplists:get_value(idle, IdleList, 0)
-        end,
-    RunQueue = erlang:statistics(run_queue),
     {MemUsedRatio, MemTotal} = get_sys_memory(),
-    [
-        {run_queue, RunQueue},
-        {cpu_idle, Idle},
-        {cpu_use, 100 - Idle},
-        {total_memory, MemTotal},
-        {used_memory, erlang:round(MemTotal * MemUsedRatio)}
-    ].
+    cpu_stats() ++
+        [
+            {run_queue, vm_stats('run.queue')},
+            {mnesia_tm_mailbox_size, emqx_broker_mon:get_mnesia_tm_mailbox_size()},
+            {broker_pool_max_mailbox_size, emqx_broker_mon:get_broker_pool_max_mailbox_size()},
+            {total_memory, MemTotal},
+            {used_memory, erlang:round(MemTotal * MemUsedRatio)}
+        ].
+
+cpu_stats() ->
+    case emqx_os_mon:is_os_check_supported() of
+        false ->
+            [];
+        true ->
+            vm_stats('cpu')
+    end.
+
+vm_stats('cpu') ->
+    CpuUtilArg = [],
+    case emqx_vm:cpu_util([CpuUtilArg]) of
+        %% return 0.0 when `emqx_cpu_sup_worker` is not started
+        {all, Use, Idle, _} ->
+            NUse = floor(Use * 100) / 100,
+            NIdle = ceil(Idle * 100) / 100,
+            [{cpu_use, NUse}, {cpu_idle, NIdle}];
+        _ ->
+            [{cpu_use, 0}, {cpu_idle, 0}]
+    end;
+vm_stats('total.memory') ->
+    {_, MemTotal} = get_sys_memory(),
+    MemTotal;
+vm_stats('used.memory') ->
+    {MemUsedRatio, MemTotal} = get_sys_memory(),
+    erlang:round(MemTotal * MemUsedRatio);
+vm_stats('run.queue') ->
+    erlang:statistics(run_queue).
 
 %%--------------------------------------------------------------------
 %% Brokers
@@ -218,12 +252,12 @@ broker_info() ->
     Info#{node => node(), otp_release => otp_rel(), node_status => 'running'}.
 
 convert_broker_info({uptime, Uptime}, M) ->
-    M#{uptime => emqx_datetime:human_readable_duration_string(Uptime)};
+    M#{uptime => emqx_utils_calendar:human_readable_duration_string(Uptime)};
 convert_broker_info({K, V}, M) ->
     M#{K => iolist_to_binary(V)}.
 
 broker_info(Nodes) ->
-    emqx_rpc:unwrap_erpc(emqx_management_proto_v4:broker_info(Nodes)).
+    emqx_rpc:unwrap_erpc(emqx_management_proto_v5:broker_info(Nodes)).
 
 %%--------------------------------------------------------------------
 %% Metrics and Stats
@@ -234,6 +268,12 @@ get_metrics() ->
 
 get_metrics(Node) ->
     unwrap_rpc(emqx_proto_v1:get_metrics(Node)).
+
+aggregated_only_keys() ->
+    [
+        'durable_subscriptions.count',
+        'durable_subscriptions.max'
+    ].
 
 get_stats() ->
     GlobalStatsKeys =
@@ -259,7 +299,7 @@ get_stats() ->
             emqx:running_nodes()
         )
     ),
-    GlobalStats = maps:with(GlobalStatsKeys, maps:from_list(get_stats(node()))),
+    GlobalStats = maps:with(GlobalStatsKeys, maps:from_list(emqx_stats:getstats())),
     maps:merge(CountStats, GlobalStats).
 
 delete_keys(List, []) ->
@@ -268,7 +308,12 @@ delete_keys(List, [Key | Keys]) ->
     delete_keys(proplists:delete(Key, List), Keys).
 
 get_stats(Node) ->
-    unwrap_rpc(emqx_proto_v1:get_stats(Node)).
+    case unwrap_rpc(emqx_proto_v1:get_stats(Node)) of
+        {error, _} = Error ->
+            Error;
+        Stats when is_list(Stats) ->
+            delete_keys(Stats, aggregated_only_keys())
+    end.
 
 nodes_info_count(PropList) ->
     NodeCount =
@@ -287,10 +332,16 @@ nodes_info_count(PropList) ->
 %%--------------------------------------------------------------------
 
 lookup_client({clientid, ClientId}, FormatFun) ->
-    lists:append([
-        lookup_client(Node, {clientid, ClientId}, FormatFun)
-     || Node <- emqx:running_nodes()
-    ]);
+    IsPersistenceEnabled = emqx_persistent_message:is_persistence_enabled(),
+    case lookup_running_client(ClientId, FormatFun) of
+        [] when IsPersistenceEnabled ->
+            case emqx_persistent_session_ds_state:print_session(ClientId) of
+                undefined -> [];
+                Session -> [maybe_format(FormatFun, {ClientId, Session})]
+            end;
+        Res ->
+            Res
+    end;
 lookup_client({username, Username}, FormatFun) ->
     lists:append([
         lookup_client(Node, {username, Username}, FormatFun)
@@ -320,6 +371,10 @@ kickout_client(ClientId) ->
     case lookup_client({clientid, ClientId}, undefined) of
         [] ->
             {error, not_found};
+        [{ClientId, _}] ->
+            %% Offline durable session (client ID is a plain binary
+            %% without channel pid):
+            emqx_persistent_session_ds:kick_offline_session(ClientId);
         _ ->
             Results = [kickout_client(Node, ClientId) || Node <- emqx:running_nodes()],
             check_results(Results)
@@ -330,9 +385,10 @@ kickout_client(Node, ClientId) ->
 
 kickout_clients(ClientIds) when is_list(ClientIds) ->
     F = fun(Node) ->
-        emqx_management_proto_v4:kickout_clients(Node, ClientIds)
+        emqx_management_proto_v5:kickout_clients(Node, ClientIds)
     end,
     Results = lists:map(F, emqx:running_nodes()),
+    lists:foreach(fun emqx_persistent_session_ds:kick_offline_session/1, ClientIds),
     case lists:filter(fun(Res) -> Res =/= ok end, Results) of
         [] ->
             ok;
@@ -354,6 +410,15 @@ list_authz_cache(ClientId) ->
     call_client(ClientId, list_authz_cache).
 
 list_client_subscriptions(ClientId) ->
+    case emqx_persistent_session_ds:list_client_subscriptions(ClientId) of
+        {error, not_found} ->
+            list_client_subscriptions_mem(ClientId);
+        Result ->
+            Result
+    end.
+
+%% List subscriptions of an in-memory session:
+list_client_subscriptions_mem(ClientId) ->
     case lookup_client({clientid, ClientId}, undefined) of
         [] ->
             {error, not_found};
@@ -371,6 +436,12 @@ list_client_subscriptions(ClientId) ->
                 [Result | _] -> Result
             end
     end.
+
+list_client_msgs(MsgsType, ClientId, PagerParams) when
+    MsgsType =:= inflight_msgs;
+    MsgsType =:= mqueue_msgs
+->
+    call_client(ClientId, {MsgsType, PagerParams}).
 
 client_subscriptions(Node, ClientId) ->
     {Node, unwrap_rpc(emqx_broker_proto_v1:list_client_subscriptions(Node, ClientId))}.
@@ -415,17 +486,34 @@ set_keepalive(_ClientId, _Interval) ->
 
 %% @private
 call_client(ClientId, Req) ->
-    Results = [call_client(Node, ClientId, Req) || Node <- emqx:running_nodes()],
-    Expected = lists:filter(
+    case emqx_cm_registry:is_enabled() of
+        true ->
+            do_call_client(ClientId, Req);
+        false ->
+            call_client_on_all_nodes(ClientId, Req)
+    end.
+
+call_client_on_all_nodes(ClientId, Req) ->
+    Nodes = emqx:running_nodes(),
+    Results = call_client(Nodes, ClientId, Req),
+    {Expected, Errs} = lists:foldr(
         fun
-            ({error, _}) -> false;
-            (_) -> true
+            ({_N, {error, not_found}}, Acc) -> Acc;
+            ({_N, {error, _}} = Err, {OkAcc, ErrAcc}) -> {OkAcc, [Err | ErrAcc]};
+            ({_N, OkRes}, {OkAcc, ErrAcc}) -> {[OkRes | OkAcc], ErrAcc}
         end,
-        Results
+        {[], []},
+        lists:zip(Nodes, Results)
     ),
+    ?maybe_log_node_errors(#{msg => "call_client_failed", request => Req}, Errs),
     case Expected of
-        [] -> {error, not_found};
-        [Result | _] -> Result
+        [] ->
+            case Errs of
+                [] -> {error, not_found};
+                [{_Node, FirstErr} | _] -> FirstErr
+            end;
+        [Result | _] ->
+            Result
     end.
 
 %% @private
@@ -438,15 +526,15 @@ do_call_client(ClientId, Req) ->
             Pid = lists:last(Pids),
             case emqx_cm:get_chan_info(ClientId, Pid) of
                 #{conninfo := #{conn_mod := ConnMod}} ->
-                    erlang:apply(ConnMod, call, [Pid, Req]);
+                    call_conn(ConnMod, Pid, Req);
                 undefined ->
                     {error, not_found}
             end
     end.
 
 %% @private
-call_client(Node, ClientId, Req) ->
-    unwrap_rpc(emqx_management_proto_v4:call_client(Node, ClientId, Req)).
+call_client(Nodes, ClientId, Req) ->
+    emqx_rpc:unwrap_erpc(emqx_management_proto_v5:call_client(Nodes, ClientId, Req)).
 
 %%--------------------------------------------------------------------
 %% Subscriptions
@@ -459,7 +547,7 @@ do_list_subscriptions() ->
     throw(not_implemented).
 
 list_subscriptions(Node) ->
-    unwrap_rpc(emqx_management_proto_v4:list_subscriptions(Node)).
+    unwrap_rpc(emqx_management_proto_v5:list_subscriptions(Node)).
 
 list_subscriptions_via_topic(Topic, FormatFun) ->
     lists:append([
@@ -478,10 +566,21 @@ list_subscriptions_via_topic(Node, Topic, _FormatFun = {M, F}) ->
 %%--------------------------------------------------------------------
 
 subscribe(ClientId, TopicTables) ->
-    subscribe(emqx:running_nodes(), ClientId, TopicTables).
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            subscribe(emqx:running_nodes(), ClientId, TopicTables);
+        true ->
+            with_client_node(
+                ClientId,
+                {error, channel_not_found},
+                fun(Node) ->
+                    subscribe([Node], ClientId, TopicTables)
+                end
+            )
+    end.
 
 subscribe([Node | Nodes], ClientId, TopicTables) ->
-    case unwrap_rpc(emqx_management_proto_v4:subscribe(Node, ClientId, TopicTables)) of
+    case unwrap_rpc(emqx_management_proto_v5:subscribe(Node, ClientId, TopicTables)) of
         {error, _} -> subscribe(Nodes, ClientId, TopicTables);
         {subscribe, Res} -> {subscribe, Res, Node}
     end;
@@ -508,7 +607,7 @@ unsubscribe(ClientId, Topic) ->
 -spec unsubscribe([node()], emqx_types:clientid(), emqx_types:topic()) ->
     {unsubscribe, _} | {error, channel_not_found}.
 unsubscribe([Node | Nodes], ClientId, Topic) ->
-    case unwrap_rpc(emqx_management_proto_v4:unsubscribe(Node, ClientId, Topic)) of
+    case unwrap_rpc(emqx_management_proto_v5:unsubscribe(Node, ClientId, Topic)) of
         {error, _} -> unsubscribe(Nodes, ClientId, Topic);
         Re -> Re
     end;
@@ -526,12 +625,23 @@ do_unsubscribe(ClientId, Topic) ->
 -spec unsubscribe_batch(emqx_types:clientid(), [emqx_types:topic()]) ->
     {unsubscribe, _} | {error, channel_not_found}.
 unsubscribe_batch(ClientId, Topics) ->
-    unsubscribe_batch(emqx:running_nodes(), ClientId, Topics).
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            unsubscribe_batch(emqx:running_nodes(), ClientId, Topics);
+        true ->
+            with_client_node(
+                ClientId,
+                {error, channel_not_found},
+                fun(Node) ->
+                    unsubscribe_batch([Node], ClientId, Topics)
+                end
+            )
+    end.
 
 -spec unsubscribe_batch([node()], emqx_types:clientid(), [emqx_types:topic()]) ->
     {unsubscribe_batch, _} | {error, channel_not_found}.
 unsubscribe_batch([Node | Nodes], ClientId, Topics) ->
-    case unwrap_rpc(emqx_management_proto_v4:unsubscribe_batch(Node, ClientId, Topics)) of
+    case unwrap_rpc(emqx_management_proto_v5:unsubscribe_batch(Node, ClientId, Topics)) of
         {error, _} -> unsubscribe_batch(Nodes, ClientId, Topics);
         Re -> Re
     end;
@@ -598,8 +708,37 @@ delete_banned(Who) ->
     emqx_banned:delete(Who).
 
 %%--------------------------------------------------------------------
+%% Internal exports
+%%--------------------------------------------------------------------
+
+lookup_running_client(ClientId, FormatFun) ->
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            lists:append([
+                lookup_client(Node, {clientid, ClientId}, FormatFun)
+             || Node <- emqx:running_nodes()
+            ]);
+        true ->
+            with_client_node(
+                ClientId,
+                _WhenNotFound = [],
+                fun(Node) -> lookup_client(Node, {clientid, ClientId}, FormatFun) end
+            )
+    end.
+
+%%--------------------------------------------------------------------
 %% Internal Functions.
 %%--------------------------------------------------------------------
+
+with_client_node(ClientId, WhenNotFound, Fn) ->
+    case emqx_cm_registry:lookup_channels(ClientId) of
+        [ChanPid | _] ->
+            Node = node(ChanPid),
+            Fn(Node);
+        [] ->
+            WhenNotFound
+    end.
+
 unwrap_rpc({badrpc, Reason}) ->
     {error, Reason};
 unwrap_rpc(Res) ->
@@ -616,3 +755,32 @@ check_results(Results) ->
 
 default_row_limit() ->
     ?DEFAULT_ROW_LIMIT.
+
+call_conn(ConnMod, Pid, Req) ->
+    try
+        erlang:apply(ConnMod, call, [Pid, Req])
+    catch
+        exit:R when R =:= shutdown; R =:= normal ->
+            {error, shutdown};
+        exit:{R, _} when R =:= shutdown; R =:= noproc ->
+            {error, shutdown};
+        exit:{{shutdown, _OOMInfo}, _Location} ->
+            {error, shutdown};
+        exit:timeout ->
+            LogData = #{
+                msg => "call_client_connection_process_timeout",
+                request => Req,
+                pid => Pid,
+                module => ConnMod
+            },
+            LogData1 =
+                case node(Pid) =:= node() of
+                    true ->
+                        LogData#{stacktrace => erlang:process_info(Pid, current_stacktrace)};
+                    false ->
+                        LogData
+                end,
+
+            ?SLOG(warning, LogData1),
+            {error, timeout}
+    end.

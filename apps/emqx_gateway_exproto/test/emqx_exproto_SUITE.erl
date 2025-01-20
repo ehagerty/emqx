@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("emqx/include/emqx_hooks.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
@@ -43,14 +43,6 @@
 
 -define(TCPOPTS, [binary, {active, false}]).
 -define(DTLSOPTS, [binary, {active, false}, {protocol, dtls}]).
-
--define(PORT, 7993).
-
--define(DEFAULT_CLIENT, #{
-    proto_name => <<"demo">>,
-    proto_ver => <<"v0.1">>,
-    clientid => <<"test_client_1">>
-}).
 
 %%--------------------------------------------------------------------
 -define(CONF_DEFAULT, <<
@@ -77,7 +69,8 @@ all() ->
         {group, udp_listener},
         {group, dtls_listener},
         {group, https_grpc_server},
-        {group, streaming_connection_handler}
+        {group, streaming_connection_handler},
+        {group, hostname_grpc_server}
     ].
 
 suite() ->
@@ -90,6 +83,7 @@ groups() ->
         t_raw_publish,
         t_auth_deny,
         t_acl_deny,
+        t_auth_expire,
         t_hook_connected_disconnected,
         t_hook_session_subscribed_unsubscribed,
         t_hook_message_delivered
@@ -100,7 +94,8 @@ groups() ->
         {udp_listener, [sequence], MainCases},
         {dtls_listener, [sequence], MainCases},
         {streaming_connection_handler, [sequence], MainCases},
-        {https_grpc_server, [sequence], MainCases}
+        {https_grpc_server, [sequence], MainCases},
+        {hostname_grpc_server, [sequence], MainCases}
     ].
 
 init_per_group(GrpName, Cfg) when
@@ -116,25 +111,53 @@ init_per_group(GrpName, Cfg) when
             udp_listener -> udp;
             dtls_listener -> dtls
         end,
-    init_per_group(LisType, 'ConnectionUnaryHandler', http, Cfg);
-init_per_group(https_grpc_server, Cfg) ->
-    init_per_group(tcp, 'ConnectionUnaryHandler', https, Cfg);
-init_per_group(streaming_connection_handler, Cfg) ->
-    init_per_group(tcp, 'ConnectionHandler', http, Cfg);
-init_per_group(_, Cfg) ->
-    init_per_group(tcp, 'ConnectionUnaryHandler', http, Cfg).
+    init_per_group(GrpName, LisType, 'ConnectionUnaryHandler', http, Cfg);
+init_per_group(https_grpc_server = GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionUnaryHandler', https, Cfg);
+init_per_group(streaming_connection_handler = GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionHandler', http, Cfg);
+init_per_group(GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionUnaryHandler', http, Cfg).
 
-init_per_group(LisType, ServiceName, Scheme, Cfg) ->
+init_per_group(GrpName, LisType, ServiceName, Scheme, Cfg) ->
     Svrs = emqx_exproto_echo_svr:start(Scheme),
-    application:load(emqx_gateway_exproto),
-    emqx_common_test_helpers:start_apps(
-        [emqx_conf, emqx_authn, emqx_gateway],
-        fun(App) ->
-            set_special_cfg(App, LisType, ServiceName, Scheme)
-        end
+    Addrs = lists:flatten(
+        io_lib:format("~s://~s:9001", [
+            Scheme,
+            case GrpName of
+                hostname_grpc_server ->
+                    "localhost";
+                _ ->
+                    "127.0.0.1"
+            end
+        ])
+    ),
+    GWConfig = #{
+        server => #{bind => 9100},
+        idle_timeout => 5000,
+        mountpoint => <<"ct/">>,
+        handler => #{
+            address => Addrs,
+            service_name => ServiceName,
+            ssl_options => #{enable => Scheme == https}
+        },
+        listeners => listener_confs(LisType)
+    },
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth,
+            {emqx_gateway, #{
+                config =>
+                    #{gateway => #{exproto => GWConfig}}
+            }},
+            emqx_gateway_exproto
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Cfg)}
     ),
     [
         {servers, Svrs},
+        {apps, Apps},
         {listener_type, LisType},
         {service_name, ServiceName},
         {grpc_client_scheme, Scheme}
@@ -142,44 +165,31 @@ init_per_group(LisType, ServiceName, Scheme, Cfg) ->
     ].
 
 end_per_group(_, Cfg) ->
-    emqx_config:erase(gateway),
-    emqx_common_test_helpers:stop_apps([emqx_gateway, emqx_authn, emqx_conf]),
+    ok = emqx_cth_suite:stop(proplists:get_value(apps, Cfg)),
     emqx_exproto_echo_svr:stop(proplists:get_value(servers, Cfg)).
 
 init_per_testcase(TestCase, Cfg) when
     TestCase == t_enter_passive_mode
 ->
+    snabbkaffe:start_trace(),
     case proplists:get_value(listener_type, Cfg) of
         udp -> {skip, ignore};
         _ -> Cfg
     end;
 init_per_testcase(_TestCase, Cfg) ->
+    snabbkaffe:start_trace(),
     Cfg.
 
 end_per_testcase(_TestCase, _Cfg) ->
-    ok.
-
-set_special_cfg(emqx_gateway, LisType, ServiceName, Scheme) ->
-    Addrs = lists:flatten(io_lib:format("~s://127.0.0.1:9001", [Scheme])),
-    emqx_config:put(
-        [gateway, exproto],
-        #{
-            server => #{bind => 9100},
-            idle_timeout => 5000,
-            mountpoint => <<"ct/">>,
-            handler => #{
-                address => Addrs,
-                service_name => ServiceName,
-                ssl_options => #{enable => Scheme == https}
-            },
-            listeners => listener_confs(LisType)
-        }
-    );
-set_special_cfg(_, _, _, _) ->
+    snabbkaffe:stop(),
     ok.
 
 listener_confs(Type) ->
-    Default = #{bind => 7993, acceptors => 8},
+    Default = #{
+        bind => 7993,
+        max_connections => 64,
+        access_rules => ["allow all"]
+    },
     #{Type => #{'default' => maps:merge(Default, socketopts(Type))}}.
 
 default_config() ->
@@ -297,6 +307,42 @@ t_auth_deny(Cfg) ->
         end,
     meck:unload([emqx_gateway_ctx]).
 
+t_auth_expire(Cfg) ->
+    SockType = proplists:get_value(listener_type, Cfg),
+    Sock = open(SockType),
+
+    Client = #{
+        proto_name => <<"demo">>,
+        proto_ver => <<"v0.1">>,
+        clientid => <<"test_client_1">>
+    },
+    Password = <<"123456">>,
+
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 500}}
+        end
+    ),
+
+    ConnBin = frame_connect(Client, Password),
+    ConnAckBin = frame_connack(0),
+
+    ?assertWaitEvent(
+        begin
+            send(Sock, ConnBin),
+            {ok, ConnAckBin} = recv(Sock, 5000)
+        end,
+        #{
+            ?snk_kind := conn_process_terminated,
+            clientid := <<"test_client_1">>,
+            reason := {shutdown, expired}
+        },
+        5000
+    ).
+
 t_acl_deny(Cfg) ->
     SockType = proplists:get_value(listener_type, Cfg),
     Sock = open(SockType),
@@ -339,7 +385,6 @@ t_acl_deny(Cfg) ->
     close(Sock).
 
 t_keepalive_timeout(Cfg) ->
-    ok = snabbkaffe:start_trace(),
     SockType = proplists:get_value(listener_type, Cfg),
     Sock = open(SockType),
 
@@ -390,8 +435,7 @@ t_keepalive_timeout(Cfg) ->
             ?assertEqual(1, length(?of_kind(conn_process_terminated, Trace))),
             %% socket port should be closed
             ?assertEqual({error, closed}, recv(Sock, 5000))
-    end,
-    snabbkaffe:stop().
+    end.
 
 t_hook_connected_disconnected(Cfg) ->
     SockType = proplists:get_value(listener_type, Cfg),
@@ -408,11 +452,18 @@ t_hook_connected_disconnected(Cfg) ->
     ConnAckBin = frame_connack(0),
 
     Parent = self(),
+    emqx_hooks:add('client.connect', {?MODULE, hook_fun0, [Parent]}, 1000),
     emqx_hooks:add('client.connected', {?MODULE, hook_fun1, [Parent]}, 1000),
     emqx_hooks:add('client.disconnected', {?MODULE, hook_fun2, [Parent]}, 1000),
 
     send(Sock, ConnBin),
     {ok, ConnAckBin} = recv(Sock, 5000),
+
+    receive
+        connect -> ok
+    after 1000 ->
+        error(hook_is_not_running)
+    end,
 
     receive
         connected -> ok
@@ -433,6 +484,7 @@ t_hook_connected_disconnected(Cfg) ->
         begin
             {error, closed} = recv(Sock, 5000)
         end,
+    emqx_hooks:del('client.connect', {?MODULE, hook_fun0}),
     emqx_hooks:del('client.connected', {?MODULE, hook_fun1}),
     emqx_hooks:del('client.disconnected', {?MODULE, hook_fun2}).
 
@@ -520,7 +572,6 @@ t_hook_message_delivered(Cfg) ->
     emqx_hooks:del('message.delivered', {?MODULE, hook_fun5}).
 
 t_idle_timeout(Cfg) ->
-    ok = snabbkaffe:start_trace(),
     SockType = proplists:get_value(listener_type, Cfg),
     Sock = open(SockType),
 
@@ -558,11 +609,14 @@ t_idle_timeout(Cfg) ->
                 {ok, #{reason := {shutdown, idle_timeout}}},
                 ?block_until(#{?snk_kind := conn_process_terminated}, 10000)
             )
-    end,
-    snabbkaffe:stop().
+    end.
 
 %%--------------------------------------------------------------------
 %% Utils
+
+hook_fun0(_, _, Parent) ->
+    Parent ! connect,
+    ok.
 
 hook_fun1(_, _, Parent) ->
     Parent ! connected,
@@ -593,11 +647,11 @@ open(udp) ->
     {ok, Sock} = gen_udp:open(0, ?TCPOPTS),
     {udp, Sock};
 open(ssl) ->
-    SslOpts = maps:to_list(client_ssl_opts()),
+    SslOpts = client_ssl_opts(),
     {ok, SslSock} = ssl:connect("127.0.0.1", 7993, ?TCPOPTS ++ SslOpts),
     {ssl, SslSock};
 open(dtls) ->
-    SslOpts = maps:to_list(client_ssl_opts()),
+    SslOpts = client_ssl_opts(),
     {ok, SslSock} = ssl:connect("127.0.0.1", 7993, ?DTLSOPTS ++ SslOpts),
     {dtls, SslSock}.
 
@@ -636,18 +690,23 @@ close({dtls, Sock}) ->
 %% Server-Opts
 
 socketopts(tcp) ->
-    #{tcp => tcp_opts()};
+    #{
+        acceptors => 8,
+        tcp_options => tcp_opts()
+    };
 socketopts(ssl) ->
     #{
-        tcp => tcp_opts(),
-        ssl => ssl_opts()
+        acceptors => 8,
+        tcp_options => tcp_opts(),
+        ssl_options => ssl_opts()
     };
 socketopts(udp) ->
-    #{udp => udp_opts()};
+    #{udp_options => udp_opts()};
 socketopts(dtls) ->
     #{
-        udp => udp_opts(),
-        dtls => dtls_opts()
+        acceptors => 8,
+        udp_options => udp_opts(),
+        dtls_options => dtls_opts()
     }.
 
 tcp_opts() ->
@@ -663,9 +722,11 @@ tcp_opts() ->
 
 udp_opts() ->
     #{
-        recbuf => 1024,
-        sndbuf => 1024,
-        buffer => 1024,
+        %% NOTE
+        %% Making those too small will lead to inability to accept connections.
+        recbuf => 2048,
+        sndbuf => 2048,
+        buffer => 2048,
         reuseaddr => true
     }.
 
@@ -691,7 +752,8 @@ dtls_opts() ->
 %% Client-Opts
 
 client_ssl_opts() ->
-    certs("client-key.pem", "client-cert.pem", "cacert.pem").
+    OptsWithCerts = certs("client-key.pem", "client-cert.pem", "cacert.pem"),
+    [{verify, verify_none} | maps:to_list(OptsWithCerts)].
 
 certs(Key, Cert, CACert) ->
     CertsPath = emqx_common_test_helpers:deps_path(emqx, "etc/certs"),

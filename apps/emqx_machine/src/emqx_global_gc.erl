@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,7 +43,8 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec run() -> {ok, timer:time()}.
+%% @doc Run global garbage collection and return the time (in milliseconds) spent.
+-spec run() -> {ok, non_neg_integer()}.
 run() -> gen_server:call(?MODULE, run, infinity).
 
 -spec stop() -> ok.

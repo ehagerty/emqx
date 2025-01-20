@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_cli_SUITE).
@@ -14,13 +14,21 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([emqx_eviction_agent]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_eviction_agent
+        ],
+        #{
+            work_dir => emqx_cth_suite:work_dir(Config)
+        }
+    ),
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
     _ = emqx_eviction_agent:disable(foo),
-    emqx_common_test_helpers:stop_apps([emqx_eviction_agent]),
-    Config.
+
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 %%--------------------------------------------------------------------
 %% Tests

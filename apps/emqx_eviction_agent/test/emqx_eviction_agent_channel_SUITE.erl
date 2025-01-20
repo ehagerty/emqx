@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_channel_SUITE).
@@ -9,7 +9,6 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
--include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("emqx/include/emqx_channel.hrl").
 
 -define(CLIENT_ID, <<"client_with_session">>).
@@ -23,22 +22,20 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_eviction_agent]),
-    {ok, _} = emqx:update_config([rpc, port_discovery], manual),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx,
+            emqx_eviction_agent
+        ],
+        #{
+            work_dir => emqx_cth_suite:work_dir(Config)
+        }
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_eviction_agent, emqx_conf]).
-
-init_per_testcase(t_persistence, _Config) ->
-    {skip, "Existing session persistence implementation is being phased out"};
-init_per_testcase(_TestCase, Config) ->
-    Config.
-
-end_per_testcase(t_persistence, Config) ->
-    Config;
-end_per_testcase(_TestCase, _Config) ->
-    ok.
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 %%--------------------------------------------------------------------
 %% Tests
@@ -199,40 +196,6 @@ t_get_connected_client_count(_Config) ->
         0,
         emqx_cm:get_connected_client_count()
     ).
-
-t_persistence(_Config) ->
-    erlang:process_flag(trap_exit, true),
-
-    Topic = <<"t1">>,
-    Message = <<"message_to_persist">>,
-
-    {ok, C0} = emqtt_connect(?CLIENT_ID, false),
-    {ok, _, _} = emqtt:subscribe(C0, Topic, 0),
-
-    Opts = evict_session_opts(?CLIENT_ID),
-    {ok, Pid} = emqx_eviction_agent_channel:start_supervised(Opts),
-
-    {ok, C1} = emqtt_connect(),
-    {ok, _} = emqtt:publish(C1, Topic, Message, 1),
-    ok = emqtt:disconnect(C1),
-
-    %% Kill channel so that the session is only persisted
-    ok = emqx_eviction_agent_channel:call(Pid, kick),
-
-    %% Should restore session from persistents storage and receive messages
-    {ok, C2} = emqtt_connect(?CLIENT_ID, false),
-
-    receive
-        {publish, #{
-            payload := Message,
-            topic := Topic
-        }} ->
-            ok
-    after 1000 ->
-        ct:fail("message not received")
-    end,
-
-    ok = emqtt:disconnect(C2).
 
 %%--------------------------------------------------------------------
 %% Helpers

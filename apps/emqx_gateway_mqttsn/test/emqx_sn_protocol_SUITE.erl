@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -33,17 +33,13 @@
 -include_lib("common_test/include/ct.hrl").
 
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
 
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(HOST, {127, 0, 0, 1}).
 -define(PORT, 1884).
-
--define(FLAG_DUP(X), X).
--define(FLAG_QOS(X), X).
--define(FLAG_RETAIN(X), X).
--define(FLAG_SESSION(X), X).
 
 -define(LOG(Format, Args), ct:log("TEST: " ++ Format, Args)).
 
@@ -71,7 +67,6 @@
 -elvis([{elvis_style, dont_repeat_yourself, disable}]).
 
 -define(CONF_DEFAULT, <<
-    "\n"
     "gateway.mqttsn {\n"
     "  gateway_id = 1\n"
     "  broadcast = true\n"
@@ -94,6 +89,20 @@
     "}\n"
 >>).
 
+-define(CONF_DTLS, <<
+    "\n"
+    "gateway.mqttsn {"
+    "  listeners.dtls.default {\n"
+    "    bind = 1885\n"
+    "    dtls_options {\n"
+    "      cacertfile = \"${cacertfile}\"\n"
+    "      certfile = \"${certfile}\"\n"
+    "      keyfile = \"${keyfile}\"\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+>>).
+
 %%--------------------------------------------------------------------
 %% Setups
 %%--------------------------------------------------------------------
@@ -102,14 +111,44 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    application:load(emqx_gateway_mqttsn),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_authn, emqx_gateway]),
+    PrivDir = ?config(priv_dir, Config),
+    Root = emqx_cth_tls:gen_cert(#{key => ec, issuer => root}),
+    Server = emqx_cth_tls:gen_cert(#{key => ec, issuer => Root}),
+    {CACertfile, _} = emqx_cth_tls:write_cert(PrivDir, Root),
+    {Certfile, Keyfile} = emqx_cth_tls:write_cert(PrivDir, Server),
+    Conf = emqx_template:render_strict(
+        emqx_template:parse([?CONF_DEFAULT, ?CONF_DTLS]),
+        #{
+            cacertfile => CACertfile,
+            certfile => Certfile,
+            keyfile => Keyfile
+        }
+    ),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, Conf},
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps}, {cacertfile, CACertfile} | Config].
+
+end_per_suite(Config) ->
+    {ok, _} = emqx:remove_config([gateway, mqttsn]),
+    emqx_common_test_http:delete_default_app(),
+    emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+init_per_testcase(_TestCase, Config) ->
+    snabbkaffe:start_trace(),
     Config.
 
-end_per_suite(_) ->
-    {ok, _} = emqx:remove_config([gateway, mqttsn]),
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_authn, emqx_conf]).
+end_per_testcase(_TestCase, _Config) ->
+    snabbkaffe:stop(),
+    ok.
 
 restart_mqttsn_with_subs_resume_on() ->
     Conf = emqx:get_raw_config([gateway, mqttsn]),
@@ -167,13 +206,83 @@ t_connect(_) ->
     SockName = {'mqttsn:udp:default', 1884},
     ?assertEqual(true, lists:keymember(SockName, 1, esockd:listeners())),
 
+    emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
     {ok, Socket} = gen_udp:open(0, [binary]),
     send_connect_msg(Socket, <<"client_id_test1">>),
+
+    %% assert: client.connect hook is called
+    ?assertMatch(
+        ['client.connect' | _],
+        emqx_gateway_test_utils:collect_emqx_hooks_calls()
+    ),
+
     ?assertEqual(<<3, ?SN_CONNACK, 0>>, receive_response(Socket)),
 
     send_disconnect_msg(Socket, undefined),
+    %% assert: mqttsn gateway will ack disconnect msg with DISCONNECT packet
     ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
     gen_udp:close(Socket).
+
+t_auth_expire(_) ->
+    SockName = {'mqttsn:udp:default', 1884},
+    ?assertEqual(true, lists:keymember(SockName, 1, esockd:listeners())),
+
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 500}}
+        end
+    ),
+
+    ?assertWaitEvent(
+        begin
+            {ok, Socket} = gen_udp:open(0, [binary]),
+            send_connect_msg(Socket, <<"client_id_test1">>),
+            ?assertEqual(<<3, ?SN_CONNACK, 0>>, receive_response(Socket)),
+
+            ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
+            gen_udp:close(Socket)
+        end,
+        #{
+            ?snk_kind := conn_process_terminated,
+            clientid := <<"client_id_test1">>,
+            reason := {shutdown, expired}
+        },
+        5000
+    ).
+
+t_first_disconnect(_) ->
+    SockName = {'mqttsn:udp:default', 1884},
+    ?assertEqual(true, lists:keymember(SockName, 1, esockd:listeners())),
+
+    {ok, Socket} = gen_udp:open(0, [binary]),
+    send_disconnect_msg(Socket, undefined),
+
+    %% assert: mqttsn gateway will ack disconnect msg with DISCONNECT packet
+    ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
+    gen_udp:close(Socket).
+
+t_connect_dtls(Config) ->
+    SockName = {'mqttsn:dtls:default', 1885},
+    ?assertEqual(true, lists:keymember(SockName, 1, esockd:listeners())),
+
+    ClientOpts = [
+        binary,
+        {active, false},
+        {protocol, dtls},
+        {cacertfile, ?config(cacertfile, Config)}
+        | emqx_common_test_helpers:ssl_verify_fun_allow_any_host()
+    ],
+    {ok, Socket} = ssl:connect(?HOST, 1885, ClientOpts, 1000),
+    ok = ssl:send(Socket, make_connect_msg(<<"client_id_test1">>, 1)),
+    ?assertEqual({ok, <<3, ?SN_CONNACK, 0>>}, ssl:recv(Socket, 0, 1000)),
+
+    ok = ssl:send(Socket, make_disconnect_msg(undefined)),
+    ?assertEqual({ok, <<2, ?SN_DISCONNECT>>}, ssl:recv(Socket, 0, 1000)),
+    ssl:close(Socket).
 
 t_subscribe(_) ->
     Dup = 0,
@@ -1213,7 +1322,7 @@ t_will_case01(_) ->
     ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     send_disconnect_msg(Socket, undefined),
-    ?assertEqual(udp_receive_timeout, receive_response(Socket)),
+    ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     gen_udp:close(Socket).
 
@@ -1240,7 +1349,7 @@ t_will_test2(_) ->
     receive_response(Socket),
 
     send_disconnect_msg(Socket, undefined),
-    ?assertEqual(udp_receive_timeout, receive_response(Socket)),
+    ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     gen_udp:close(Socket).
 
@@ -1261,7 +1370,7 @@ t_will_test3(_) ->
     ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     send_disconnect_msg(Socket, undefined),
-    ?assertEqual(udp_receive_timeout, receive_response(Socket)),
+    ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     gen_udp:close(Socket).
 
@@ -1290,7 +1399,7 @@ t_will_test4(_) ->
     receive_response(Socket),
 
     send_disconnect_msg(Socket, undefined),
-    ?assertEqual(udp_receive_timeout, receive_response(Socket)),
+    ?assertEqual(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
 
     gen_udp:close(Socket).
 
@@ -1381,14 +1490,14 @@ t_asleep_test01_timeout(_) ->
 
 t_asleep_test02_to_awake_and_back(_) ->
     QoS = 1,
-    Keepalive_Duration = 1,
+    KeepaliveDuration = 1,
     SleepDuration = 5,
     WillTopic = <<"dead">>,
     WillPayload = <<10, 11, 12, 13, 14>>,
     {ok, Socket} = gen_udp:open(0, [binary]),
 
     ClientId = ?CLIENTID,
-    send_connect_msg_with_will(Socket, Keepalive_Duration, ClientId),
+    send_connect_msg_with_will(Socket, KeepaliveDuration, ClientId),
     ?assertEqual(<<2, ?SN_WILLTOPICREQ>>, receive_response(Socket)),
     send_willtopic_msg(Socket, WillTopic, QoS),
     ?assertEqual(<<2, ?SN_WILLMSGREQ>>, receive_response(Socket)),
@@ -2109,11 +2218,18 @@ t_register_subs_resume_off(_) ->
         emqx_message:make(test, ?QOS_2, <<"topic-b">>, <<"test-b">>)
     ),
 
-    <<_, ?SN_PUBLISH, 2#00100000, TopicIdA:16, MsgId1:16, "test-a">> = receive_response(Socket),
+    QoS1Flags = 2#00100000,
+    QoS2Flags = 2#01000000,
+
+    %% This is a QoS 1 message
+    <<_, ?SN_PUBLISH, QoS1Flags, TopicIdA:16, MsgId1:16, "test-a">> = receive_response(Socket),
     send_puback_msg(Socket, TopicIdA, MsgId1, ?SN_RC_ACCEPTED),
 
-    <<_, ?SN_PUBLISH, 2#01000000, TopicIdB:16, MsgId2:16, "test-b">> = receive_response(Socket),
-    send_puback_msg(Socket, TopicIdB, MsgId2, ?SN_RC_ACCEPTED),
+    %% This is a QoS 2 message
+    <<_, ?SN_PUBLISH, QoS2Flags, TopicIdB:16, MsgId2:16, "test-b">> = receive_response(Socket),
+    send_pubrec_msg(Socket, MsgId2),
+    %% discard PUBREL message
+    <<_, ?SN_PUBREL, MsgId2:16>> = receive_response(Socket),
 
     send_disconnect_msg(Socket, undefined),
     ?assertMatch(<<2, ?SN_DISCONNECT>>, receive_response(Socket)),
@@ -2136,8 +2252,11 @@ t_register_subs_resume_off(_) ->
 
     %% qos1
 
+    %% receive PUBREL for `test-b' again
+    <<_, ?SN_PUBREL, MsgId2:16>> = receive_response(NSocket),
+    send_pubcomp_msg(NSocket, MsgId2),
     %% received the resume messages
-    <<_, ?SN_PUBLISH, 2#00100000, TopicIdA:16, MsgIdA0:16, "m1">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS1Flags, TopicIdA:16, MsgIdA0:16, "m1">> = receive_response(NSocket),
     %% only one qos1/qos2 inflight
     ?assertEqual(udp_receive_timeout, receive_response(NSocket)),
     send_puback_msg(NSocket, TopicIdA, MsgIdA0, ?SN_RC_INVALID_TOPIC_ID),
@@ -2145,17 +2264,17 @@ t_register_subs_resume_off(_) ->
     <<_, ?SN_REGISTER, TopicIdA:16, RegMsgIdA:16, "topic-a">> = receive_response(NSocket),
     send_regack_msg(NSocket, TopicIdA, RegMsgIdA),
     %% received the replay messages
-    <<_, ?SN_PUBLISH, 2#00100000, TopicIdA:16, MsgIdA1:16, "m1">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS1Flags, TopicIdA:16, MsgIdA1:16, "m1">> = receive_response(NSocket),
     send_puback_msg(NSocket, TopicIdA, MsgIdA1, ?SN_RC_ACCEPTED),
 
-    <<_, ?SN_PUBLISH, 2#00100000, TopicIdA:16, MsgIdA2:16, "m2">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS1Flags, TopicIdA:16, MsgIdA2:16, "m2">> = receive_response(NSocket),
     send_puback_msg(NSocket, TopicIdA, MsgIdA2, ?SN_RC_ACCEPTED),
 
-    <<_, ?SN_PUBLISH, 2#00100000, TopicIdA:16, MsgIdA3:16, "m3">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS1Flags, TopicIdA:16, MsgIdA3:16, "m3">> = receive_response(NSocket),
     send_puback_msg(NSocket, TopicIdA, MsgIdA3, ?SN_RC_ACCEPTED),
 
     %% qos2
-    <<_, ?SN_PUBLISH, 2#01000000, TopicIdB:16, MsgIdB0:16, "m1">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS2Flags, TopicIdB:16, MsgIdB0:16, "m1">> = receive_response(NSocket),
     %% only one qos1/qos2 inflight
     ?assertEqual(udp_receive_timeout, receive_response(NSocket)),
     send_puback_msg(NSocket, TopicIdB, MsgIdB0, ?SN_RC_INVALID_TOPIC_ID),
@@ -2163,16 +2282,20 @@ t_register_subs_resume_off(_) ->
     <<_, ?SN_REGISTER, TopicIdB:16, RegMsgIdB:16, "topic-b">> = receive_response(NSocket),
     send_regack_msg(NSocket, TopicIdB, RegMsgIdB),
     %% received the replay messages
-    <<_, ?SN_PUBLISH, 2#01000000, TopicIdB:16, MsgIdB1:16, "m1">> = receive_response(NSocket),
+    <<_, ?SN_PUBLISH, QoS2Flags, TopicIdB:16, MsgIdB1:16, "m1">> = receive_response(NSocket),
     send_pubrec_msg(NSocket, MsgIdB1),
     <<_, ?SN_PUBREL, MsgIdB1:16>> = receive_response(NSocket),
     send_pubcomp_msg(NSocket, MsgIdB1),
 
-    <<_, ?SN_PUBLISH, 2#01000000, TopicIdB:16, MsgIdB2:16, "m2">> = receive_response(NSocket),
-    send_puback_msg(NSocket, TopicIdB, MsgIdB2, ?SN_RC_ACCEPTED),
+    <<_, ?SN_PUBLISH, QoS2Flags, TopicIdB:16, MsgIdB2:16, "m2">> = receive_response(NSocket),
+    send_pubrec_msg(NSocket, MsgIdB2),
+    <<_, ?SN_PUBREL, MsgIdB2:16>> = receive_response(NSocket),
+    send_pubcomp_msg(NSocket, MsgIdB2),
 
-    <<_, ?SN_PUBLISH, 2#01000000, TopicIdB:16, MsgIdB3:16, "m3">> = receive_response(NSocket),
-    send_puback_msg(NSocket, TopicIdB, MsgIdB3, ?SN_RC_ACCEPTED),
+    <<_, ?SN_PUBLISH, QoS2Flags, TopicIdB:16, MsgIdB3:16, "m3">> = receive_response(NSocket),
+    send_pubrec_msg(NSocket, MsgIdB3),
+    <<_, ?SN_PUBREL, MsgIdB3:16>> = receive_response(NSocket),
+    send_pubcomp_msg(NSocket, MsgIdB3),
 
     %% no more messages
     ?assertEqual(udp_receive_timeout, receive_response(NSocket)),
@@ -2312,9 +2435,7 @@ t_socket_passvice(_) ->
     ok.
 
 t_clients_api(_) ->
-    TsNow = emqx_gateway_utils:unix_ts_to_rfc3339(
-        erlang:system_time(millisecond)
-    ),
+    TsNow = emqx_utils_calendar:now_to_rfc3339(millisecond),
     ClientId = <<"client_id_test1">>,
     {ok, Socket} = gen_udp:open(0, [binary]),
     send_connect_msg(Socket, ClientId),
@@ -2343,6 +2464,8 @@ t_clients_api(_) ->
         request(get, "/gateways/mqttsn/clients/client_id_test1"),
     %% assert
     Client1 = Client2 = Client3 = Client4,
+    %% assert keepalive
+    ?assertEqual(10, maps:get(keepalive, Client4)),
     %% kickout
     {204, _} =
         request(delete, "/gateways/mqttsn/clients/client_id_test1"),
@@ -2430,10 +2553,7 @@ send_searchgw_msg(Socket) ->
     Radius = 0,
     ok = gen_udp:send(Socket, ?HOST, ?PORT, <<Length:8, MsgType:8, Radius:8>>).
 
-send_connect_msg(Socket, ClientId) ->
-    send_connect_msg(Socket, ClientId, 1).
-
-send_connect_msg(Socket, ClientId, CleanSession) when
+make_connect_msg(ClientId, CleanSession) when
     CleanSession == 0;
     CleanSession == 1
 ->
@@ -2446,9 +2566,14 @@ send_connect_msg(Socket, ClientId, CleanSession) when
     TopicIdType = 0,
     ProtocolId = 1,
     Duration = 10,
-    Packet =
-        <<Length:8, MsgType:8, Dup:1, QoS:2, Retain:1, Will:1, CleanSession:1, TopicIdType:2,
-            ProtocolId:8, Duration:16, ClientId/binary>>,
+    <<Length:8, MsgType:8, Dup:1, QoS:2, Retain:1, Will:1, CleanSession:1, TopicIdType:2,
+        ProtocolId:8, Duration:16, ClientId/binary>>.
+
+send_connect_msg(Socket, ClientId) ->
+    send_connect_msg(Socket, ClientId, 1).
+
+send_connect_msg(Socket, ClientId, CleanSession) ->
+    Packet = make_connect_msg(ClientId, CleanSession),
     ok = gen_udp:send(Socket, ?HOST, ?PORT, Packet).
 
 send_connect_msg_with_will(Socket, Duration, ClientId) ->
@@ -2710,15 +2835,17 @@ send_pingreq_msg(Socket, ClientId) ->
     ?LOG("send_pingreq_msg ClientId=~p", [ClientId]),
     ok = gen_udp:send(Socket, ?HOST, ?PORT, PingReqPacket).
 
-send_disconnect_msg(Socket, Duration) ->
+make_disconnect_msg(Duration) ->
     Length = 2,
     Length2 = 4,
     MsgType = ?SN_DISCONNECT,
-    DisConnectPacket =
-        case Duration of
-            undefined -> <<Length:8, MsgType:8>>;
-            Other -> <<Length2:8, MsgType:8, Other:16>>
-        end,
+    case Duration of
+        undefined -> <<Length:8, MsgType:8>>;
+        Other -> <<Length2:8, MsgType:8, Other:16>>
+    end.
+
+send_disconnect_msg(Socket, Duration) ->
+    DisConnectPacket = make_disconnect_msg(Duration),
     ?LOG("send_disconnect_msg Duration=~p", [Duration]),
     ok = gen_udp:send(Socket, ?HOST, ?PORT, DisConnectPacket).
 

@@ -14,7 +14,7 @@ profile = Mix.env()
 # need to use this information because we might have compiled all
 # applications in the test profile, and thus filter what's in the
 # release lib directory.
-rel_apps = MixProject.applications(inputs.edition_type)
+rel_apps = MixProject.applications(inputs.release_type, inputs.edition_type)
 
 apps =
   rel_apps
@@ -24,10 +24,10 @@ apps =
 
 :xref.start(:xref)
 :xref.set_default(:xref, warnings: false)
-rel_dir = '_build/#{profile}/lib/'
+rel_dir = ~c"_build/#{profile}/lib/"
 :xref.add_release(:xref, rel_dir)
 
-{:ok, calls} = :xref.q(:xref, '(App) (XC | [#{Enum.join(apps, ",")}] || mria:create_table/_)')
+{:ok, calls} = :xref.q(:xref, ~c"(App) (XC | [#{Enum.join(apps, ",")}] || mria:create_table/_)")
 
 emqx_calls =
   calls

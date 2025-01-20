@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,7 +31,11 @@
 ]).
 
 -define(DEFAULT_APP_ID, <<"default_appid">>).
+-define(DEFAULT_APP_KEY, <<"default_app_key">>).
 -define(DEFAULT_APP_SECRET, <<"default_app_secret">>).
+
+%% from emqx_dashboard/include/emqx_dashboard_rbac.hrl
+-define(ROLE_API_SUPERUSER, <<"administrator">>).
 
 request_api(Method, Url, Auth) ->
     request_api(Method, Url, [], Auth, []).
@@ -60,7 +64,7 @@ request_api(Method, Url, QueryParams, Auth, Body, HttpOpts) ->
     do_request_api(Method, Request, HttpOpts).
 
 do_request_api(Method, Request, HttpOpts) ->
-    ct:pal("Method: ~p, Request: ~p", [Method, Request]),
+    % ct:pal("Method: ~p, Request: ~p", [Method, Request]),
     case httpc:request(Method, Request, HttpOpts, [{body_format, binary}]) of
         {error, socket_closed_remotely} ->
             {error, socket_closed_remotely};
@@ -89,9 +93,22 @@ default_auth_header() ->
 create_default_app() ->
     Now = erlang:system_time(second),
     ExpiredAt = Now + timer:minutes(10),
-    emqx_mgmt_auth:create(
-        ?DEFAULT_APP_ID, ?DEFAULT_APP_SECRET, true, ExpiredAt, <<"default app key for test">>
-    ).
+    case
+        emqx_mgmt_auth:create(
+            ?DEFAULT_APP_ID,
+            ?DEFAULT_APP_KEY,
+            ?DEFAULT_APP_SECRET,
+            true,
+            ExpiredAt,
+            <<"default app key for test">>,
+            ?ROLE_API_SUPERUSER
+        )
+    of
+        {ok, App} ->
+            {ok, App};
+        {error, name_already_existed} ->
+            {ok, _} = emqx_mgmt_auth:read(?DEFAULT_APP_ID)
+    end.
 
 delete_default_app() ->
     emqx_mgmt_auth:delete(?DEFAULT_APP_ID).

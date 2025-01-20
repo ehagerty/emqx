@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,5 +20,10 @@
 -define(TOMBSTONE_VALUE, <<"marked_for_deletion">>).
 -define(TOMBSTONE_CONFIG_CHANGE_REQ, mark_it_for_deletion).
 -define(CONFIG_NOT_FOUND_MAGIC, '$0tFound').
+
+%%--------------------------------------------------------------------
+%% EE injections
+%%--------------------------------------------------------------------
+-define(EMQX_SSL_FUN_MFA(Name), {emqx_ssl_fun_mfa, Name}).
 
 -endif.

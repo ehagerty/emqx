@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 %% gen_server callbacks
 -export([
     init/1,
+    handle_continue/2,
     handle_call/3,
     handle_cast/2,
     handle_info/2,
@@ -57,8 +58,8 @@ remove_handler() ->
 post_config_update(_, _Req, NewConf, OldConf, _AppEnvs) ->
     #{os := OS1, vm := VM1} = OldConf,
     #{os := OS2, vm := VM2} = NewConf,
-    VM1 =/= VM2 andalso ?MODULE:update(VM2),
-    OS1 =/= OS2 andalso emqx_os_mon:update(OS2),
+    (VM1 =/= VM2) andalso ?MODULE:update(VM2),
+    (OS1 =/= OS2) andalso emqx_os_mon:update(OS2),
     ok.
 
 update(VM) ->
@@ -70,11 +71,14 @@ update(VM) ->
 
 init([]) ->
     emqx_logger:set_proc_metadata(#{sysmon => true}),
-    init_system_monitor(),
+    {ok, undefined, {continue, setup}}.
 
+handle_continue(setup, undefined) ->
+    init_system_monitor(),
     %% Monitor cluster partition event
     ekka:monitor(partition, fun handle_partition_event/1),
-    {ok, start_timer(#{timer => undefined, events => []})}.
+    NewState = start_timer(#{timer => undefined, events => []}),
+    {noreply, NewState, hibernate}.
 
 start_timer(State) ->
     State#{timer := emqx_utils:start_timer(timer:seconds(2), reset)}.
@@ -116,7 +120,7 @@ handle_info({monitor, Pid, long_gc, Info}, State) ->
         fun() ->
             WarnMsg = io_lib:format("long_gc warning: pid = ~p", [Pid]),
             ?SLOG(warning, #{
-                msg => long_gc,
+                msg => "long_gc",
                 info => Info,
                 porcinfo => procinfo(Pid)
             }),
@@ -130,7 +134,7 @@ handle_info({monitor, Pid, long_schedule, Info}, State) when is_pid(Pid) ->
         fun() ->
             WarnMsg = io_lib:format("long_schedule warning: pid = ~p", [Pid]),
             ?SLOG(warning, #{
-                msg => long_schedule,
+                msg => "long_schedule",
                 info => Info,
                 procinfo => procinfo(Pid)
             }),
@@ -144,7 +148,7 @@ handle_info({monitor, Port, long_schedule, Info}, State) when is_port(Port) ->
         fun() ->
             WarnMsg = io_lib:format("long_schedule warning: port = ~p", [Port]),
             ?SLOG(warning, #{
-                msg => long_schedule,
+                msg => "long_schedule",
                 info => Info,
                 portinfo => portinfo(Port)
             }),
@@ -158,7 +162,7 @@ handle_info({monitor, Pid, large_heap, Info}, State) ->
         fun() ->
             WarnMsg = io_lib:format("large_heap warning: pid = ~p", [Pid]),
             ?SLOG(warning, #{
-                msg => large_heap,
+                msg => "large_heap",
                 info => Info,
                 procinfo => procinfo(Pid)
             }),
@@ -172,7 +176,7 @@ handle_info({monitor, SusPid, busy_port, Port}, State) ->
         fun() ->
             WarnMsg = io_lib:format("busy_port warning: suspid = ~p, port = ~p", [SusPid, Port]),
             ?SLOG(warning, #{
-                msg => busy_port,
+                msg => "busy_port",
                 portinfo => portinfo(Port),
                 procinfo => procinfo(SusPid)
             }),
@@ -186,7 +190,7 @@ handle_info({monitor, SusPid, busy_dist_port, Port}, State) ->
         fun() ->
             WarnMsg = io_lib:format("busy_dist_port warning: suspid = ~p, port = ~p", [SusPid, Port]),
             ?SLOG(warning, #{
-                msg => busy_dist_port,
+                msg => "busy_dist_port",
                 portinfo => portinfo(Port),
                 procinfo => procinfo(SusPid)
             }),

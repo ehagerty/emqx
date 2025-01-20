@@ -79,6 +79,30 @@
     "enabled": true
   },
   {
+    "name": "kafka_2_plain",
+    "listen": "0.0.0.0:19292",
+    "upstream": "kafka-2.emqx.net:9292",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_sasl_plain",
+    "listen": "0.0.0.0:19293",
+    "upstream": "kafka-2.emqx.net:9293",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_ssl",
+    "listen": "0.0.0.0:19294",
+    "upstream": "kafka-2.emqx.net:9294",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_sasl_ssl",
+    "listen": "0.0.0.0:19295",
+    "upstream": "kafka-2.emqx.net:9295",
+    "enabled": true
+  },
+  {
     "name": "rocketmq",
     "listen": "0.0.0.0:9876",
     "upstream": "rocketmq_namesrv:9876",
@@ -94,6 +118,18 @@
     "name": "cassa_tls",
     "listen": "0.0.0.0:9142",
     "upstream": "cassandra:9142",
+    "enabled": true
+  },
+  {
+    "name": "cassa_no_auth_tcp",
+    "listen": "0.0.0.0:9043",
+    "upstream": "cassandra_noauth:9042",
+    "enabled": true
+  },
+  {
+    "name": "cassa_no_auth_tls",
+    "listen": "0.0.0.0:9143",
+    "upstream": "cassandra_noauth:9142",
     "enabled": true
   },
   {
@@ -127,15 +163,33 @@
     "enabled": true
   },
   {
-    "name": "iotdb",
+    "name": "iotdb110",
     "listen": "0.0.0.0:18080",
-    "upstream": "iotdb:18080",
+    "upstream": "iotdb110:18080",
+    "enabled": true
+  },
+  {
+    "name": "iotdb130",
+    "listen": "0.0.0.0:28080",
+    "upstream": "iotdb130:18080",
     "enabled": true
   },
   {
     "name": "iotdb013",
     "listen": "0.0.0.0:38080",
     "upstream": "iotdb013:18080",
+    "enabled": true
+  },
+  {
+    "name": "iotdb_thrift",
+    "listen": "0.0.0.0:46667",
+    "upstream": "iotdb-thrift:6667",
+    "enabled": true
+  },
+  {
+    "name": "iotdb_thrift_rest",
+    "listen": "0.0.0.0:48080",
+    "upstream": "iotdb-thrift:18080",
     "enabled": true
   },
   {
@@ -178,6 +232,54 @@
     "name": "kinesis",
     "listen": "0.0.0.0:4566",
     "upstream": "kinesis:4566",
+    "enabled": true
+  },
+  {
+    "name": "ldap_tcp",
+    "listen": "0.0.0.0:389",
+    "upstream": "ldap:389",
+    "enabled": true
+  },
+  {
+    "name": "ldap_ssl",
+    "listen": "0.0.0.0:636",
+    "upstream": "ldap:636",
+    "enabled": true
+  },
+  {
+    "name": "elasticsearch",
+    "listen": "0.0.0.0:9200",
+    "upstream": "elasticsearch:9200",
+    "enabled": true
+  },
+  {
+    "name": "azurite_plain",
+    "listen": "0.0.0.0:10000",
+    "upstream": "azurite:10000",
+    "enabled": true
+  },
+  {
+    "name": "couchbase",
+    "listen": "0.0.0.0:8093",
+    "upstream": "couchbase:8093",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_tcp",
+    "listen": "0.0.0.0:8361",
+    "upstream": "datalayers_tcp:8361",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_tls",
+    "listen": "0.0.0.0:8362",
+    "upstream": "datalayers_tls:8362",
+    "enabled": true
+  },
+  {
+    "name": "mongo_single_tcp",
+    "listen": "0.0.0.0:27017",
+    "upstream": "mongo:27017",
     "enabled": true
   }
 ]

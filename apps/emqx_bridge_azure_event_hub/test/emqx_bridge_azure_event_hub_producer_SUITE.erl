@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_azure_event_hub_producer_SUITE).
 
@@ -12,7 +12,7 @@
 
 -define(BRIDGE_TYPE, azure_event_hub_producer).
 -define(BRIDGE_TYPE_BIN, <<"azure_event_hub_producer">>).
--define(APPS, [emqx_resource, emqx_bridge, emqx_rule_engine]).
+-define(KAFKA_BRIDGE_TYPE, kafka).
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -40,6 +40,7 @@ init_per_suite(Config) ->
                     emqx_resource,
                     emqx_bridge_azure_event_hub,
                     emqx_bridge,
+                    emqx_rule_engine,
                     {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
                 ],
                 #{work_dir => ?config(priv_dir, Config)}
@@ -65,10 +66,6 @@ init_per_suite(Config) ->
     end.
 
 end_per_suite(Config) ->
-    %% emqx_mgmt_api_test_util:end_suite(),
-    %% ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    %% ok = emqx_connector_test_helpers:stop_apps([emqx_bridge, emqx_resource, emqx_rule_engine]),
-    %% _ = application:stop(emqx_connector),
     Apps = ?config(tc_apps, Config),
     emqx_cth_suite:stop(Apps),
     ok.
@@ -145,7 +142,6 @@ bridge_config(TestCase, Config) ->
                     <<"message">> =>
                         #{
                             <<"key">> => <<"${.clientid}">>,
-                            <<"timestamp">> => <<"${.timestamp}">>,
                             <<"value">> => <<"${.}">>
                         },
                     <<"partition_count_refresh_interval">> => <<"60s">>,
@@ -279,5 +275,45 @@ t_sync_query(Config) ->
         fun make_message/0,
         fun(Res) -> ?assertEqual(ok, Res) end,
         emqx_bridge_kafka_impl_producer_sync_query
+    ),
+    ok.
+
+t_same_name_azure_kafka_bridges(AehConfig) ->
+    ConfigKafka = lists:keyreplace(bridge_type, 1, AehConfig, {bridge_type, ?KAFKA_BRIDGE_TYPE}),
+    BridgeName = ?config(bridge_name, AehConfig),
+    TracePoint = emqx_bridge_kafka_impl_producer_sync_query,
+    %% creates the AEH bridge and check it's working
+    ok = emqx_bridge_testlib:t_sync_query(
+        AehConfig,
+        fun make_message/0,
+        fun(Res) -> ?assertEqual(ok, Res) end,
+        TracePoint
+    ),
+    %% than creates a Kafka bridge with same name and delete it after creation
+    ok = emqx_bridge_testlib:t_create_via_http(ConfigKafka),
+    AehResourceId = emqx_bridge_testlib:resource_id(AehConfig),
+    KafkaResourceId = emqx_bridge_testlib:resource_id(ConfigKafka),
+    %% check that both bridges are healthy
+    ?assertEqual({ok, connected}, emqx_resource_manager:health_check(AehResourceId)),
+    ?assertEqual({ok, connected}, emqx_resource_manager:health_check(KafkaResourceId)),
+    ?assertMatch(
+        {{ok, _}, {ok, _}},
+        ?wait_async_action(
+            emqx_bridge:disable_enable(disable, ?KAFKA_BRIDGE_TYPE, BridgeName),
+            #{?snk_kind := kafka_producer_stopped},
+            5_000
+        )
+    ),
+    % check that AEH bridge is still working
+    ?check_trace(
+        begin
+            BridgeId = emqx_bridge_v2_testlib:bridge_id(AehConfig),
+            Message = {BridgeId, make_message()},
+            ?assertEqual(ok, emqx_resource:simple_sync_query(AehResourceId, Message)),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([#{instance_id := AehResourceId}], ?of_kind(TracePoint, Trace))
+        end
     ),
     ok.

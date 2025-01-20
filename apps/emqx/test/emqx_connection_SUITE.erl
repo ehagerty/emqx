@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ all() -> emqx_common_test_helpers:all(?MODULE).
 init_per_suite(Config) ->
     %% Meck Transport
     ok = meck:new(emqx_transport, [non_strict, passthrough, no_history, no_link]),
+    ok = meck:expect(emqx_transport, shutdown, fun(_, _) -> ok end),
     %% Meck Channel
     ok = meck:new(emqx_channel, [passthrough, no_history, no_link]),
     %% Meck Cm
@@ -49,7 +50,7 @@ init_per_suite(Config) ->
     %% Meck Hooks
     ok = meck:new(emqx_hooks, [passthrough, no_history, no_link]),
     ok = meck:expect(emqx_hooks, run, fun(_Hook, _Args) -> ok end),
-    ok = meck:expect(emqx_hooks, run_fold, fun(_Hook, _Args, Acc) -> {ok, Acc} end),
+    ok = meck:expect(emqx_hooks, run_fold, fun(_Hook, _Args, Acc) -> Acc end),
 
     ok = meck:expect(emqx_channel, ensure_disconnected, fun(_, Channel) -> Channel end),
 
@@ -57,10 +58,10 @@ init_per_suite(Config) ->
     ok = meck:expect(emqx_alarm, deactivate, fun(_) -> ok end),
     ok = meck:expect(emqx_alarm, deactivate, fun(_, _) -> ok end),
 
-    emqx_common_test_helpers:start_apps([]),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     ok = meck:unload(emqx_transport),
     catch meck:unload(emqx_channel),
     ok = meck:unload(emqx_cm),
@@ -68,8 +69,8 @@ end_per_suite(_Config) ->
     ok = meck:unload(emqx_metrics),
     ok = meck:unload(emqx_hooks),
     ok = meck:unload(emqx_alarm),
-    emqx_common_test_helpers:stop_apps([]),
-    ok.
+
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
 
 init_per_testcase(TestCase, Config) when
     TestCase =/= t_ws_pingreq_before_connected
@@ -83,7 +84,8 @@ init_per_testcase(TestCase, Config) when
         fun
             (peername, [sock]) -> {ok, {{127, 0, 0, 1}, 3456}};
             (sockname, [sock]) -> {ok, {{127, 0, 0, 1}, 1883}};
-            (peercert, [sock]) -> undefined
+            (peercert, [sock]) -> undefined;
+            (peersni, [sock]) -> undefined
         end
     ),
     ok = meck:expect(emqx_transport, setopts, fun(_Sock, _Opts) -> ok end),
@@ -93,8 +95,7 @@ init_per_testcase(TestCase, Config) when
     ok = meck:expect(emqx_transport, getstat, fun(_Sock, Options) ->
         {ok, [{K, 0} || K <- Options]}
     end),
-    ok = meck:expect(emqx_transport, async_send, fun(_Sock, _Data) -> ok end),
-    ok = meck:expect(emqx_transport, async_send, fun(_Sock, _Data, _Opts) -> ok end),
+    ok = meck:expect(emqx_transport, send, fun(_Sock, _Data) -> ok end),
     ok = meck:expect(emqx_transport, fast_close, fun(_Sock) -> ok end),
     case erlang:function_exported(?MODULE, TestCase, 2) of
         true -> ?MODULE:TestCase(init, Config);
@@ -187,15 +188,15 @@ t_process_msg(_) ->
     ).
 
 t_ensure_stats_timer(_) ->
-    NStats = emqx_connection:ensure_stats_timer(100, st()),
-    Stats_timer = emqx_connection:info(stats_timer, NStats),
-    ?assert(is_reference(Stats_timer)),
-    ?assertEqual(NStats, emqx_connection:ensure_stats_timer(100, NStats)).
+    NStats = emqx_connection:ensure_stats_timer(st(#{stats_timer => undefined})),
+    StatsTimer = emqx_connection:info(stats_timer, NStats),
+    ?assert(is_reference(StatsTimer)),
+    ?assertEqual(NStats, emqx_connection:ensure_stats_timer(NStats)).
 
 t_cancel_stats_timer(_) ->
     NStats = emqx_connection:cancel_stats_timer(st(#{stats_timer => make_ref()})),
-    Stats_timer = emqx_connection:info(stats_timer, NStats),
-    ?assertEqual(undefined, Stats_timer),
+    StatsTimer = emqx_connection:info(stats_timer, NStats),
+    ?assertEqual(undefined, StatsTimer),
     ?assertEqual(NStats, emqx_connection:cancel_stats_timer(NStats)).
 
 t_append_msg(_) ->
@@ -233,9 +234,11 @@ t_handle_msg_incoming(_) ->
     ?assertMatch({ok, _St}, handle_msg({incoming, undefined}, st())).
 
 t_handle_msg_outgoing(_) ->
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBLISH_PACKET(?QOS_2, <<"Topic">>, 1, <<>>)}, st())),
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBREL_PACKET(1)}, st())),
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBCOMP_PACKET(1)}, st())).
+    ?assertMatch(
+        {ok, _}, handle_msg({outgoing, ?PUBLISH_PACKET(?QOS_2, <<"Topic">>, 1, <<>>)}, st())
+    ),
+    ?assertMatch({ok, _}, handle_msg({outgoing, ?PUBREL_PACKET(1)}, st())),
+    ?assertMatch({ok, _}, handle_msg({outgoing, ?PUBCOMP_PACKET(1)}, st())).
 
 t_handle_msg_tcp_error(_) ->
     ?assertMatch(
@@ -254,18 +257,13 @@ t_handle_msg_deliver(_) ->
     ?assertMatch({ok, _St}, handle_msg({deliver, topic, msg}, st())).
 
 t_handle_msg_inet_reply(_) ->
-    ok = meck:expect(emqx_pd, get_counter, fun(_) -> 10 end),
-    emqx_config:put_listener_conf(tcp, default, [tcp_options, active_n], 0),
-    ?assertMatch({ok, _St}, handle_msg({inet_reply, for_testing, ok}, st())),
-    emqx_config:put_listener_conf(tcp, default, [tcp_options, active_n], 100),
-    ?assertEqual(ok, handle_msg({inet_reply, for_testing, ok}, st())),
     ?assertMatch(
         {stop, {shutdown, for_testing}, _St},
         handle_msg({inet_reply, for_testing, {error, for_testing}}, st())
     ).
 
 t_handle_msg_connack(_) ->
-    ?assertEqual(ok, handle_msg({connack, ?CONNACK_PACKET(?CONNACK_ACCEPT)}, st())).
+    ?assertMatch({ok, _}, handle_msg({connack, ?CONNACK_PACKET(?CONNACK_ACCEPT)}, st())).
 
 t_handle_msg_close(_) ->
     ?assertMatch({stop, {shutdown, normal}, _St}, handle_msg({close, normal}, st())).
@@ -274,8 +272,7 @@ t_handle_msg_event(_) ->
     ok = meck:expect(emqx_cm, register_channel, fun(_, _, _) -> ok end),
     ok = meck:expect(emqx_cm, insert_channel_info, fun(_, _, _) -> ok end),
     ok = meck:expect(emqx_cm, set_chan_info, fun(_, _) -> ok end),
-    ok = meck:expect(emqx_cm, connection_closed, fun(_) -> ok end),
-    ?assertEqual(ok, handle_msg({event, connected}, st())),
+    ?assertMatch({ok, _St}, handle_msg({event, connected}, st())),
     ?assertMatch({ok, _St}, handle_msg({event, disconnected}, st())),
     ?assertMatch({ok, _St}, handle_msg({event, undefined}, st())).
 
@@ -315,8 +312,8 @@ t_handle_timeout(_) ->
     ?assertMatch({ok, _NState}, emqx_connection:handle_timeout(TRef, undefined, State)).
 
 t_parse_incoming(_) ->
-    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<>>, [], st())),
-    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<"for_testing">>, [], st())).
+    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<>>, st())),
+    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<"for_testing">>, st())).
 
 t_next_incoming_msgs(_) ->
     State = st(#{}),
@@ -335,6 +332,17 @@ t_handle_incoming(_) ->
         emqx_connection:handle_incoming(?CONNECT_PACKET(#mqtt_packet_connect{}), st())
     ),
     ?assertMatch({ok, _Out, _NState}, emqx_connection:handle_incoming(frame_error, st())).
+
+t_handle_outing_non_utf8_topic(_) ->
+    Topic = <<"测试"/utf16>>,
+    Publish = ?PUBLISH_PACKET(0, Topic, 1),
+    StrictOff = #{version => 5, max_size => 16#FFFF, strict_mode => false},
+    StOff = st(#{serialize => StrictOff}),
+    OffResult = emqx_connection:handle_outgoing(Publish, StOff),
+    ?assertMatch({ok, _}, OffResult),
+    StrictOn = #{version => 5, max_size => 16#FFFF, strict_mode => true},
+    StOn = st(#{serialize => StrictOn}),
+    ?assertError(frame_serialize_error, emqx_connection:handle_outgoing(Publish, StOn)).
 
 t_with_channel(_) ->
     State = st(),
@@ -388,8 +396,8 @@ t_with_channel(_) ->
     meck:unload(emqx_channel).
 
 t_handle_outgoing(_) ->
-    ?assertEqual(ok, emqx_connection:handle_outgoing(?PACKET(?PINGRESP), st())),
-    ?assertEqual(ok, emqx_connection:handle_outgoing([?PACKET(?PINGRESP)], st())).
+    ?assertMatch({ok, _}, emqx_connection:handle_outgoing(?PACKET(?PINGRESP), st())),
+    ?assertMatch({ok, _}, emqx_connection:handle_outgoing([?PACKET(?PINGRESP)], st())).
 
 t_handle_info(_) ->
     ?assertMatch(
@@ -518,7 +526,7 @@ t_oom_shutdown(_) ->
     with_conn(
         fun(Pid) ->
             Pid ! {tcp_passive, foo},
-            {ok, _} = ?block_until(#{?snk_kind := check_oom}, 1000),
+            {ok, _} = ?block_until(#{?snk_kind := check_oom_shutdown}, 1000),
             {ok, _} = ?block_until(#{?snk_kind := terminate}, 100),
             Trace = snabbkaffe:collect_trace(),
             ?assertEqual(1, length(?of_kind(terminate, Trace))),
@@ -677,10 +685,11 @@ channel(InitFields) ->
         is_superuser => false,
         mountpoint => undefined
     },
-    Conf = emqx_cm:get_session_confs(ClientInfo, #{
-        receive_maximum => 0, expiry_interval => 1000
-    }),
-    Session = emqx_session:init(Conf),
+    Session = emqx_session:create(
+        ClientInfo,
+        #{receive_maximum => 0, expiry_interval => 1000},
+        _WillMsg = undefined
+    ),
     maps:fold(
         fun(Field, Value, Channel) ->
             emqx_channel:set_field(Field, Value, Channel)

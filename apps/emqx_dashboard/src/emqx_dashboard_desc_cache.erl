@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ init() ->
 %% Load is incremental, so it can be called multiple times.
 %% NOTE: no garbage collection is done, because stale entries are harmless.
 load_desc(EtsTab, File) ->
-    ?SLOG(info, #{msg => "loading desc", file => File}),
+    ?SLOG(info, #{msg => "loading_desc", file => File}),
     {ok, Descs} = hocon:load(File),
     ["desc", Lang, "hocon"] = string:tokens(filename:basename(File), "."),
     Insert = fun(Namespace, Id, Tag, Text) ->

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,13 +21,25 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
--define(EMQX_PLUGIN_TEMPLATE_RELEASE_NAME, "emqx_plugin_template").
+-define(EMQX_PLUGIN_APP_NAME, my_emqx_plugin).
+-define(EMQX_PLUGIN_TEMPLATE_RELEASE_NAME, atom_to_list(?EMQX_PLUGIN_APP_NAME)).
 -define(EMQX_PLUGIN_TEMPLATE_URL,
     "https://github.com/emqx/emqx-plugin-template/releases/download/"
 ).
--define(EMQX_PLUGIN_TEMPLATE_VSN, "5.0.0").
--define(EMQX_PLUGIN_TEMPLATE_TAG, "5.0.0").
+-define(EMQX_PLUGIN_TEMPLATE_VSN, "5.1.0").
+-define(EMQX_PLUGIN_TEMPLATE_TAG, "5.1.0").
+
+-define(EMQX_PLUGIN_TEMPLATES_LEGACY, [
+    #{
+        vsn => "5.0.0",
+        tag => "5.0.0",
+        release_name => "emqx_plugin_template",
+        app_name => emqx_plugin_template
+    }
+]).
+
 -define(EMQX_ELIXIR_PLUGIN_TEMPLATE_RELEASE_NAME, "elixir_plugin_template").
 -define(EMQX_ELIXIR_PLUGIN_TEMPLATE_URL,
     "https://github.com/emqx/emqx-elixir-plugin/releases/download/"
@@ -35,6 +47,8 @@
 -define(EMQX_ELIXIR_PLUGIN_TEMPLATE_VSN, "0.1.0").
 -define(EMQX_ELIXIR_PLUGIN_TEMPLATE_TAG, "0.1.0-2").
 -define(PACKAGE_SUFFIX, ".tar.gz").
+
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
 
 all() ->
     [
@@ -62,23 +76,21 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_suite(Config) ->
-    WorkDir = proplists:get_value(data_dir, Config),
-    filelib:ensure_path(WorkDir),
-    OrigInstallDir = emqx_plugins:get_config(install_dir, undefined),
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_plugins]),
-    emqx_plugins:put_config(install_dir, WorkDir),
-    [{orig_install_dir, OrigInstallDir} | Config].
+    WorkDir = emqx_cth_suite:work_dir(Config),
+    InstallDir = filename:join([WorkDir, "plugins"]),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_ctl,
+            {emqx_plugins, #{config => #{plugins => #{install_dir => InstallDir}}}}
+        ],
+        #{work_dir => WorkDir}
+    ),
+    ok = filelib:ensure_path(InstallDir),
+    [{suite_apps, Apps}, {install_dir, InstallDir} | Config].
 
 end_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_config:erase(plugins),
-    %% restore config
-    case proplists:get_value(orig_install_dir, Config) of
-        undefined -> ok;
-        OrigInstallDir -> emqx_plugins:put_config(install_dir, OrigInstallDir)
-    end,
-    emqx_common_test_helpers:stop_apps([emqx_plugins, emqx_conf]),
-    ok.
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 init_per_testcase(TestCase, Config) ->
     emqx_plugins:put_configured([]),
@@ -130,6 +142,39 @@ bin(A) when is_atom(A) -> atom_to_binary(A, utf8);
 bin(L) when is_list(L) -> unicode:characters_to_binary(L, utf8);
 bin(B) when is_binary(B) -> B.
 
+hookpoints() ->
+    [
+        'client.connect',
+        'client.connack',
+        'client.connected',
+        'client.disconnected',
+        'client.authenticate',
+        'client.authorize',
+        'client.subscribe',
+        'client.unsubscribe',
+        'session.created',
+        'session.subscribed',
+        'session.unsubscribed',
+        'session.resumed',
+        'session.discarded',
+        'session.takenover',
+        'session.terminated',
+        'message.publish',
+        'message.puback',
+        'message.delivered',
+        'message.acked',
+        'message.dropped'
+    ].
+
+get_hook_modules() ->
+    lists:flatmap(
+        fun(HookPoint) ->
+            CBs = emqx_hooks:lookup(HookPoint),
+            [Mod || {callback, {Mod, _Fn, _Args}, _Filter, _Prio} <- CBs]
+        end,
+        hookpoints()
+    ).
+
 t_demo_install_start_stop_uninstall({init, Config}) ->
     Opts = #{package := Package} = get_demo_plugin_package(),
     NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
@@ -153,11 +198,11 @@ t_demo_install_start_stop_uninstall(Config) ->
     ?assertEqual([maps:without([readme], Info)], emqx_plugins:list()),
     %% start
     ok = emqx_plugins:ensure_started(NameVsn),
-    ok = assert_app_running(emqx_plugin_template, true),
+    ok = assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
     ok = assert_app_running(map_sets, true),
     %% start (idempotent)
     ok = emqx_plugins:ensure_started(bin(NameVsn)),
-    ok = assert_app_running(emqx_plugin_template, true),
+    ok = assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
     ok = assert_app_running(map_sets, true),
 
     %% running app can not be un-installed
@@ -168,11 +213,11 @@ t_demo_install_start_stop_uninstall(Config) ->
 
     %% stop
     ok = emqx_plugins:ensure_stopped(NameVsn),
-    ok = assert_app_running(emqx_plugin_template, false),
+    ok = assert_app_running(?EMQX_PLUGIN_APP_NAME, false),
     ok = assert_app_running(map_sets, false),
     %% stop (idempotent)
     ok = emqx_plugins:ensure_stopped(bin(NameVsn)),
-    ok = assert_app_running(emqx_plugin_template, false),
+    ok = assert_app_running(?EMQX_PLUGIN_APP_NAME, false),
     ok = assert_app_running(map_sets, false),
     %% still listed after stopped
     ReleaseNameBin = list_to_binary(ReleaseName),
@@ -188,6 +233,7 @@ t_demo_install_start_stop_uninstall(Config) ->
     ),
     ok = emqx_plugins:ensure_uninstalled(NameVsn),
     ?assertEqual([], emqx_plugins:list()),
+    ?assertMatch([<<"[]">>], emqx_plugins_cli:list(fun(_, L) -> L end)),
     ok.
 
 %% help function to create a info file.
@@ -195,7 +241,7 @@ t_demo_install_start_stop_uninstall(Config) ->
 %% but since we are using hocon:load to load it
 %% ad-hoc test files can be in hocon format
 write_info_file(Config, NameVsn, Content) ->
-    WorkDir = proplists:get_value(data_dir, Config),
+    WorkDir = proplists:get_value(install_dir, Config),
     InfoFile = filename:join([WorkDir, NameVsn, "release.json"]),
     ok = filelib:ensure_dir(InfoFile),
     ok = file:write_file(InfoFile, Content).
@@ -216,7 +262,7 @@ t_position(Config) ->
     PosApp2 = <<"position-2">>,
     ok = write_info_file(Config, PosApp2, FakeInfo),
     %% fake a disabled plugin in config
-    ok = emqx_plugins:ensure_state(PosApp2, {before, NameVsn}, false),
+    ok = ensure_state(PosApp2, {before, NameVsn}, false),
     ListFun = fun() ->
         lists:map(
             fun(
@@ -246,46 +292,99 @@ t_start_restart_and_stop({init, Config}) ->
 t_start_restart_and_stop({'end', _Config}) ->
     ok;
 t_start_restart_and_stop(Config) ->
+    %% pre-condition
+    Hooks0 = get_hook_modules(),
+    ?assertNot(lists:member(?EMQX_PLUGIN_APP_NAME, Hooks0), #{hooks => Hooks0}),
+
     NameVsn = proplists:get_value(name_vsn, Config),
     ok = emqx_plugins:ensure_installed(NameVsn),
     ok = emqx_plugins:ensure_enabled(NameVsn),
+
+    %% Application is not yet started.
+    Hooks1 = get_hook_modules(),
+    ?assertNot(lists:member(?EMQX_PLUGIN_APP_NAME, Hooks1), #{hooks => Hooks1}),
+
     FakeInfo =
         "name=bar, rel_vsn=\"2\", rel_apps=[\"bar-9\"],"
         "description=\"desc bar\"",
     Bar2 = <<"bar-2">>,
     ok = write_info_file(Config, Bar2, FakeInfo),
     %% fake a disabled plugin in config
-    ok = emqx_plugins:ensure_state(Bar2, front, false),
+    ok = ensure_state(Bar2, front, false),
 
-    assert_app_running(emqx_plugin_template, false),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, false),
     ok = emqx_plugins:ensure_started(),
-    assert_app_running(emqx_plugin_template, true),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
+
+    %% Should have called the application start callback, which in turn adds hooks.
+    Hooks2 = get_hook_modules(),
+    ?assert(lists:member(?EMQX_PLUGIN_APP_NAME, Hooks2), #{hooks => Hooks2}),
 
     %% fake enable bar-2
-    ok = emqx_plugins:ensure_state(Bar2, rear, true),
+    ok = ensure_state(Bar2, rear, true),
     %% should cause an error
-    ?assertError(
-        #{function := _, errors := [_ | _]},
-        emqx_plugins:ensure_started()
+    ?check_trace(
+        emqx_plugins:ensure_started(),
+        fun(Trace) ->
+            ?assertMatch(
+                [#{function := _, errors := [_ | _]}],
+                ?of_kind(for_plugins_action_error_occurred, Trace)
+            ),
+            ok
+        end
     ),
     %% but demo plugin should still be running
-    assert_app_running(emqx_plugin_template, true),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
 
     %% stop all
     ok = emqx_plugins:ensure_stopped(),
-    assert_app_running(emqx_plugin_template, false),
-    ok = emqx_plugins:ensure_state(Bar2, rear, false),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, false),
+    ok = ensure_state(Bar2, rear, false),
+
+    %% Should have called the application stop callback, which removes the hooks.
+    Hooks3 = get_hook_modules(),
+    ?assertNot(lists:member(?EMQX_PLUGIN_APP_NAME, Hooks3), #{hooks => Hooks3}),
 
     ok = emqx_plugins:restart(NameVsn),
-    assert_app_running(emqx_plugin_template, true),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
     %% repeat
     ok = emqx_plugins:restart(NameVsn),
-    assert_app_running(emqx_plugin_template, true),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
 
     ok = emqx_plugins:ensure_stopped(),
     ok = emqx_plugins:ensure_disabled(NameVsn),
     ok = emqx_plugins:ensure_uninstalled(NameVsn),
     ok = emqx_plugins:ensure_uninstalled(Bar2),
+    ?assertEqual([], emqx_plugins:list()),
+    ok.
+
+t_legacy_plugins({init, Config}) ->
+    Config;
+t_legacy_plugins({'end', _Config}) ->
+    ok;
+t_legacy_plugins(Config) ->
+    lists:foreach(
+        fun(LegacyPlugin) ->
+            test_legacy_plugin(LegacyPlugin, Config)
+        end,
+        ?EMQX_PLUGIN_TEMPLATES_LEGACY
+    ).
+
+test_legacy_plugin(#{app_name := AppName} = LegacyPlugin, _Config) ->
+    #{package := Package} = get_demo_plugin_package(LegacyPlugin#{
+        shdir => emqx_plugins:install_dir(), git_url => ?EMQX_PLUGIN_TEMPLATE_URL
+    }),
+    NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
+    ok = emqx_plugins:ensure_installed(NameVsn),
+    %% start
+    ok = emqx_plugins:ensure_started(NameVsn),
+    ok = assert_app_running(AppName, true),
+    ok = assert_app_running(map_sets, true),
+    %% stop
+    ok = emqx_plugins:ensure_stopped(NameVsn),
+    ok = assert_app_running(AppName, false),
+    ok = assert_app_running(map_sets, false),
+    ok = emqx_plugins:ensure_uninstalled(NameVsn),
     ?assertEqual([], emqx_plugins:list()),
     ok.
 
@@ -298,7 +397,7 @@ t_enable_disable({'end', Config}) ->
 t_enable_disable(Config) ->
     NameVsn = proplists:get_value(name_vsn, Config),
     ok = emqx_plugins:ensure_installed(NameVsn),
-    ?assertEqual([], emqx_plugins:configured()),
+    ?assertEqual([#{name_vsn => NameVsn, enable => false}], emqx_plugins:configured()),
     ok = emqx_plugins:ensure_enabled(NameVsn),
     ?assertEqual([#{name_vsn => NameVsn, enable => true}], emqx_plugins:configured()),
     ok = emqx_plugins:ensure_disabled(NameVsn),
@@ -307,7 +406,7 @@ t_enable_disable(Config) ->
     ?assertEqual([#{name_vsn => NameVsn, enable => true}], emqx_plugins:configured()),
     ?assertMatch(
         {error, #{
-            reason := "bad_plugin_config_status",
+            msg := "bad_plugin_config_status",
             hint := "disable_the_plugin_first"
         }},
         emqx_plugins:ensure_uninstalled(NameVsn)
@@ -325,25 +424,35 @@ assert_app_running(Name, false) ->
     AllApps = application:which_applications(),
     ?assertEqual(false, lists:keyfind(Name, 1, AllApps)).
 
+assert_started_and_hooks_loaded() ->
+    PluginConfig = emqx_plugins:list(),
+    ct:pal("plugin config:\n  ~p", [PluginConfig]),
+    ?assertMatch([_], PluginConfig),
+    assert_app_running(?EMQX_PLUGIN_APP_NAME, true),
+    Hooks = get_hook_modules(),
+    ?assert(lists:member(?EMQX_PLUGIN_APP_NAME, Hooks), #{hooks => Hooks}),
+    ok.
+
 t_bad_tar_gz({init, Config}) ->
     Config;
 t_bad_tar_gz({'end', _Config}) ->
     ok;
 t_bad_tar_gz(Config) ->
-    WorkDir = proplists:get_value(data_dir, Config),
+    WorkDir = proplists:get_value(install_dir, Config),
     FakeTarTz = filename:join([WorkDir, "fake-vsn.tar.gz"]),
     ok = file:write_file(FakeTarTz, "a\n"),
     ?assertMatch(
         {error, #{
-            reason := "bad_plugin_package",
-            return := eof
+            msg := "bad_plugin_package",
+            reason := eof
         }},
         emqx_plugins:ensure_installed("fake-vsn")
     ),
+    %% the plugin tarball can not be found on any nodes
     ?assertMatch(
         {error, #{
-            reason := "failed_to_extract_plugin_package",
-            return := not_found
+            msg := "no_nodes_to_copy_plugin_from",
+            reason := plugin_not_found
         }},
         emqx_plugins:ensure_installed("nonexisting")
     ),
@@ -355,7 +464,7 @@ t_bad_tar_gz(Config) ->
 %% create with incomplete info file
 %% failed install attempts should not leave behind extracted dir
 t_bad_tar_gz2({init, Config}) ->
-    WorkDir = proplists:get_value(data_dir, Config),
+    WorkDir = proplists:get_value(install_dir, Config),
     NameVsn = "foo-0.2",
     %% this an invalid info file content (description missing)
     BadInfo = "name=foo, rel_vsn=\"0.2\", rel_apps=[foo]",
@@ -373,7 +482,7 @@ t_bad_tar_gz2(Config) ->
     ?assert(filelib:is_regular(TarGz)),
     %% failed to install, it also cleans up the bad content of .tar.gz file
     ?assertMatch({error, _}, emqx_plugins:ensure_installed(NameVsn)),
-    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:dir(NameVsn))),
+    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:plugin_dir(NameVsn))),
     %% but the tar.gz file is still around
     ?assert(filelib:is_regular(TarGz)),
     ok.
@@ -381,7 +490,7 @@ t_bad_tar_gz2(Config) ->
 %% test that we even cleanup content that doesn't match the expected name-vsn
 %% pattern
 t_tar_vsn_content_mismatch({init, Config}) ->
-    WorkDir = proplists:get_value(data_dir, Config),
+    WorkDir = proplists:get_value(install_dir, Config),
     NameVsn = "bad_tar-0.2",
     %% this an invalid info file content
     BadInfo = "name=foo, rel_vsn=\"0.2\", rel_apps=[\"foo-0.2\"], description=\"lorem ipsum\"",
@@ -401,8 +510,8 @@ t_tar_vsn_content_mismatch(Config) ->
     %% failed to install, it also cleans up content of the bad .tar.gz file even
     %% if in other directory
     ?assertMatch({error, _}, emqx_plugins:ensure_installed(NameVsn)),
-    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:dir(NameVsn))),
-    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:dir("foo-0.2"))),
+    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:plugin_dir(NameVsn))),
+    ?assertEqual({error, enoent}, file:read_file_info(emqx_plugins:plugin_dir("foo-0.2"))),
     %% the tar.gz file is still around
     ?assert(filelib:is_regular(TarGz)),
     ok.
@@ -416,15 +525,15 @@ t_bad_info_json(Config) ->
     ok = write_info_file(Config, NameVsn, "bad-syntax"),
     ?assertMatch(
         {error, #{
-            error := "bad_info_file",
-            return := {parse_error, _}
+            msg := "bad_info_file",
+            reason := {parse_error, _}
         }},
         emqx_plugins:describe(NameVsn)
     ),
     ok = write_info_file(Config, NameVsn, "{\"bad\": \"obj\"}"),
     ?assertMatch(
         {error, #{
-            error := "bad_info_file_content",
+            msg := "bad_info_file_content",
             mandatory_fields := _
         }},
         emqx_plugins:describe(NameVsn)
@@ -460,7 +569,7 @@ t_elixir_plugin(Config) ->
     ok = emqx_plugins:ensure_installed(NameVsn),
     %% idempotent
     ok = emqx_plugins:ensure_installed(NameVsn),
-    {ok, Info} = emqx_plugins:read_plugin(NameVsn, #{}),
+    {ok, Info} = emqx_plugins:read_plugin_info(NameVsn, #{}),
     ?assertEqual([Info], emqx_plugins:list()),
     %% start
     ok = emqx_plugins:ensure_started(NameVsn),
@@ -517,7 +626,7 @@ t_load_config_from_cli({'end', Config}) ->
 t_load_config_from_cli(Config) when is_list(Config) ->
     NameVsn = ?config(name_vsn, Config),
     ok = emqx_plugins:ensure_installed(NameVsn),
-    ?assertEqual([], emqx_plugins:configured()),
+    ?assertEqual([#{name_vsn => NameVsn, enable => false}], emqx_plugins:configured()),
     ok = emqx_plugins:ensure_enabled(NameVsn),
     ok = emqx_plugins:ensure_started(NameVsn),
     Params0 = unused,
@@ -565,34 +674,31 @@ t_load_config_from_cli(Config) when is_list(Config) ->
     ok.
 
 group_t_copy_plugin_to_a_new_node({init, Config}) ->
-    WorkDir = proplists:get_value(data_dir, Config),
-    FromInstallDir = filename:join(WorkDir, atom_to_list(plugins_copy_from)),
-    file:del_dir_r(FromInstallDir),
+    FromInstallDir = filename:join(emqx_cth_suite:work_dir(?FUNCTION_NAME, Config), from),
     ok = filelib:ensure_path(FromInstallDir),
-    ToInstallDir = filename:join(WorkDir, atom_to_list(plugins_copy_to)),
-    file:del_dir_r(ToInstallDir),
+    ToInstallDir = filename:join(emqx_cth_suite:work_dir(?FUNCTION_NAME, Config), to),
     ok = filelib:ensure_path(ToInstallDir),
     #{package := Package, release_name := PluginName} = get_demo_plugin_package(FromInstallDir),
-    [{CopyFrom, CopyFromOpts}, {CopyTo, CopyToOpts}] =
-        emqx_common_test_helpers:emqx_cluster(
+    Apps = [
+        emqx,
+        emqx_conf,
+        emqx_ctl,
+        emqx_plugins
+    ],
+    [SpecCopyFrom, SpecCopyTo] =
+        emqx_cth_cluster:mk_nodespecs(
             [
-                {core, plugins_copy_from},
-                {core, plugins_copy_to}
+                {plugins_copy_from, #{role => core, apps => Apps}},
+                {plugins_copy_to, #{role => core, apps => Apps}}
             ],
             #{
-                apps => [emqx_conf, emqx_plugins],
-                env => [
-                    {emqx, boot_modules, []}
-                ],
-                load_schema => false
+                work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)
             }
         ),
-    CopyFromNode = emqx_common_test_helpers:start_slave(
-        CopyFrom, maps:remove(join_to, CopyFromOpts)
-    ),
-    ok = rpc:call(CopyFromNode, emqx_plugins, put_config, [install_dir, FromInstallDir]),
-    CopyToNode = emqx_common_test_helpers:start_slave(CopyTo, maps:remove(join_to, CopyToOpts)),
-    ok = rpc:call(CopyToNode, emqx_plugins, put_config, [install_dir, ToInstallDir]),
+    [CopyFromNode] = emqx_cth_cluster:start([SpecCopyFrom#{join_to => undefined}]),
+    ok = rpc:call(CopyFromNode, emqx_plugins, put_config_internal, [install_dir, FromInstallDir]),
+    [CopyToNode] = emqx_cth_cluster:start([SpecCopyTo#{join_to => undefined}]),
+    ok = rpc:call(CopyToNode, emqx_plugins, put_config_internal, [install_dir, ToInstallDir]),
     NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
     ok = rpc:call(CopyFromNode, emqx_plugins, ensure_installed, [NameVsn]),
     ok = rpc:call(CopyFromNode, emqx_plugins, ensure_started, [NameVsn]),
@@ -615,21 +721,14 @@ group_t_copy_plugin_to_a_new_node({init, Config}) ->
         | Config
     ];
 group_t_copy_plugin_to_a_new_node({'end', Config}) ->
-    CopyFromNode = proplists:get_value(copy_from_node, Config),
-    CopyToNode = proplists:get_value(copy_to_node, Config),
-    ok = rpc:call(CopyFromNode, emqx_config, delete_override_conf_files, []),
-    ok = rpc:call(CopyToNode, emqx_config, delete_override_conf_files, []),
-    rpc:call(CopyToNode, ekka, leave, []),
-    rpc:call(CopyFromNode, ekka, leave, []),
-    ok = emqx_common_test_helpers:stop_slave(CopyToNode),
-    ok = emqx_common_test_helpers:stop_slave(CopyFromNode),
-    ok = file:del_dir_r(proplists:get_value(to_install_dir, Config)),
-    ok = file:del_dir_r(proplists:get_value(from_install_dir, Config));
+    CopyFromNode = ?config(copy_from_node, Config),
+    CopyToNode = ?config(copy_to_node, Config),
+    ok = emqx_cth_cluster:stop([CopyFromNode, CopyToNode]);
 group_t_copy_plugin_to_a_new_node(Config) ->
     CopyFromNode = proplists:get_value(copy_from_node, Config),
     CopyToNode = proplists:get_value(copy_to_node, Config),
     CopyToDir = proplists:get_value(to_install_dir, Config),
-    CopyFromPluginsState = rpc:call(CopyFromNode, emqx_plugins, get_config, [[states], []]),
+    CopyFromPluginsState = rpc:call(CopyFromNode, emqx_plugins, get_config_interal, [[states], []]),
     NameVsn = proplists:get_value(name_vsn, Config),
     PluginName = proplists:get_value(plugin_name, Config),
     PluginApp = list_to_atom(PluginName),
@@ -652,12 +751,20 @@ group_t_copy_plugin_to_a_new_node(Config) ->
     ),
     ok = rpc:call(CopyToNode, ekka, join, [CopyFromNode]),
     %% Mimic cluster-override conf copying
-    ok = rpc:call(CopyToNode, emqx_plugins, put_config, [[states], CopyFromPluginsState]),
+    ok = rpc:call(CopyToNode, emqx_plugins, put_config_internal, [[states], CopyFromPluginsState]),
     %% Plugin copying is triggered upon app restart on a new node.
     %% This is similar to emqx_conf, which copies cluster-override conf upon start,
     %% see: emqx_conf_app:init_conf/0
     ok = rpc:call(CopyToNode, application, stop, [emqx_plugins]),
     {ok, _} = rpc:call(CopyToNode, application, ensure_all_started, [emqx_plugins]),
+
+    %% Plugin config should be synced from `CopyFromNode`
+    %% by application `emqx` and `emqx_conf`
+    %% FIXME: in test case, we manually do it here
+    ok = rpc:call(CopyToNode, emqx_plugins, put_config_internal, [[states], CopyFromPluginsState]),
+    ok = rpc:call(CopyToNode, emqx_plugins, ensure_installed, []),
+    ok = rpc:call(CopyToNode, emqx_plugins, ensure_started, []),
+
     ?assertMatch(
         {ok, #{running_status := running, config_status := enabled}},
         rpc:call(CopyToNode, emqx_plugins, describe, [NameVsn])
@@ -665,69 +772,61 @@ group_t_copy_plugin_to_a_new_node(Config) ->
 
 %% checks that we can start a cluster with a lone node.
 group_t_copy_plugin_to_a_new_node_single_node({init, Config}) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    ToInstallDir = filename:join(PrivDataDir, "plugins_copy_to"),
+    ToInstallDir = emqx_cth_suite:work_dir(?FUNCTION_NAME, Config),
     file:del_dir_r(ToInstallDir),
     ok = filelib:ensure_path(ToInstallDir),
     #{package := Package, release_name := PluginName} = get_demo_plugin_package(ToInstallDir),
     NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
-    [{CopyTo, CopyToOpts}] =
-        emqx_common_test_helpers:emqx_cluster(
-            [
-                {core, plugins_copy_to}
-            ],
-            #{
-                apps => [emqx_conf, emqx_plugins],
-                env => [
-                    {emqx, boot_modules, []}
-                ],
-                env_handler => fun
-                    (emqx_plugins) ->
-                        ok = emqx_plugins:put_config(install_dir, ToInstallDir),
-                        %% this is to simulate an user setting the state
-                        %% via environment variables before starting the node
-                        ok = emqx_plugins:put_config(
-                            states,
-                            [#{name_vsn => NameVsn, enable => true}]
-                        ),
-                        ok;
-                    (_) ->
-                        ok
-                end,
-                priv_data_dir => PrivDataDir,
-                schema_mod => emqx_conf_schema,
-                peer_mod => slave,
-                load_schema => true
+    Apps = [
+        emqx,
+        emqx_conf,
+        emqx_ctl,
+        {emqx_plugins, #{
+            config => #{
+                plugins => #{
+                    install_dir => ToInstallDir,
+                    states => [#{name_vsn => NameVsn, enable => true}]
+                }
             }
-        ),
+        }}
+    ],
+    [CopyToNode] = emqx_cth_cluster:start(
+        [{plugins_copy_to, #{role => core, apps => Apps}}],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
     [
         {to_install_dir, ToInstallDir},
-        {copy_to_node_name, CopyTo},
-        {copy_to_opts, CopyToOpts},
+        {copy_to_node, CopyToNode},
         {name_vsn, NameVsn},
         {plugin_name, PluginName}
         | Config
     ];
 group_t_copy_plugin_to_a_new_node_single_node({'end', Config}) ->
     CopyToNode = proplists:get_value(copy_to_node, Config),
-    ok = emqx_common_test_helpers:stop_slave(CopyToNode),
-    ok = file:del_dir_r(proplists:get_value(to_install_dir, Config)),
-    ok;
+    ok = emqx_cth_cluster:stop([CopyToNode]);
 group_t_copy_plugin_to_a_new_node_single_node(Config) ->
-    CopyTo = ?config(copy_to_node_name, Config),
-    CopyToOpts = ?config(copy_to_opts, Config),
+    CopyToNode = ?config(copy_to_node, Config),
     ToInstallDir = ?config(to_install_dir, Config),
     NameVsn = proplists:get_value(name_vsn, Config),
     %% Start the node for the first time. The plugin should start
     %% successfully even if it's not extracted yet.  Simply starting
     %% the node would crash if not working properly.
-    CopyToNode = emqx_common_test_helpers:start_slave(CopyTo, CopyToOpts),
     ct:pal("~p config:\n  ~p", [
-        CopyToNode, erpc:call(CopyToNode, emqx_plugins, get_config, [[], #{}])
+        CopyToNode, erpc:call(CopyToNode, emqx_plugins, get_config_interal, [[], #{}])
     ]),
     ct:pal("~p install_dir:\n  ~p", [
         CopyToNode, erpc:call(CopyToNode, file, list_dir, [ToInstallDir])
     ]),
+
+    %% Plugin config should be synced from `CopyFromNode`
+    %% by application `emqx` and `emqx_conf`
+    %% FIXME: in test case, we manually do it here
+    ok = rpc:call(CopyToNode, emqx_plugins, put_config_internal, [
+        [states], [#{enable => true, name_vsn => NameVsn}]
+    ]),
+    ok = rpc:call(CopyToNode, emqx_plugins, ensure_installed, []),
+    ok = rpc:call(CopyToNode, emqx_plugins, ensure_started, []),
+
     ?assertMatch(
         {ok, #{running_status := running, config_status := enabled}},
         rpc:call(CopyToNode, emqx_plugins, describe, [NameVsn])
@@ -735,59 +834,50 @@ group_t_copy_plugin_to_a_new_node_single_node(Config) ->
     ok.
 
 group_t_cluster_leave({init, Config}) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    ToInstallDir = filename:join(PrivDataDir, "plugins_copy_to"),
-    file:del_dir_r(ToInstallDir),
-    ok = filelib:ensure_path(ToInstallDir),
-    #{package := Package, release_name := PluginName} = get_demo_plugin_package(ToInstallDir),
+    Specs = emqx_cth_cluster:mk_nodespecs(
+        [
+            {group_t_cluster_leave1, #{role => core, apps => [emqx, emqx_conf, emqx_ctl]}},
+            {group_t_cluster_leave2, #{role => core, apps => [emqx, emqx_conf, emqx_ctl]}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    Nodes = emqx_cth_cluster:start(Specs),
+    InstallRelDir = "plugins_copy_to",
+    InstallDirs = [filename:join(WD, InstallRelDir) || #{work_dir := WD} <- Specs],
+    ok = lists:foreach(fun filelib:ensure_path/1, InstallDirs),
+    #{package := Package, release_name := PluginName} = get_demo_plugin_package(hd(InstallDirs)),
     NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
-    Cluster =
-        emqx_common_test_helpers:emqx_cluster(
-            [core, core],
-            #{
-                apps => [emqx_conf, emqx_plugins],
-                env => [
-                    {emqx, boot_modules, []}
-                ],
-                env_handler => fun
-                    (emqx_plugins) ->
-                        ok = emqx_plugins:put_config(install_dir, ToInstallDir),
-                        %% this is to simulate an user setting the state
-                        %% via environment variables before starting the node
-                        ok = emqx_plugins:put_config(
-                            states,
-                            [#{name_vsn => NameVsn, enable => true}]
-                        ),
-                        ok;
-                    (_) ->
-                        ok
-                end,
-                priv_data_dir => PrivDataDir,
-                schema_mod => emqx_conf_schema,
-                peer_mod => slave,
-                load_schema => true
+    [{ok, _}, {ok, _}] = erpc:multicall(Nodes, emqx_cth_suite, start_app, [
+        emqx_plugins,
+        #{
+            config => #{
+                plugins => #{
+                    install_dir => InstallRelDir,
+                    states => [#{name_vsn => NameVsn, enable => true}]
+                }
             }
-        ),
-    Nodes = [emqx_common_test_helpers:start_slave(Name, Opts) || {Name, Opts} <- Cluster],
+        }
+    ]),
     [
-        {to_install_dir, ToInstallDir},
-        {cluster, Cluster},
         {nodes, Nodes},
         {name_vsn, NameVsn},
         {plugin_name, PluginName}
         | Config
     ];
 group_t_cluster_leave({'end', Config}) ->
-    Nodes = proplists:get_value(nodes, Config),
-    [ok = emqx_common_test_helpers:stop_slave(N) || N <- Nodes],
-    ok = file:del_dir_r(proplists:get_value(to_install_dir, Config)),
-    ok;
+    Nodes = ?config(nodes, Config),
+    ok = emqx_cth_cluster:stop(Nodes);
 group_t_cluster_leave(Config) ->
     [N1, N2] = ?config(nodes, Config),
     NameVsn = proplists:get_value(name_vsn, Config),
     ok = erpc:call(N1, emqx_plugins, ensure_installed, [NameVsn]),
     ok = erpc:call(N1, emqx_plugins, ensure_started, [NameVsn]),
     ok = erpc:call(N1, emqx_plugins, ensure_enabled, [NameVsn]),
+
+    ok = erpc:call(N2, emqx_plugins, ensure_installed, [NameVsn]),
+    ok = erpc:call(N2, emqx_plugins, ensure_started, [NameVsn]),
+    ok = erpc:call(N2, emqx_plugins, ensure_enabled, [NameVsn]),
+
     Params = unused,
     %% 2 nodes running
     ?assertMatch(
@@ -813,6 +903,106 @@ group_t_cluster_leave(Config) ->
     ),
     ok.
 
+%% Checks that starting a node with a plugin enabled starts it correctly, and that the
+%% hooks added by the plugin's `application:start/2' callback are indeed in place.
+%% See also: https://github.com/emqx/emqx/issues/13378
+t_start_node_with_plugin_enabled({init, Config}) ->
+    #{package := Package} = get_demo_plugin_package(),
+    Basename = filename:basename(Package),
+    NameVsn = filename:basename(Package, ?PACKAGE_SUFFIX),
+    AppSpecs = [
+        emqx,
+        emqx_conf,
+        emqx_ctl,
+        {emqx_plugins, #{
+            config =>
+                #{
+                    plugins =>
+                        #{
+                            install_dir => <<"plugins">>,
+                            states =>
+                                [
+                                    #{
+                                        enable => true,
+                                        name_vsn => NameVsn
+                                    }
+                                ]
+                        }
+                }
+        }}
+    ],
+    Name1 = t_cluster_start_enabled1,
+    Name2 = t_cluster_start_enabled2,
+    Specs = emqx_cth_cluster:mk_nodespecs(
+        [
+            {Name1, #{role => core, apps => AppSpecs, join_to => undefined}},
+            {Name2, #{role => core, apps => AppSpecs, join_to => undefined}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    lists:foreach(
+        fun(#{work_dir := WorkDir}) ->
+            Destination = filename:join([WorkDir, "plugins", Basename]),
+            ok = filelib:ensure_dir(Destination),
+            {ok, _} = file:copy(Package, Destination)
+        end,
+        Specs
+    ),
+    Names = [Name1, Name2],
+    Nodes = [emqx_cth_cluster:node_name(N) || N <- Names],
+    [
+        {node_specs, Specs},
+        {nodes, Nodes},
+        {name_vsn, NameVsn}
+        | Config
+    ];
+t_start_node_with_plugin_enabled({'end', Config}) ->
+    Nodes = ?config(nodes, Config),
+    ok = emqx_cth_cluster:stop(Nodes),
+    ok;
+t_start_node_with_plugin_enabled(Config) when is_list(Config) ->
+    NodeSpecs = ?config(node_specs, Config),
+    ?check_trace(
+        #{timetrap => 10_000},
+        begin
+            %% Hack: we use `restart' here to disable the clean slate verification, as we
+            %% just created and populated the `plugins' directory...
+            [N1, N2 | _] = lists:flatmap(fun emqx_cth_cluster:restart/1, NodeSpecs),
+            ?ON(N1, assert_started_and_hooks_loaded()),
+            ?ON(N2, assert_started_and_hooks_loaded()),
+            %% Now make them join.
+            %% N.B.: We need to start autocluster so that applications are restarted in
+            %% order, and also we need to override the config loader to emulate what
+            %% `emqx_cth_cluster' does and avoid the node crashing due to lack of config
+            %% keys.
+            ok = ?ON(N2, emqx_machine_boot:start_autocluster()),
+            ?ON(N2, begin
+                StartCallback0 =
+                    case ekka:env({callback, start}) of
+                        {ok, SC0} -> SC0;
+                        _ -> fun() -> ok end
+                    end,
+                StartCallback = fun() ->
+                    ok = emqx_app:set_config_loader(emqx_cth_suite),
+                    StartCallback0()
+                end,
+                ekka:callback(start, StartCallback)
+            end),
+            {ok, {ok, _}} =
+                ?wait_async_action(
+                    ?ON(N2, ekka:join(N1)),
+                    #{?snk_kind := "emqx_plugins_app_started"}
+                ),
+            ct:pal("checking N1 state"),
+            ?ON(N1, assert_started_and_hooks_loaded()),
+            ct:pal("checking N2 state"),
+            ?ON(N2, assert_started_and_hooks_loaded()),
+            ok
+        end,
+        []
+    ),
+    ok.
+
 make_tar(Cwd, NameWithVsn) ->
     make_tar(Cwd, NameWithVsn, NameWithVsn).
 
@@ -826,3 +1016,7 @@ make_tar(Cwd, NameWithVsn, TarfileVsn) ->
     after
         file:set_cwd(OriginalCwd)
     end.
+
+ensure_state(NameVsn, Position, Enabled) ->
+    %% NOTE: this is an internal function that is (legacy) exported in test builds only...
+    emqx_plugins:ensure_state(NameVsn, Position, Enabled, _ConfLocation = local).

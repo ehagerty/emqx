@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_redis_SUITE).
 
@@ -30,6 +30,11 @@
     <<"local_topic">> => <<"local_topic/#">>
 }).
 
+-define(USERNAME_PASSWORD_AUTH_OPTS, #{
+    <<"username">> => <<"test_user">>,
+    <<"password">> => <<"test_passwd">>
+}).
+
 -define(BATCH_SIZE, 5).
 
 -define(PROXY_HOST, "toxiproxy").
@@ -51,9 +56,14 @@
 ).
 
 all() -> [{group, transports}, {group, rest}].
+suite() -> [{timetrap, {minutes, 20}}].
 
 groups() ->
-    ResourceSpecificTCs = [t_create_delete_bridge],
+    ResourceSpecificTCs = [
+        t_create_delete_bridge,
+        t_create_via_http,
+        t_start_stop
+    ],
     TCs = emqx_common_test_helpers:all(?MODULE) -- ResourceSpecificTCs,
     TypeGroups = [
         {group, redis_single},
@@ -117,10 +127,22 @@ wait_for_ci_redis(Checks, Config) ->
             ProxyHost = os:getenv("PROXY_HOST", ?PROXY_HOST),
             ProxyPort = list_to_integer(os:getenv("PROXY_PORT", ?PROXY_PORT)),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            ok = emqx_common_test_helpers:start_apps([
-                emqx_conf, emqx_resource, emqx_connector, emqx_bridge, emqx_rule_engine
-            ]),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_resource,
+                    emqx_bridge,
+                    emqx_bridge_redis,
+                    emqx_rule_engine,
+                    emqx_management,
+                    {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
+            {ok, _Api} = emqx_common_test_http:create_default_app(),
             [
+                {apps, Apps},
                 {proxy_host, ProxyHost},
                 {proxy_port, ProxyPort}
                 | Config
@@ -137,16 +159,18 @@ redis_checks() ->
             1
     end.
 
-end_per_suite(_Config) ->
-    ok = delete_all_bridges(),
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_rule_engine, emqx_bridge, emqx_resource]),
-    _ = application:stop(emqx_connector),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
-init_per_testcase(_Testcase, Config) ->
+init_per_testcase(Testcase, Config0) ->
+    emqx_logger:set_log_level(debug),
     ok = delete_all_rules(),
-    ok = delete_all_bridges(),
+    ok = emqx_bridge_v2_SUITE:delete_all_bridges_and_connectors(),
+    UniqueNum = integer_to_binary(erlang:unique_integer()),
+    Name = <<(atom_to_binary(Testcase))/binary, UniqueNum/binary>>,
+    Config = [{bridge_name, Name} | Config0],
     case {?config(connector_type, Config), ?config(batch_mode, Config)} of
         {undefined, _} ->
             Config;
@@ -160,7 +184,12 @@ init_per_testcase(_Testcase, Config) ->
             IsBatch = (BatchMode =:= batch_on),
             BridgeConfig0 = maps:merge(RedisConnConfig, ?COMMON_REDIS_OPTS),
             BridgeConfig1 = BridgeConfig0#{<<"resource_opts">> => ResourceConfig},
-            [{bridge_config, BridgeConfig1}, {is_batch, IsBatch} | Config]
+            [
+                {bridge_type, RedisType},
+                {bridge_config, BridgeConfig1},
+                {is_batch, IsBatch}
+                | Config
+            ]
     end.
 
 end_per_testcase(_Testcase, Config) ->
@@ -168,10 +197,18 @@ end_per_testcase(_Testcase, Config) ->
     ProxyPort = ?config(proxy_port, Config),
     ok = snabbkaffe:stop(),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-    ok = delete_all_bridges().
+    ok = emqx_bridge_v2_SUITE:delete_all_bridges_and_connectors().
 
 t_create_delete_bridge(Config) ->
-    Name = <<"mybridge">>,
+    Pid = erlang:whereis(eredis_sentinel),
+    ct:pal("t_create_detele_bridge:~p~n", [
+        #{
+            config => Config,
+            sentinel => Pid,
+            eredis_sentinel => Pid =/= undefined andalso erlang:process_info(Pid)
+        }
+    ]),
+    Name = ?config(bridge_name, Config),
     Type = ?config(connector_type, Config),
     BridgeConfig = ?config(bridge_config, Config),
     IsBatch = ?config(is_batch, Config),
@@ -179,13 +216,11 @@ t_create_delete_bridge(Config) ->
         {ok, _},
         emqx_bridge:create(Type, Name, BridgeConfig)
     ),
-
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
-
     ?WAIT(
         {ok, connected},
         emqx_resource:health_check(ResourceId),
-        5
+        10
     ),
 
     RedisType = atom_to_binary(Type),
@@ -209,7 +244,7 @@ t_create_delete_bridge(Config) ->
     %% check export through local topic
     _ = check_resource_queries(ResourceId, <<"local_topic/test">>, IsBatch),
 
-    {ok, _} = emqx_bridge:remove(Type, Name).
+    ok = emqx_bridge:remove(Type, Name).
 
 % check that we provide correct examples
 t_check_values(_Config) ->
@@ -239,7 +274,7 @@ t_check_values(_Config) ->
     ).
 
 t_check_replay(Config) ->
-    Name = <<"toxic_bridge">>,
+    Name = ?config(bridge_name, Config),
     Type = <<"redis_single">>,
     Topic = <<"local_topic/test">>,
     ProxyName = "redis_single_tcp",
@@ -289,7 +324,7 @@ t_check_replay(Config) ->
             )
         end
     ),
-    {ok, _} = emqx_bridge:remove(Type, Name).
+    ok = emqx_bridge:remove(Type, Name).
 
 t_permanent_error(_Config) ->
     Name = <<"invalid_command_bridge">>,
@@ -317,10 +352,67 @@ t_permanent_error(_Config) ->
             )
         end
     ),
-    {ok, _} = emqx_bridge:remove(Type, Name).
+    ok = emqx_bridge:remove(Type, Name).
+
+t_auth_username_password(Config) ->
+    Name = ?config(bridge_name, Config),
+    Type = <<"redis_single">>,
+    BridgeConfig = username_password_redis_bridge_config(),
+    ?assertMatch(
+        {ok, _},
+        emqx_bridge:create(Type, Name, BridgeConfig)
+    ),
+    ResourceId = emqx_bridge_resource:resource_id(Type, Name),
+    ?WAIT(
+        {ok, connected},
+        emqx_resource:health_check(ResourceId),
+        5
+    ),
+    ok = emqx_bridge:remove(Type, Name).
+
+t_auth_error_username_password(Config) ->
+    Name = ?config(bridge_name, Config),
+    Type = <<"redis_single">>,
+    BridgeConfig0 = username_password_redis_bridge_config(),
+    BridgeConfig = maps:merge(BridgeConfig0, #{<<"password">> => <<"wrong_password">>}),
+    ?assertMatch(
+        {ok, _},
+        emqx_bridge:create(Type, Name, BridgeConfig)
+    ),
+    ResourceId = emqx_bridge_resource:resource_id(Type, Name),
+    ?WAIT(
+        {ok, disconnected},
+        emqx_resource:health_check(ResourceId),
+        5
+    ),
+    ?assertMatch(
+        {ok, _, #{error := {unhealthy_target, _Msg}}},
+        emqx_resource_manager:lookup(ResourceId)
+    ),
+    ok = emqx_bridge:remove(Type, Name).
+
+t_auth_error_password_only(Config) ->
+    Name = ?config(bridge_name, Config),
+    Type = <<"redis_single">>,
+    BridgeConfig0 = toxiproxy_redis_bridge_config(),
+    BridgeConfig = maps:merge(BridgeConfig0, #{<<"password">> => <<"wrong_password">>}),
+    ?assertMatch(
+        {ok, _},
+        emqx_bridge:create(Type, Name, BridgeConfig)
+    ),
+    ResourceId = emqx_bridge_resource:resource_id(Type, Name),
+    ?assertEqual(
+        {ok, disconnected},
+        emqx_resource:health_check(ResourceId)
+    ),
+    ?assertMatch(
+        {ok, _, #{error := {unhealthy_target, _Msg}}},
+        emqx_resource_manager:lookup(ResourceId)
+    ),
+    ok = emqx_bridge:remove(Type, Name).
 
 t_create_disconnected(Config) ->
-    Name = <<"toxic_bridge">>,
+    Name = ?config(bridge_name, Config),
     Type = <<"redis_single">>,
 
     ?check_trace(
@@ -337,7 +429,15 @@ t_create_disconnected(Config) ->
             ok
         end
     ),
-    {ok, _} = emqx_bridge:remove(Type, Name).
+    ok = emqx_bridge:remove(Type, Name).
+
+t_create_via_http(Config) ->
+    ok = emqx_bridge_testlib:t_create_via_http(Config),
+    ok.
+
+t_start_stop(Config) ->
+    ok = emqx_bridge_testlib:t_start_stop(Config, redis_bridge_stopped),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Helper functions
@@ -388,10 +488,8 @@ check_resource_queries(ResourceId, BaseTopic, IsBatch) ->
 added_msgs(ResourceId, BaseTopic, Payload) ->
     lists:flatmap(
         fun(K) ->
-            {ok, Results} = emqx_resource:simple_sync_query(
-                ResourceId,
-                {cmd, [<<"LRANGE">>, K, <<"0">>, <<"-1">>]}
-            ),
+            Message = {cmd, [<<"LRANGE">>, K, <<"0">>, <<"-1">>]},
+            {ok, Results} = emqx_resource:simple_sync_query(ResourceId, Message),
             [El || El <- Results, El =:= Payload]
         end,
         [format_redis_key(BaseTopic, S) || S <- lists:seq(0, ?KEYSHARDS - 1)]
@@ -418,14 +516,6 @@ delete_all_rules() ->
             emqx_rule_engine:delete_rule(RuleId)
         end,
         emqx_rule_engine:get_rules()
-    ).
-
-delete_all_bridges() ->
-    lists:foreach(
-        fun(#{name := Name, type := Type}) ->
-            emqx_bridge:remove(Type, Name)
-        end,
-        emqx_bridge:list()
     ).
 
 all_test_hosts() ->
@@ -468,11 +558,11 @@ redis_connect_ssl_opts(Type) ->
 client_ssl_cert_opts(redis_single) ->
     emqx_authn_test_lib:client_ssl_cert_opts();
 client_ssl_cert_opts(_) ->
-    Dir = code:lib_dir(emqx, etc),
+    Dir = code:lib_dir(emqx),
     #{
-        <<"keyfile">> => filename:join([Dir, <<"certs">>, <<"client-key.pem">>]),
-        <<"certfile">> => filename:join([Dir, <<"certs">>, <<"client-cert.pem">>]),
-        <<"cacertfile">> => filename:join([Dir, <<"certs">>, <<"cacert.pem">>])
+        <<"keyfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"client-key.pem">>]),
+        <<"certfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"client-cert.pem">>]),
+        <<"cacertfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"cacert.pem">>])
     }.
 
 redis_connect_configs() ->
@@ -492,12 +582,12 @@ redis_connect_configs() ->
             tcp => #{
                 <<"servers">> => <<"redis-sentinel:26379">>,
                 <<"redis_type">> => <<"sentinel">>,
-                <<"sentinel">> => <<"mymaster">>
+                <<"sentinel">> => <<"mytcpmaster">>
             },
             tls => #{
                 <<"servers">> => <<"redis-sentinel-tls:26380">>,
                 <<"redis_type">> => <<"sentinel">>,
-                <<"sentinel">> => <<"mymaster">>,
+                <<"sentinel">> => <<"mytlsmaster">>,
                 <<"ssl">> => redis_connect_ssl_opts(redis_sentinel)
             }
         },
@@ -523,10 +613,37 @@ toxiproxy_redis_bridge_config() ->
             <<"worker_pool_size">> => <<"1">>,
             <<"batch_size">> => integer_to_binary(?BATCH_SIZE),
             <<"health_check_interval">> => <<"1s">>,
-            <<"start_timeout">> => <<"15s">>
+            <<"max_buffer_bytes">> => <<"256MB">>,
+            <<"buffer_seg_bytes">> => <<"10MB">>,
+            <<"request_ttl">> => <<"45s">>,
+            <<"inflight_window">> => <<"100">>,
+            <<"resume_interval">> => <<"1s">>,
+            <<"metrics_flush_interval">> => <<"1s">>,
+            <<"start_after_created">> => true,
+            <<"start_timeout">> => <<"5s">>
         }
     },
     maps:merge(Conf0, ?COMMON_REDIS_OPTS).
+
+username_password_redis_bridge_config() ->
+    Conf0 = ?REDIS_TOXYPROXY_CONNECT_CONFIG#{
+        <<"resource_opts">> => #{
+            <<"query_mode">> => <<"sync">>,
+            <<"worker_pool_size">> => <<"1">>,
+            <<"batch_size">> => integer_to_binary(?BATCH_SIZE),
+            <<"health_check_interval">> => <<"1s">>,
+            <<"max_buffer_bytes">> => <<"256MB">>,
+            <<"buffer_seg_bytes">> => <<"10MB">>,
+            <<"request_ttl">> => <<"45s">>,
+            <<"inflight_window">> => <<"100">>,
+            <<"resume_interval">> => <<"15s">>,
+            <<"metrics_flush_interval">> => <<"1s">>,
+            <<"start_after_created">> => true,
+            <<"start_timeout">> => <<"5s">>
+        }
+    },
+    Conf1 = maps:merge(Conf0, ?COMMON_REDIS_OPTS),
+    maps:merge(Conf1, ?USERNAME_PASSWORD_AUTH_OPTS).
 
 invalid_command_bridge_config() ->
     #{redis_single := #{tcp := Conf0}} = redis_connect_configs(),

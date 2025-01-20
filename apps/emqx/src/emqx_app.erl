@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -38,8 +38,7 @@
 
 start(_Type, _Args) ->
     ok = maybe_load_config(),
-    ok = emqx_persistent_session:init_db_backend(),
-    _ = emqx_persistent_session_ds:init(),
+    _ = emqx_persistent_message:init(),
     ok = maybe_start_quicer(),
     ok = emqx_bpapi:start(),
     ok = emqx_alarm_handler:load(),
@@ -55,7 +54,9 @@ prep_stop(_State) ->
     emqx_boot:is_enabled(listeners) andalso
         emqx_listeners:stop().
 
-stop(_State) -> ok.
+stop(_State) ->
+    ok = emqx_router:deinit_schema(),
+    ok.
 
 -define(CONFIG_LOADER, config_loader).
 -define(DEFAULT_LOADER, emqx).

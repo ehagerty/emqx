@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,15 +25,51 @@
 -define(TOPIC1, <<"api_topic1">>).
 -define(TOPIC2, <<"api_topic2">>).
 
+-define(OFFLINE_TOPIC, <<"offline_api_topic">>).
+
 all() ->
-    emqx_common_test_helpers:all(?MODULE).
+    [
+        {group, with_ds},
+        {group, without_ds}
+    ].
 
-init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite(),
-    Config.
+groups() ->
+    Tcs = emqx_common_test_helpers:all(?MODULE),
+    [
+        {with_ds, Tcs},
+        {without_ds, Tcs}
+    ].
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite().
+init_per_group(without_ds, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config];
+init_per_group(with_ds, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_durable_storage,
+            {emqx,
+                "durable_sessions {enable = true}"
+                "\ndurable_sessions {\n"
+                "  enable = true\n"
+                "  heartbeat_interval = 100ms\n"
+                "  session_gc_interval = 2s\n"
+                "}\n"},
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_group(_, Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(Case, Config) ->
     ?MODULE:Case({init, Config}).
@@ -336,6 +372,61 @@ t_publish_bulk_dispatch_failure(Config) when is_list(Config) ->
         ],
         decode_json(ResponseBody)
     ).
+
+t_publish_offline_api({init, Config}) ->
+    {ok, Client} = emqtt:start_link(
+        #{
+            username => <<"api_username">>,
+            clientid => <<"api_clientid">>,
+            proto_ver => v5,
+            clean_start => false,
+            properties => #{'Session-Expiry-Interval' => 60}
+        }
+    ),
+    {ok, _} = emqtt:connect(Client),
+    {ok, _, [0]} = emqtt:subscribe(Client, ?OFFLINE_TOPIC),
+    _ = emqtt:stop(Client),
+    Config;
+t_publish_offline_api({'end', _Config}) ->
+    ok;
+t_publish_offline_api(_) ->
+    Payload = <<"hello">>,
+    Path = emqx_mgmt_api_test_util:api_path(["publish"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    UserProperties = #{<<"foo">> => <<"bar">>},
+    Properties =
+        #{
+            <<"payload_format_indicator">> => 0,
+            <<"message_expiry_interval">> => 1000,
+            <<"correlation_data">> => <<"some_correlation_id">>,
+            <<"user_properties">> => UserProperties,
+            <<"content_type">> => <<"application/json">>
+        },
+    Body = #{topic => ?OFFLINE_TOPIC, payload => Payload, properties => Properties},
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(post, Path, "", Auth, Body),
+    ResponseMap = decode_json(Response),
+    ?assertEqual([<<"id">>], lists:sort(maps:keys(ResponseMap))).
+
+%% Checks that we return HTTP response status code 200 for delayed messages, even if there
+%% are no subscribers at the time of publishing.
+t_delayed_message_always_200({init, Config}) ->
+    Config;
+t_delayed_message_always_200({'end', _Config}) ->
+    ok;
+t_delayed_message_always_200(Config) when is_list(Config) ->
+    Request = #{
+        <<"topic">> => <<"$delayed/1/t">>,
+        <<"payload">> => <<"delayed">>
+    },
+    ?assertMatch(
+        {200, #{<<"id">> := _}},
+        emqx_mgmt_api_test_util:simple_request(
+            post,
+            emqx_mgmt_api_test_util:api_path(["publish"]),
+            Request
+        )
+    ),
+    ok.
 
 receive_assert(Topic, Qos, Payload) ->
     receive

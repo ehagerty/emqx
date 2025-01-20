@@ -1,4 +1,4 @@
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 %% module if it integrated with emqx_gateway_conn module
 -module(emqx_gateway_channel).
 
+-export_type([gen_server_from/0, channel/0]).
+
 -type channel() :: any().
 
 %%--------------------------------------------------------------------
@@ -37,7 +39,7 @@
 %% Init
 
 %% @doc Initialize the channel state
--callback init(emqx_types:conniinfo(), map()) -> channel().
+-callback init(emqx_types:conninfo(), map()) -> channel().
 
 %%--------------------------------------------------------------------
 %% Handles
@@ -47,8 +49,8 @@
 -type gen_server_from() :: {pid(), Tag :: term()}.
 
 -type reply() ::
-    {outgoing, emqx_gateway_frame:packet()}
-    | {outgoing, [emqx_gateway_frame:packet()]}
+    {outgoing, emqx_gateway_frame:frame()}
+    | {outgoing, [emqx_gateway_frame:frame()]}
     | {event, conn_state() | updated}
     | {close, Reason :: atom()}.
 

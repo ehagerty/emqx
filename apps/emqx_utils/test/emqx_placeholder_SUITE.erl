@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -106,12 +106,29 @@ t_preproc_sql2(_) ->
     ?assertEqual(<<"a:$a,b:b},c:{c},d:${d">>, PrepareStatement),
     ?assertEqual([], emqx_placeholder:proc_sql(ParamsTokens, Selected)).
 
-t_preproc_sql3(_) ->
+t_preproc_sqlserver(_) ->
     Selected = #{a => <<"1">>, b => 1, c => 1.0, d => #{d1 => <<"hi">>}},
     ParamsTokens = emqx_placeholder:preproc_tmpl(<<"a:${a},b:${b},c:${c},d:${d}">>),
     ?assertEqual(
         <<"a:'1',b:1,c:1.0,d:'{\"d1\":\"hi\"}'">>,
-        emqx_placeholder:proc_sql_param_str(ParamsTokens, Selected)
+        emqx_placeholder:proc_sqlserver_param_str(ParamsTokens, Selected)
+    ).
+
+t_preproc_sqlserver_sql(_) ->
+    Selected = #{
+        a => <<"abc_hello你好👋"/utf8>>,
+        b => 1,
+        c => 1.0,
+        d => #{d1 => <<"hi">>},
+        hex_str => <<"0x0010">>,
+        not_hex => <<"0xabcdefghijk_你好🐸"/utf8>>
+    },
+    ParamsTokens = emqx_placeholder:preproc_tmpl(
+        <<"a:${a},b:${b},c:${c},d:${d},hex_str:${hex_str},not_hex:${not_hex}"/utf8>>
+    ),
+    ?assertEqual(
+        <<"a:'abc_hello你好👋',b:1,c:1.0,d:'{\"d1\":\"hi\"}',hex_str:0x0010,not_hex:'0xabcdefghijk_你好🐸'"/utf8>>,
+        emqx_placeholder:proc_sqlserver_param_str(ParamsTokens, Selected)
     ).
 
 t_preproc_mysql1(_) ->
@@ -206,3 +223,75 @@ t_preproc_tmpl_deep(_) ->
         #{<<"${a}">> => [<<"1">>, "c", 2, 3.0, '${d}', {[<<"1.0">>], 0}]},
         emqx_placeholder:proc_tmpl_deep(Tmpl1, Selected)
     ).
+
+t_proc_tmpl_arbitrary_var_name(_) ->
+    Selected = #{
+        <<"中"/utf8>> => <<"1">>,
+        <<"中-1"/utf8>> => <<"1-1">>,
+        <<"-_+=<>,/?:;\"'\\[]|">> => 1,
+        <<"-_+=<>,">> => #{<<"/?:;\"'\\[]|">> => 2},
+        <<"!@#$%^&*()">> => 1.0,
+        <<"d">> => #{
+            <<"$ff">> => <<"oo">>,
+            <<"${f">> => <<"hi">>,
+            <<"${f}">> => <<"qq">>
+        }
+    },
+    Tks = emqx_placeholder:preproc_tmpl(
+        <<
+            "a:${中},a:${中-1},b:${-_+=<>,/?:;\"'\\[]|},"
+            "b:${-_+=<>,./?:;\"'\\[]|},c:${!@#$%^&*()},d:${d.$ff},d1:${d.${f}}"/utf8
+        >>
+    ),
+    ?assertEqual(
+        <<"a:1,a:1-1,b:1,b:2,c:1.0,d:oo,d1:hi}">>,
+        emqx_placeholder:proc_tmpl(Tks, Selected)
+    ).
+
+t_proc_tmpl_arbitrary_var_name_double_quote(_) ->
+    Selected = #{
+        <<"中"/utf8>> => <<"1">>,
+        <<"中-1"/utf8>> => <<"1-1">>,
+        <<"-_+=<>,/?:;\"'\\[]|">> => 1,
+        <<"-_+=<>,">> => #{<<"/?:;\"'\\[]|">> => 2},
+        <<"!@#$%^&*()">> => 1.0,
+        <<"d">> => #{
+            <<"$ff">> => <<"oo">>,
+            <<"${f">> => <<"hi">>,
+            <<"${f}">> => <<"qq">>
+        }
+    },
+    Tks = emqx_placeholder:preproc_tmpl(
+        <<
+            "a:\"${中}\",a:\"${中-1}\",b:\"${-_+=<>,/?:;\"'\\[]|}\","
+            "b:\"${-_+=<>,./?:;\"'\\[]|}\",c:\"${!@#$%^&*()}\",d:\"${d.$ff}\",d1:\"${d.${f}\"}"/utf8
+        >>,
+        #{strip_double_quote => true}
+    ),
+    ct:print("TKs:~p~n", [Tks]),
+    ?assertEqual(
+        <<"a:1,a:1-1,b:1,b:2,c:1.0,d:oo,d1:hi}">>,
+        emqx_placeholder:proc_tmpl(Tks, Selected)
+    ).
+
+t_proc_tmpl_badmap(_Config) ->
+    ThisTks = emqx_placeholder:preproc_tmpl(<<"${.}">>),
+    Tks = emqx_placeholder:preproc_tmpl(<<"${.a.b.c}">>),
+    BadMap = <<"not-a-map">>,
+    ?assertEqual(
+        <<"not-a-map">>,
+        emqx_placeholder:proc_tmpl(ThisTks, BadMap)
+    ),
+    ?assertEqual(
+        <<"undefined">>,
+        emqx_placeholder:proc_tmpl(Tks, #{<<"a">> => #{<<"b">> => BadMap}})
+    ),
+    ?assertEqual(
+        <<"undefined">>,
+        emqx_placeholder:proc_tmpl(Tks, #{<<"a">> => BadMap})
+    ),
+    ?assertEqual(
+        <<"undefined">>,
+        emqx_placeholder:proc_tmpl(Tks, BadMap)
+    ),
+    ok.

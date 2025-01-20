@@ -10,12 +10,14 @@ set -euo pipefail
 # ensure dir
 cd -P -- "$(dirname -- "$0")/../../"
 
-HAPROXY_PORTS=(-p 18083:18083 -p 8883:8883 -p 8084:8084)
+HAPROXY_PORTS=(-p 18083:18083 -p 1883:1883 -p 8883:8883 -p 8084:8084)
 
 NET='emqx.io'
 NODE1="node1.$NET"
 NODE2="node2.$NET"
 COOKIE='this-is-a-secret'
+IPV6=0
+DASHBOARD_NODES='both'
 
 cleanup() {
     docker rm -f haproxy >/dev/null 2>&1 || true
@@ -24,31 +26,81 @@ cleanup() {
     docker network rm "$NET" >/dev/null 2>&1 || true
 }
 
-while getopts ":Pc" opt
+show_help() {
+    echo "Usage: $0 [options] EMQX_IMAGE1 [EMQX_IAMGE2]"
+    echo ""
+    echo "Specifiy which docker image to run with EMQX_IMAGE1"
+    echo "EMQX_IMAGE2 is the same as EMQX_IMAGE1 if not set"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help: Show this help message and exit."
+    echo "  -P: Add -p options for docker run to expose more HAProxy container ports."
+    echo "  -6: Test with IPv6"
+    echo "  -c: Cleanup: delete docker network, force delete the containers."
+    echo "  -d: '1', '2', or 'both' (defualt = 'both')"
+    echo "          1: Only put node 1 behind haproxy"
+    echo "          2: Only put node 2 behind haproxy"
+    echo "       both: This is the default value, which means both nodes serve dashboard"
+    echo "       This is often needed for tests which want to check one dashboard version"
+    echo "       when starting two different versions of EMQX."
+}
+
+while getopts "hc6P:d:" opt
 do
     case $opt in
         # -P option is treated similarly to docker run -P:
         # publish ports to random available host ports
-        P) HAPROXY_PORTS=(-p 18083 -p 8883 -p 8084);;
+        P) HAPROXY_PORTS=(-p 18083 -p 1883 -p 8883 -p 8084);;
         c) cleanup; exit 0;;
+        h) show_help; exit 0;;
+        6) IPV6=1;;
+        d) DASHBOARD_NODES="$OPTARG";;
         *) ;;
     esac
 done
 shift $((OPTIND - 1))
 
-IMAGE1="${1}"
+IMAGE1="${1:-}"
 IMAGE2="${2:-${IMAGE1}}"
+
+DASHBOARD_BACKEND1="server emqx-1 $NODE1:18083"
+DASHBOARD_BACKEND2="server emqx-2 $NODE2:18083"
+case "${DASHBOARD_NODES}" in
+    1)
+        DASHBOARD_BACKEND2=""
+        ;;
+    2)
+        DASHBOARD_BACKEND1=""
+        ;;
+    both)
+        ;;
+esac
+
+if [ -z "${IMAGE1:-}" ] || [ -z "${IMAGE2:-}" ]; then
+    show_help
+    exit 1
+fi
 
 cleanup
 
-docker network create "$NET"
+if [ ${IPV6} = 1 ]; then
+    docker network create --ipv6 --subnet 2001:0DB8::/112 "$NET"
+    RPC_ADDRESS="::"
+    PROTO_DIST='inet6_tls'
+else
+    docker network create "$NET"
+    RPC_ADDRESS="0.0.0.0"
+    PROTO_DIST='inet_tls'
+fi
 
 docker run -d -t --restart=always --name "$NODE1" \
   --net "$NET" \
   -e EMQX_LOG__CONSOLE_HANDLER__LEVEL=debug \
   -e EMQX_NODE_NAME="emqx@$NODE1" \
   -e EMQX_NODE_COOKIE="$COOKIE" \
-  -e EMQX_CLUSTER__PROTO_DIST='inet_tls' \
+  -e EMQX_CLUSTER__PROTO_DIST="${PROTO_DIST}" \
+  -e EMQX_RPC__LISTEN_ADDRESS="${RPC_ADDRESS}" \
+  -e EMQX_RPC__IPV6_ONLY="true" \
   -e EMQX_listeners__ssl__default__enable=false \
   -e EMQX_listeners__wss__default__enable=false \
   -e EMQX_listeners__tcp__default__proxy_protocol=true \
@@ -60,7 +112,9 @@ docker run -d -t --restart=always --name "$NODE2" \
   -e EMQX_LOG__CONSOLE_HANDLER__LEVEL=debug \
   -e EMQX_NODE_NAME="emqx@$NODE2" \
   -e EMQX_NODE_COOKIE="$COOKIE" \
-  -e EMQX_CLUSTER__PROTO_DIST='inet_tls' \
+  -e EMQX_CLUSTER__PROTO_DIST="${PROTO_DIST}" \
+  -e EMQX_RPC__LISTEN_ADDRESS="${RPC_ADDRESS}" \
+  -e EMQX_RPC__IPV6_ONLY="true" \
   -e EMQX_listeners__ssl__default__enable=false \
   -e EMQX_listeners__wss__default__enable=false \
   -e EMQX_listeners__tcp__default__proxy_protocol=true \
@@ -75,7 +129,7 @@ cat <<EOF > tmp/haproxy.cfg
 global
     log stdout format raw daemon debug
     # Replace 1024000 with deployment connections
-    maxconn 1000
+    maxconn 102400
     nbproc 1
     nbthread 2
     cpu-map auto:1/1-2 0-1
@@ -93,7 +147,7 @@ defaults
     mode tcp
     option tcplog
     # Replace 1024000 with deployment connections
-    maxconn 1000
+    maxconn 102400
     timeout connect 30000
     timeout client 600s
     timeout server 600s
@@ -113,37 +167,44 @@ backend emqx_dashboard_back
     # load randomly will cause the browser fail to GET some chunks (or get bad chunks if names clash)
     balance source
     mode http
-    server emqx-1 $NODE1:18083
-    server emqx-2 $NODE2:18083
+    ${DASHBOARD_BACKEND1}
+    ${DASHBOARD_BACKEND2}
 
 ##----------------------------------------------------------------
-## TLS
+## MQTT Listeners
 ##----------------------------------------------------------------
+frontend emqx_tcp
+    mode tcp
+    option tcplog
+    bind *:1883
+    default_backend emqx_backend_tcp
+
 frontend emqx_ssl
     mode tcp
     option tcplog
     bind *:8883 ssl crt /tmp/emqx.pem ca-file /usr/local/etc/haproxy/certs/cacert.pem verify required no-sslv3
-    default_backend emqx_ssl_back
+    default_backend emqx_backend_tcp
 
 frontend emqx_wss
     mode tcp
     option tcplog
     bind *:8084 ssl crt /tmp/emqx.pem ca-file /usr/local/etc/haproxy/certs/cacert.pem verify required no-sslv3
-    default_backend emqx_wss_back
+    default_backend emqx_backend_ws
 
-backend emqx_ssl_back
+backend emqx_backend_tcp
     mode tcp
     balance static-rr
     server emqx-1 $NODE1:1883 check-send-proxy send-proxy-v2-ssl-cn
     server emqx-2 $NODE2:1883 check-send-proxy send-proxy-v2-ssl-cn
 
-backend emqx_wss_back
+backend emqx_backend_ws
     mode tcp
     balance static-rr
     server emqx-1 $NODE1:8083 check-send-proxy send-proxy-v2-ssl-cn
     server emqx-2 $NODE2:8083 check-send-proxy send-proxy-v2-ssl-cn
 EOF
 
+HAPROXY_IMAGE='ghcr.io/haproxytech/haproxy-docker-alpine:2.4.27'
 
 haproxy_cid=$(docker run -d --name haproxy \
                      --net "$NET" \
@@ -151,8 +212,8 @@ haproxy_cid=$(docker run -d --name haproxy \
                      -v "$(pwd)/apps/emqx/etc/certs:/usr/local/etc/haproxy/certs" \
                      -w /usr/local/etc/haproxy \
                      "${HAPROXY_PORTS[@]}" \
-                     "haproxy:2.4" \
-                     bash -c 'set -euo pipefail;
+                     "${HAPROXY_IMAGE}" \
+                     sh -c 'set -euo pipefail;
                               cat certs/cert.pem certs/key.pem > /tmp/emqx.pem;
                               haproxy -f haproxy.cfg')
 

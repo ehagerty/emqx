@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_node_rebalance_cli).
@@ -29,6 +29,15 @@ cli(["start" | StartArgs]) ->
                     emqx_ctl:print("Rebalance is already enabled~n"),
                     false
             end;
+        {purge, Opts} ->
+            case emqx_node_rebalance_purge:start(Opts) of
+                ok ->
+                    emqx_ctl:print("Rebalance(purge) started~n"),
+                    true;
+                {error, Reason} ->
+                    emqx_ctl:print("Rebalance(purge) start error: ~p~n", [Reason]),
+                    false
+            end;
         {rebalance, Opts} ->
             case emqx_node_rebalance:start(Opts) of
                 ok ->
@@ -55,6 +64,7 @@ cli(["node-status"]) ->
 cli(["status"]) ->
     #{
         evacuations := Evacuations,
+        purges := Purges,
         rebalances := Rebalances
     } = emqx_node_rebalance_status:global_status(),
     lists:foreach(
@@ -75,6 +85,18 @@ cli(["status"]) ->
                 "--------------------------------------------------------------------~n"
             ),
             emqx_ctl:print(
+                "Node ~p: purge~n~s",
+                [Node, emqx_node_rebalance_status:format_local_status(Status)]
+            )
+        end,
+        Purges
+    ),
+    lists:foreach(
+        fun({Node, Status}) ->
+            emqx_ctl:print(
+                "--------------------------------------------------------------------~n"
+            ),
+            emqx_ctl:print(
                 "Node ~p: rebalance coordinator~n~s",
                 [Node, emqx_node_rebalance_status:format_coordinator_status(Status)]
             )
@@ -82,10 +104,14 @@ cli(["status"]) ->
         Rebalances
     );
 cli(["stop"]) ->
-    case emqx_node_rebalance_evacuation:status() of
-        {enabled, _} ->
-            ok = emqx_node_rebalance_evacuation:stop(),
-            emqx_ctl:print("Rebalance(evacuation) stopped~n"),
+    Checks =
+        [
+            {evacuation, fun emqx_node_rebalance_evacuation:status/0,
+                fun emqx_node_rebalance_evacuation:stop/0},
+            {purge, fun emqx_node_rebalance_purge:status/0, fun emqx_node_rebalance_purge:stop/0}
+        ],
+    case do_stop(Checks) of
+        ok ->
             true;
         disabled ->
             case emqx_node_rebalance:status() of
@@ -112,16 +138,24 @@ cli(_) ->
                 "Start current node evacuation with optional server redirect to the specified servers"
             },
 
+            %% TODO: uncomment after we officially release the feature.
+            %% {
+            %%     "rebalance start --purge \\\n"
+            %%     "    [--purge-rate CountPerSec]",
+            %%     "Start purge on all running nodes in the cluster"
+            %% },
+
             {
                 "rebalance start \\\n"
                 "    [--nodes \"node1@host1 node2@host2\"] \\\n"
                 "    [--wait-health-check Secs] \\\n"
                 "    [--conn-evict-rate ConnPerSec] \\\n"
+                "    [--conn-evict-rpc-timeout Secs] \\\n"
                 "    [--abs-conn-threshold Count] \\\n"
                 "    [--rel-conn-threshold Fraction] \\\n"
-                "    [--conn-evict-rate ConnPerSec] \\\n"
                 "    [--wait-takeover Secs] \\\n"
                 "    [--sess-evict-rate CountPerSec] \\\n"
+                "    [--sess-evict-rpc-timeout Secs] \\\n"
                 "    [--abs-sess-threshold Count] \\\n"
                 "    [--rel-sess-threshold Fraction]",
                 "Start rebalance on the specified nodes using the current node as the coordinator"
@@ -140,7 +174,11 @@ cli(_) ->
 
 node_status(NodeStatus) ->
     case NodeStatus of
-        {Process, Status} when Process =:= evacuation orelse Process =:= rebalance ->
+        {Process, Status} when
+            Process =:= evacuation;
+            Process =:= purge;
+            Process =:= rebalance
+        ->
             emqx_ctl:print(
                 "Rebalance type: ~p~n~s~n",
                 [Process, emqx_node_rebalance_status:format_local_status(Status)]
@@ -157,6 +195,13 @@ start_args(Args) ->
             case validate_evacuation(maps:to_list(Collected), #{}) of
                 {ok, Validated} ->
                     {evacuation, Validated};
+                {error, _} = Error ->
+                    Error
+            end;
+        {ok, #{"--purge" := true} = Collected} ->
+            case validate_purge(maps:to_list(Collected), #{}) of
+                {ok, Validated} ->
+                    {purge, Validated};
                 {error, _} = Error ->
                     Error
             end;
@@ -180,6 +225,11 @@ collect_args(["--redirect-to", ServerReference | Args], Map) ->
     collect_args(Args, Map#{"--redirect-to" => ServerReference});
 collect_args(["--migrate-to", MigrateTo | Args], Map) ->
     collect_args(Args, Map#{"--migrate-to" => MigrateTo});
+%% purge
+collect_args(["--purge" | Args], Map) ->
+    collect_args(Args, Map#{"--purge" => true});
+collect_args(["--purge-rate", PurgeRate | Args], Map) ->
+    collect_args(Args, Map#{"--purge-rate" => PurgeRate});
 %% rebalance
 collect_args(["--nodes", Nodes | Args], Map) ->
     collect_args(Args, Map#{"--nodes" => Nodes});
@@ -191,6 +241,10 @@ collect_args(["--abs-sess-threshold", AbsSessThres | Args], Map) ->
     collect_args(Args, Map#{"--abs-sess-threshold" => AbsSessThres});
 collect_args(["--rel-sess-threshold", RelSessThres | Args], Map) ->
     collect_args(Args, Map#{"--rel-sess-threshold" => RelSessThres});
+collect_args(["--conn-evict-rpc-timeout", ConnEvictRpcTimeout | Args], Map) ->
+    collect_args(Args, Map#{"--conn-evict-rpc-timeout" => ConnEvictRpcTimeout});
+collect_args(["--sess-evict-rpc-timeout", SessEvictRpcTimeout | Args], Map) ->
+    collect_args(Args, Map#{"--sess-evict-rpc-timeout" => SessEvictRpcTimeout});
 %% common
 collect_args(["--wait-health-check", WaitHealthCheck | Args], Map) ->
     collect_args(Args, Map#{"--wait-health-check" => WaitHealthCheck});
@@ -239,14 +293,27 @@ validate_evacuation([{"--migrate-to", MigrateTo} | Rest], Map) ->
 validate_evacuation(Rest, _Map) ->
     {error, io_lib:format("unknown evacuation arguments: ~p", [Rest])}.
 
+validate_purge([], Map) ->
+    {ok, Map};
+validate_purge([{"--purge", _} | Rest], Map) ->
+    validate_purge(Rest, Map);
+validate_purge([{"--purge-rate", _} | _] = Opts, Map) ->
+    validate_pos_int(purge_rate, Opts, Map, fun validate_purge/2);
+validate_purge(Rest, _Map) ->
+    {error, io_lib:format("unknown purge arguments: ~p", [Rest])}.
+
 validate_rebalance([], Map) ->
     {ok, Map};
 validate_rebalance([{"--wait-health-check", _} | _] = Opts, Map) ->
     validate_pos_int(wait_health_check, Opts, Map, fun validate_rebalance/2);
 validate_rebalance([{"--conn-evict-rate", _} | _] = Opts, Map) ->
     validate_pos_int(conn_evict_rate, Opts, Map, fun validate_rebalance/2);
+validate_rebalance([{"--conn-evict-rpc-timeout", _} | _] = Opts, Map) ->
+    validate_sec_timeout(conn_evict_rpc_timeout, Opts, Map, fun validate_rebalance/2);
 validate_rebalance([{"--sess-evict-rate", _} | _] = Opts, Map) ->
     validate_pos_int(sess_evict_rate, Opts, Map, fun validate_rebalance/2);
+validate_rebalance([{"--sess-evict-rpc-timeout", _} | _] = Opts, Map) ->
+    validate_sec_timeout(sess_evict_rpc_timeout, Opts, Map, fun validate_rebalance/2);
 validate_rebalance([{"--abs-conn-threshold", _} | _] = Opts, Map) ->
     validate_pos_int(abs_conn_threshold, Opts, Map, fun validate_rebalance/2);
 validate_rebalance([{"--rel-conn-threshold", _} | _] = Opts, Map) ->
@@ -294,6 +361,14 @@ validate_pos_int(Name, [{OptionName, Value} | Rest], Map, Next) ->
             {error, "invalid " ++ OptionName ++ " value"}
     end.
 
+validate_sec_timeout(Name, [{OptionName, Value} | Rest], Map, Next) ->
+    case string:to_integer(Value) of
+        {Int, ""} when Int > 0 ->
+            Next(Rest, Map#{Name => Int * 1000});
+        _ ->
+            {error, "invalid " ++ OptionName ++ " value"}
+    end.
+
 strings_to_atoms(Strings) ->
     strings_to_atoms(Strings, [], []).
 
@@ -306,3 +381,15 @@ strings_to_atoms([Str | Rest], Atoms, Invalid) ->
         {error, _} ->
             strings_to_atoms(Rest, Atoms, [Str | Invalid])
     end.
+
+do_stop([{Type, Check, Stop} | Rest]) ->
+    case Check() of
+        {enabled, _} ->
+            ok = Stop(),
+            emqx_ctl:print("Rebalance(~s) stopped~n", [Type]),
+            ok;
+        disabled ->
+            do_stop(Rest)
+    end;
+do_stop([]) ->
+    disabled.

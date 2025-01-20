@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 -include("emqx_psk.hrl").
 
 start(_Type, _Args) ->
-    ok = mria:wait_for_tables([?TAB]),
+    ok = mria:wait_for_tables(emqx_psk:create_tables()),
     emqx_conf:add_handler([?PSK_KEY], emqx_psk),
     {ok, Sup} = emqx_psk_sup:start_link(),
     {ok, Sup}.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,6 +26,14 @@
     update_vips/0
 ]).
 
+-export([open_ports_check/0]).
+-export([mria_lb_custom_info/0, mria_lb_custom_info_check/1]).
+
+-ifdef(TEST).
+-export([create_plan/0]).
+-endif.
+
+-include_lib("kernel/include/inet.hrl").
 -include_lib("emqx/include/logger.hrl").
 
 %% @doc EMQX boot entrypoint.
@@ -40,8 +48,17 @@ start() ->
             os:set_signal(sigterm, handle)
     end,
     ok = set_backtrace_depth(),
-    start_sysmon(),
+    ok = start_sysmon(),
     configure_shard_transports(),
+    set_mnesia_extra_diagnostic_checks(),
+    ok = configure_otel_deps(),
+    %% Register mria callbacks that help to check compatibility of the
+    %% replicant with the core node. Currently they rely on the exact
+    %% match of the version of EMQX OTP application:
+    _ = application:load(mria),
+    _ = application:load(emqx),
+    mria_config:register_callback(lb_custom_info, fun ?MODULE:mria_lb_custom_info/0),
+    mria_config:register_callback(lb_custom_info_check, fun ?MODULE:mria_lb_custom_info_check/1),
     ekka:start(),
     ok.
 
@@ -94,3 +111,155 @@ configure_shard_transports() ->
         end,
         maps:to_list(ShardTransports)
     ).
+
+set_mnesia_extra_diagnostic_checks() ->
+    Checks = [{check_open_ports, ok, fun ?MODULE:open_ports_check/0}],
+    mria_config:set_extra_mnesia_diagnostic_checks(Checks),
+    ok.
+
+-if(?EMQX_RELEASE_EDITION == ee).
+configure_otel_deps() ->
+    emqx_otel_app:configure_otel_deps().
+-else.
+configure_otel_deps() ->
+    ok.
+-endif.
+
+-define(PORT_PROBE_TIMEOUT, 10_000).
+open_ports_check() ->
+    Plan = create_plan(),
+    %% 2 ports to check: ekka/epmd and gen_rpc
+    Timeout = 2 * ?PORT_PROBE_TIMEOUT + 5_000,
+    try emqx_utils:pmap(fun do_check/1, Plan, Timeout) of
+        Results ->
+            verify_results(Results)
+    catch
+        Kind:Reason:Stacktrace ->
+            #{
+                msg => "error probing ports",
+                exception => Kind,
+                reason => Reason,
+                stacktrace => Stacktrace
+            }
+    end.
+
+verify_results(Results0) ->
+    Errors = [
+        R
+     || R = {_Node, #{status := Status}} <- Results0,
+        Status =/= ok
+    ],
+    case Errors of
+        [] ->
+            %% all ok
+            ok;
+        _ ->
+            Results1 = maps:from_list(Results0),
+            #{results => Results1, msg => "some ports are unreachable"}
+    end.
+
+create_plan() ->
+    %% expected core nodes according to mnesia schema
+    OtherNodes = mnesia:system_info(db_nodes) -- [node()],
+    lists:map(
+        fun(N) ->
+            IPs = node_to_ips(N),
+            {_GenRPCMod, GenRPCPort} = gen_rpc_helper:get_client_config_per_node(N),
+            %% 0 or 1 result
+            EkkaEPMDPort = get_ekka_epmd_port(IPs),
+            {N, #{
+                resolved_ips => IPs,
+                ports_to_check => [GenRPCPort | EkkaEPMDPort]
+            }}
+        end,
+        OtherNodes
+    ).
+
+get_ekka_epmd_port([IP | _]) ->
+    %% we're currently only checking the first IP, if there are many
+    case erl_epmd:names(IP) of
+        {ok, NamePorts} ->
+            choose_emqx_epmd_port(NamePorts);
+        _ ->
+            []
+    end;
+get_ekka_epmd_port([]) ->
+    %% failed to get?
+    [].
+
+%% filter out remsh and take the first emqx port as epmd/ekka port
+choose_emqx_epmd_port([{"emqx" ++ _, Port} | _]) ->
+    [Port];
+choose_emqx_epmd_port([{_Name, _Port} | Rest]) ->
+    choose_emqx_epmd_port(Rest);
+choose_emqx_epmd_port([]) ->
+    [].
+
+do_check({Node, #{resolved_ips := []} = Plan}) ->
+    {Node, Plan#{status => failed_to_resolve_ip}};
+do_check({Node, #{resolved_ips := [IP | _]} = Plan}) ->
+    %% check other IPs too?
+    PortsToCheck = maps:get(ports_to_check, Plan),
+    PortStatus0 = lists:map(fun(P) -> is_tcp_port_open(IP, P) end, PortsToCheck),
+    case lists:all(fun(IsOpen) -> IsOpen end, PortStatus0) of
+        true ->
+            {Node, Plan#{status => ok}};
+        false ->
+            PortStatus1 = maps:from_list(lists:zip(PortsToCheck, PortStatus0)),
+            {Node, Plan#{status => bad_ports, open_ports => PortStatus1}}
+    end.
+
+node_to_ips(Node) ->
+    NodeBin0 = atom_to_binary(Node),
+    HostOrIP = re:replace(NodeBin0, <<"^.+@">>, <<"">>, [{return, list}]),
+    AddressType = resolve_dist_address_type(),
+    case inet:gethostbyname(HostOrIP, AddressType) of
+        {ok, #hostent{h_addr_list = AddrList}} ->
+            AddrList;
+        _ ->
+            []
+    end.
+
+is_tcp_port_open(IP, Port) ->
+    case gen_tcp:connect(IP, Port, [], ?PORT_PROBE_TIMEOUT) of
+        {ok, P} ->
+            gen_tcp:close(P),
+            true;
+        _ ->
+            false
+    end.
+
+resolve_dist_address_type() ->
+    ProtoDistStr = os:getenv("EKKA_PROTO_DIST_MOD", "inet_tcp"),
+    case ProtoDistStr of
+        "inet_tcp" ->
+            inet;
+        "inet6_tcp" ->
+            inet6;
+        "inet_tls" ->
+            inet;
+        "inet6_tls" ->
+            inet6;
+        _ ->
+            inet
+    end.
+
+%% Note: this function is stored in the Mria's application environment
+mria_lb_custom_info() ->
+    get_emqx_vsn().
+
+%% Note: this function is stored in the Mria's application environment
+%% This function is only evaluated by replicant nodes.
+%% Should return `true' if the input node version may be connected to by the current node.
+mria_lb_custom_info_check(undefined) ->
+    false;
+mria_lb_custom_info_check(OtherVsn) ->
+    get_emqx_vsn() =:= OtherVsn.
+
+get_emqx_vsn() ->
+    case application:get_key(emqx, vsn) of
+        {ok, Vsn} ->
+            Vsn;
+        undefined ->
+            undefined
+    end.

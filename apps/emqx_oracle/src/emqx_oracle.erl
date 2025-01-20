@@ -1,12 +1,14 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_oracle).
 
 -behaviour(emqx_resource).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(UNHEALTHY_TARGET_MSG,
@@ -19,16 +21,21 @@
 
 %% callbacks for behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
     on_query/3,
     on_batch_query/3,
-    on_get_status/2
+    on_get_status/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3
 ]).
 
 %% callbacks for ecpool
--export([connect/1, prepare_sql_to_conn/3]).
+-export([connect/1, prepare_sql_to_conn/3, get_reconnect_callback_signature/1]).
 
 %% Internal exports used to execute code with ecpool worker
 -export([
@@ -61,12 +68,14 @@
         batch_params_tokens := params_tokens()
     }.
 
+resource_type() -> oracle.
+
 % As ecpool is not monitoring the worker's PID when doing a handover_async, the
 % request can be lost if worker crashes. Thus, it's better to force requests to
 % be sync for now.
 callback_mode() -> always_sync.
 
--spec on_start(binary(), hoconsc:config()) -> {ok, state()} | {error, _}.
+-spec on_start(binary(), hocon:config()) -> {ok, state()} | {error, _}.
 on_start(
     InstId,
     #{
@@ -95,7 +104,7 @@ on_start(
         {host, Host},
         {port, Port},
         {user, emqx_utils_conv:str(User)},
-        {password, jamdb_secret:wrap(maps:get(password, Config, ""))},
+        {password, maps:get(password, Config, "")},
         {sid, emqx_utils_conv:str(Sid)},
         {service_name, ServiceName},
         {pool_size, maps:get(pool_size, Config, ?DEFAULT_POOL_SIZE)},
@@ -103,12 +112,13 @@ on_start(
         {app_name, "EMQX Data To Oracle Database Action"}
     ],
     PoolName = InstId,
-    Prepares = parse_prepare_sql(Config),
-    InitState = #{pool_name => PoolName},
-    State = maps:merge(InitState, Prepares),
+    State = #{
+        pool_name => PoolName,
+        installed_channels => #{}
+    },
     case emqx_resource_pool:start(InstId, ?MODULE, Options) of
         ok ->
-            {ok, init_prepare(State)};
+            {ok, State};
         {error, Reason} ->
             ?tp(
                 oracle_connector_start_failed,
@@ -125,15 +135,78 @@ on_stop(InstId, #{pool_name := PoolName}) ->
     ?tp(oracle_bridge_stopped, #{instance_id => InstId}),
     emqx_resource_pool:stop(PoolName).
 
+on_add_channel(
+    _InstId,
+    #{
+        installed_channels := InstalledChannels,
+        pool_name := PoolName
+    } = OldState,
+    ChannelId,
+    ChannelConfig
+) ->
+    {ok, ChannelState} = create_channel_state(ChannelId, PoolName, ChannelConfig),
+    NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
+    %% Update state
+    NewState = OldState#{installed_channels => NewInstalledChannels},
+    {ok, NewState}.
+
+create_channel_state(
+    ChannelId,
+    PoolName,
+    #{parameters := Conf} = _ChannelConfig
+) ->
+    State0 = parse_prepare_sql(ChannelId, Conf),
+    State1 = init_prepare(PoolName, State0),
+    {ok, State1}.
+
+on_remove_channel(
+    _InstId,
+    #{
+        installed_channels := InstalledChannels
+    } = OldState,
+    ChannelId
+) ->
+    NewInstalledChannels = maps:remove(ChannelId, InstalledChannels),
+    %% Update state
+    NewState = OldState#{installed_channels => NewInstalledChannels},
+    {ok, NewState}.
+
+on_get_channel_status(
+    _ResId,
+    ChannelId,
+    #{
+        pool_name := PoolName,
+        installed_channels := Channels
+    } = _State
+) ->
+    State = maps:get(ChannelId, Channels),
+    case do_check_prepares(ChannelId, PoolName, State) of
+        ok ->
+            ?status_connected;
+        {error, undefined_table} ->
+            %% return new state indicating that we are connected but the target table is not created
+            {?status_disconnected, {unhealthy_target, ?UNHEALTHY_TARGET_MSG}};
+        {error, _Reason} ->
+            %% do not log error, it is logged in prepare_sql_to_conn
+            ?status_connecting
+    end.
+
+on_get_channels(ResId) ->
+    emqx_bridge_v2:get_channels_for_connector(ResId).
+
 on_query(InstId, {TypeOrKey, NameOrSQL}, #{pool_name := _PoolName} = State) ->
     on_query(InstId, {TypeOrKey, NameOrSQL, []}, State);
 on_query(
     InstId,
     {TypeOrKey, NameOrSQL, Params},
-    #{pool_name := PoolName} = State
+    #{
+        pool_name := PoolName,
+        installed_channels := Channels
+    } = _ConnectorState
 ) ->
+    State = maps:get(TypeOrKey, Channels, #{}),
     ?SLOG(debug, #{
-        msg => "oracle database connector received sql query",
+        msg => "oracle_connector_received_sql_query",
         connector => InstId,
         type => TypeOrKey,
         sql => NameOrSQL,
@@ -141,24 +214,32 @@ on_query(
     }),
     Type = query,
     {NameOrSQL2, Data} = proc_sql_params(TypeOrKey, NameOrSQL, Params, State),
-    Res = on_sql_query(InstId, PoolName, Type, ?SYNC_QUERY_MODE, NameOrSQL2, Data),
+    Res = on_sql_query(InstId, TypeOrKey, PoolName, Type, ?SYNC_QUERY_MODE, NameOrSQL2, Data),
     handle_result(Res).
 
 on_batch_query(
     InstId,
     BatchReq,
-    #{pool_name := PoolName, params_tokens := Tokens, prepare_sql := Sts} = State
+    #{
+        pool_name := PoolName,
+        installed_channels := Channels
+    } = ConnectorState
 ) ->
     case BatchReq of
         [{Key, _} = Request | _] ->
             BinKey = to_bin(Key),
+            State = maps:get(BinKey, Channels),
+            #{
+                params_tokens := Tokens,
+                prepare_sql := Sts
+            } = State,
             case maps:get(BinKey, Tokens, undefined) of
                 undefined ->
                     Log = #{
                         connector => InstId,
                         first_request => Request,
                         state => State,
-                        msg => "batch prepare not implemented"
+                        msg => "batch_prepare_not_implemented"
                     },
                     ?SLOG(error, Log),
                     {error, {unrecoverable_error, batch_prepare_not_implemented}};
@@ -167,7 +248,9 @@ on_batch_query(
                     Datas2 = [emqx_placeholder:proc_sql(TokenList, Data) || Data <- Datas],
                     St = maps:get(BinKey, Sts),
                     case
-                        on_sql_query(InstId, PoolName, execute_batch, ?SYNC_QUERY_MODE, St, Datas2)
+                        on_sql_query(
+                            InstId, BinKey, PoolName, execute_batch, ?SYNC_QUERY_MODE, St, Datas2
+                        )
                     of
                         {ok, Results} ->
                             handle_batch_result(Results, 0);
@@ -179,8 +262,8 @@ on_batch_query(
             Log = #{
                 connector => InstId,
                 request => BatchReq,
-                state => State,
-                msg => "invalid request"
+                state => ConnectorState,
+                msg => "invalid_request"
             },
             ?SLOG(error, Log),
             {error, {unrecoverable_error, invalid_request}}
@@ -204,7 +287,13 @@ proc_sql_params(TypeOrKey, SQLOrData, Params, #{
             end
     end.
 
-on_sql_query(InstId, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
+on_sql_query(InstId, ChannelID, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
+    emqx_trace:rendered_action_template(ChannelID, #{
+        type => Type,
+        apply_mode => ApplyMode,
+        name_or_sql => NameOrSQL,
+        data => #emqx_trace_format_func_data{function = fun trace_format_data/1, data = Data}
+    }),
     case ecpool:pick_and_do(PoolName, {?MODULE, Type, [NameOrSQL, Data]}, ApplyMode) of
         {error, Reason} = Result ->
             ?tp(
@@ -212,7 +301,7 @@ on_sql_query(InstId, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
                 #{error => Reason}
             ),
             ?SLOG(error, #{
-                msg => "oracle database connector do sql query failed",
+                msg => "oracle_connector_do_sql_query_failed",
                 connector => InstId,
                 type => Type,
                 sql => NameOrSQL,
@@ -232,36 +321,44 @@ on_sql_query(InstId, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
             Result
     end.
 
-on_get_status(_InstId, #{pool_name := Pool} = State) ->
+trace_format_data(Data0) ->
+    %% In batch request, we get a two level list
+    {'$array$', lists:map(fun insert_array_marker_if_list/1, Data0)}.
+
+insert_array_marker_if_list(List) when is_list(List) ->
+    {'$array$', List};
+insert_array_marker_if_list(Item) ->
+    Item.
+
+on_get_status(_InstId, #{pool_name := Pool} = _State) ->
     case emqx_resource_pool:health_check_workers(Pool, fun ?MODULE:do_get_status/1) of
         true ->
-            case do_check_prepares(State) of
-                ok ->
-                    connected;
-                {ok, NState} ->
-                    %% return new state with prepared statements
-                    {connected, NState};
-                {error, {undefined_table, NState}} ->
-                    %% return new state indicating that we are connected but the target table is not created
-                    {disconnected, NState, {unhealthy_target, ?UNHEALTHY_TARGET_MSG}};
-                {error, _Reason} ->
-                    %% do not log error, it is logged in prepare_sql_to_conn
-                    connecting
-            end;
+            ?status_connected;
         false ->
-            disconnected
+            ?status_disconnected
     end.
 
 do_get_status(Conn) ->
     ok == element(1, jamdb_oracle:sql_query(Conn, "select 1 from dual")).
 
 do_check_prepares(
+    _ChannelId,
+    _PoolName,
     #{
-        pool_name := PoolName,
-        prepare_sql := #{<<"send_message">> := SQL},
-        params_tokens := #{<<"send_message">> := Tokens}
-    } = State
+        prepare_sql := {error, _Prepares}
+    } = _State
 ) ->
+    {error, undefined_table};
+do_check_prepares(
+    ChannelId,
+    PoolName,
+    State
+) ->
+    #{
+        prepare_sql := #{ChannelId := SQL},
+        params_tokens := #{ChannelId := Tokens}
+    } = State,
+
     % it's already connected. Verify if target table still exists
     Workers = [Worker || {_WorkerName, Worker} <- ecpool:workers(PoolName)],
     lists:foldl(
@@ -270,7 +367,7 @@ do_check_prepares(
                 case ecpool_worker:client(WorkerPid) of
                     {ok, Conn} ->
                         case check_if_table_exists(Conn, SQL, Tokens) of
-                            {error, undefined_table} -> {error, {undefined_table, State}};
+                            {error, undefined_table} -> {error, undefined_table};
                             _ -> ok
                         end;
                     _ ->
@@ -281,20 +378,7 @@ do_check_prepares(
         end,
         ok,
         Workers
-    );
-do_check_prepares(
-    State = #{pool_name := PoolName, prepare_sql := {error, Prepares}, params_tokens := TokensMap}
-) ->
-    case prepare_sql(Prepares, PoolName, TokensMap) of
-        %% remove the error
-        {ok, Sts} ->
-            {ok, State#{prepare_sql => Sts}};
-        {error, undefined_table} ->
-            %% indicate the error
-            {error, {undefined_table, State#{prepare_sql => {error, Prepares}}}};
-        {error, _Reason} = Error ->
-            Error
-    end.
+    ).
 
 %% ===================================================================
 
@@ -328,13 +412,13 @@ execute_batch(Conn, SQL, ParamsList) ->
     ?tp(oracle_batch_query, #{conn => Conn, sql => SQL, params => ParamsList, result => Ret}),
     handle_result(Ret).
 
-parse_prepare_sql(Config) ->
+parse_prepare_sql(ChannelId, Config) ->
     SQL =
         case maps:get(prepare_statement, Config, undefined) of
             undefined ->
                 case maps:get(sql, Config, undefined) of
                     undefined -> #{};
-                    Template -> #{<<"send_message">> => Template}
+                    Template -> #{ChannelId => Template}
                 end;
             Any ->
                 Any
@@ -352,13 +436,13 @@ parse_prepare_sql([], Prepares, Tokens) ->
         params_tokens => Tokens
     }.
 
-init_prepare(State = #{prepare_sql := Prepares, pool_name := PoolName, params_tokens := TokensMap}) ->
+init_prepare(PoolName, State = #{prepare_sql := Prepares, params_tokens := TokensMap}) ->
     case prepare_sql(Prepares, PoolName, TokensMap) of
         {ok, Sts} ->
             State#{prepare_sql := Sts};
         Error ->
             LogMeta = #{
-                msg => <<"Oracle Database init prepare statement failed">>, error => Error
+                msg => <<"oracle_init_prepare_statement_failed">>, error => Error
             },
             ?SLOG(error, LogMeta),
             %% mark the prepare_sql as failed
@@ -396,7 +480,7 @@ prepare_sql_to_conn(Conn, Prepares, TokensMap) ->
 
 prepare_sql_to_conn(Conn, [], _TokensMap, Statements) when is_pid(Conn) -> {ok, Statements};
 prepare_sql_to_conn(Conn, [{Key, SQL} | PrepareList], TokensMap, Statements) when is_pid(Conn) ->
-    LogMeta = #{msg => "Oracle Database Prepare Statement", name => Key, prepare_sql => SQL},
+    LogMeta = #{msg => "oracle_prepare_statement", name => Key, prepare_sql => SQL},
     Tokens = maps:get(Key, TokensMap, []),
     ?SLOG(info, LogMeta),
     case check_if_table_exists(Conn, SQL, Tokens) of
@@ -411,6 +495,12 @@ prepare_sql_to_conn(Conn, [{Key, SQL} | PrepareList], TokensMap, Statements) whe
         Error ->
             Error
     end.
+
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([[{ChannelId, _Template}]]) ->
+    ChannelId.
 
 check_if_table_exists(Conn, SQL, Tokens0) ->
     % Discard nested tokens for checking if table exist. As payload here is defined as

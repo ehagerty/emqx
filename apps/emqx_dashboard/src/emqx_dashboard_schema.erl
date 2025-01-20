@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -55,7 +55,16 @@ fields("dashboard") ->
                     desc => ?DESC(token_expired_time)
                 }
             )},
+        {password_expired_time,
+            ?HOCON(
+                emqx_schema:duration_s(),
+                #{
+                    default => 0,
+                    desc => ?DESC(password_expired_time)
+                }
+            )},
         {cors, fun cors/1},
+        {swagger_support, fun swagger_support/1},
         {i18n_lang, fun i18n_lang/1},
         {bootstrap_users_file,
             ?HOCON(
@@ -68,7 +77,7 @@ fields("dashboard") ->
                     importance => ?IMPORTANCE_HIDDEN
                 }
             )}
-    ];
+    ] ++ sso_fields();
 fields("listeners") ->
     [
         {"http",
@@ -100,8 +109,7 @@ fields("https") ->
         enable(false),
         bind(18084),
         ssl_options()
-        | common_listener_fields() ++
-            hidden_server_ssl_options()
+        | common_listener_fields()
     ];
 fields("ssl_options") ->
     server_ssl_options().
@@ -117,30 +125,8 @@ ssl_options() ->
             }
         )}.
 
-hidden_server_ssl_options() ->
-    lists:map(
-        fun({K, V}) ->
-            {K, V#{
-                importance => ?IMPORTANCE_HIDDEN,
-                default => undefined,
-                required => false
-            }}
-        end,
-        server_ssl_options()
-    ).
-
 server_ssl_options() ->
-    Opts0 = emqx_schema:server_ssl_opts_schema(#{}, true),
-    exclude_fields(["fail_if_no_peer_cert"], Opts0).
-
-exclude_fields([], Fields) ->
-    Fields;
-exclude_fields([FieldName | Rest], Fields) ->
-    %% assert field exists
-    case lists:keytake(FieldName, 1, Fields) of
-        {value, _, New} -> exclude_fields(Rest, New);
-        false -> error({FieldName, Fields})
-    end.
+    emqx_schema:server_ssl_opts_schema(#{}, true).
 
 common_listener_fields() ->
     [
@@ -216,6 +202,7 @@ enable(Bool) ->
             #{
                 default => Bool,
                 required => false,
+                %% deprecated because we use port number =:= 0 to disable
                 deprecated => {since, "5.1.0"},
                 importance => ?IMPORTANCE_HIDDEN,
                 desc => ?DESC(listener_enable)
@@ -253,6 +240,10 @@ default_username(default) -> <<"admin">>;
 default_username(required) -> true;
 default_username(desc) -> ?DESC(default_username);
 default_username('readOnly') -> true;
+%% username is hidden but password is not,
+%% this is because we want to force changing 'admin' user's password.
+%% instead of suggesting to create a new user --- which could be
+%% more prone to leaving behind 'admin' user's password unchanged without detection.
 default_username(importance) -> ?IMPORTANCE_HIDDEN;
 default_username(_) -> undefined.
 
@@ -263,7 +254,7 @@ default_password('readOnly') -> true;
 default_password(sensitive) -> true;
 default_password(converter) -> fun emqx_schema:password_converter/2;
 default_password(desc) -> ?DESC(default_password);
-default_password(importance) -> ?IMPORTANCE_HIDDEN;
+default_password(importance) -> ?IMPORTANCE_LOW;
 default_password(_) -> undefined.
 
 cors(type) -> boolean();
@@ -271,6 +262,11 @@ cors(default) -> false;
 cors(required) -> false;
 cors(desc) -> ?DESC(cors);
 cors(_) -> undefined.
+
+swagger_support(type) -> boolean();
+swagger_support(default) -> true;
+swagger_support(desc) -> ?DESC(swagger_support);
+swagger_support(_) -> undefined.
 
 %% TODO: change it to string type
 %% It will be up to the dashboard package which languages to support
@@ -290,12 +286,31 @@ validate_sample_interval(Second) ->
             {error, Msg}
     end.
 
-https_converter(Conf = #{<<"ssl_options">> := _}, _Opts) ->
+https_converter(undefined, _Opts) ->
+    %% no https listener configured
+    undefined;
+https_converter(Conf, Opts) ->
+    convert_ssl_layout(Conf, Opts).
+
+convert_ssl_layout(Conf = #{<<"ssl_options">> := _}, _Opts) ->
     Conf;
-https_converter(Conf = #{}, _Opts) ->
+convert_ssl_layout(Conf = #{}, _Opts) ->
     Keys = lists:map(fun({K, _}) -> list_to_binary(K) end, server_ssl_options()),
     SslOpts = maps:with(Keys, Conf),
     Conf1 = maps:without(Keys, Conf),
-    Conf1#{<<"ssl_options">> => SslOpts};
-https_converter(Conf, _Opts) ->
-    Conf.
+    Conf1#{<<"ssl_options">> => SslOpts}.
+
+-if(?EMQX_RELEASE_EDITION == ee).
+sso_fields() ->
+    [
+        {sso,
+            ?HOCON(
+                ?R_REF(emqx_dashboard_sso_schema, sso),
+                #{required => {false, recursively}}
+            )}
+    ].
+
+-else.
+sso_fields() ->
+    [].
+-endif.

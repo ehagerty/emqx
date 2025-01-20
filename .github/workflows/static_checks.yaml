@@ -7,9 +7,6 @@ concurrency:
 on:
   workflow_call:
     inputs:
-      runner:
-        required: true
-        type: string
       builder:
         required: true
         type: string
@@ -20,30 +17,31 @@ on:
 env:
   IS_CI: "yes"
 
+permissions:
+  contents: read
+
 jobs:
   static_checks:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ github.repository_owner == 'emqx' && fromJSON('["self-hosted","ephemeral","linux","x64"]') || 'ubuntu-22.04' }}
+    name: "static_checks (${{ matrix.profile }})"
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(inputs.ct-matrix) }}
-    container: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-ubuntu22.04"
+    container: "${{ inputs.builder }}"
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ matrix.profile }}
       - name: extract artifact
         run: |
           unzip -o -q ${{ matrix.profile }}.zip
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/cache@v3
+      - uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
         with:
-          path: "emqx_dialyzer_${{ matrix.otp }}_plt"
-          key: rebar3-dialyzer-plt-${{ matrix.profile }}-${{ matrix.otp }}-${{ hashFiles('rebar.*', 'apps/*/rebar.*', 'lib-ee/*/rebar.*') }}
+          path: "emqx_dialyzer_${{ matrix.profile }}_plt"
+          key: rebar3-dialyzer-plt-${{ matrix.profile }}-${{ hashFiles('rebar.*', 'apps/*/rebar.*') }}
           restore-keys: |
-            rebar3-dialyzer-plt-${{ matrix.profile }}-${{ matrix.otp }}-
+            rebar3-dialyzer-plt-${{ matrix.profile }}-
       - name: run static checks
-        env:
-          PROFILE: ${{ matrix.profile }}
         run: make static_checks

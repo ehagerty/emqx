@@ -1,15 +1,17 @@
 {application, emqx_bridge_mongodb, [
     {description, "EMQX Enterprise MongoDB Bridge"},
-    {vsn, "0.2.1"},
+    {vsn, "0.3.6"},
     {registered, []},
     {applications, [
         kernel,
         stdlib,
-        emqx_connector,
         emqx_resource,
         emqx_mongodb
     ]},
-    {env, []},
+    {env, [
+        {emqx_action_info_modules, [emqx_bridge_mongodb_action_info]},
+        {emqx_connector_info_modules, [emqx_bridge_mongodb_connector_info]}
+    ]},
     {modules, []},
     {links, []}
 ]}.

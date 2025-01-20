@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -143,11 +143,11 @@ start_grpc_server(GwName, Options = #{bind := ListenOn}) ->
             false ->
                 [];
             true ->
+                Opts1 = maps:get(ssl, Options, #{}),
+                Opts2 = maps:without([handshake_timeout], Opts1),
+                SSLOpts = emqx_tls_lib:to_server_opts(tls, Opts2),
                 [
-                    {ssl_options,
-                        maps:to_list(
-                            maps:without([enable, handshake_timeout], maps:get(ssl, Options, #{}))
-                        )}
+                    {ssl_options, SSLOpts}
                 ]
         end,
     ListenOnStr = emqx_listeners:format_bind(ListenOn),
@@ -166,7 +166,7 @@ start_grpc_server(GwName, Options = #{bind := ListenOn}) ->
                 {badconf, #{
                     key => server,
                     value => Options,
-                    reason => illegal_grpc_server_confs
+                    reason => invalid_grpc_server_confs
                 }}
             )
     end;
@@ -175,7 +175,7 @@ start_grpc_server(_GwName, Options) ->
         {badconf, #{
             key => server,
             value => Options,
-            reason => illegal_grpc_server_confs
+            reason => invalid_grpc_server_confs
         }}
     ).
 
@@ -196,24 +196,31 @@ start_grpc_client_channel(
                     {badconf, #{
                         key => address,
                         value => Address,
-                        reason => illegal_grpc_address
+                        reason => invalid_grpc_address
                     }}
                 )
         end,
-    case emqx_utils_maps:deep_get([ssl_options, enable], Options, false) of
+    SSLOpts = emqx_utils_maps:deep_get([ssl_options], Options, #{}),
+    case maps:get(enable, SSLOpts, false) of
         false ->
             SvrAddr = compose_http_uri(http, Host, Port),
-            grpc_client_sup:create_channel_pool(GwName, SvrAddr, #{});
-        true ->
-            SslOpts = maps:to_list(maps:get(ssl, Options, #{})),
             ClientOpts = #{
-                gun_opts =>
-                    #{
-                        transport => ssl,
-                        transport_opts => SslOpts
-                    }
+                gun_opts => #{
+                    %% NOTE: Disable retries by default, emulating 0.6.x behavior.
+                    retry => 0
+                }
             },
-
+            grpc_client_sup:create_channel_pool(GwName, SvrAddr, ClientOpts);
+        true ->
+            SSLOpts1 = [{nodelay, true} | emqx_tls_lib:to_client_opts(SSLOpts)],
+            ClientOpts = #{
+                gun_opts => #{
+                    transport => ssl,
+                    tls_opts => SSLOpts1,
+                    %% NOTE: Disable retries by default, emulating 0.6.x behavior.
+                    retry => 0
+                }
+            },
             SvrAddr = compose_http_uri(https, Host, Port),
             grpc_client_sup:create_channel_pool(GwName, SvrAddr, ClientOpts)
     end;
@@ -222,14 +229,22 @@ start_grpc_client_channel(_GwName, Options) ->
         {badconf, #{
             key => handler,
             value => Options,
-            reason => ililegal_grpc_client_confs
+            reason => invalid_grpc_client_confs
         }}
     ).
 
-compose_http_uri(Scheme, Host, Port) ->
+compose_http_uri(Scheme, Host0, Port) ->
+    Host =
+        case inet:is_ip_address(Host0) of
+            true ->
+                inet:ntoa(Host0);
+            false when is_list(Host0) ->
+                Host0
+        end,
+
     lists:flatten(
         io_lib:format(
-            "~s://~s:~w", [Scheme, inet:ntoa(Host), Port]
+            "~s://~s:~w", [Scheme, Host, Port]
         )
     ).
 

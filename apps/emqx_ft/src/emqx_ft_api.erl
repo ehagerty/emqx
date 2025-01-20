@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -110,7 +110,7 @@ schema("/file_transfer") ->
     #{
         'operationId' => '/file_transfer',
         get => #{
-            tags => [<<"file_transfer">>],
+            tags => ?TAGS,
             summary => <<"Get current File Transfer configuration">>,
             description => ?DESC("file_transfer_get_config"),
             responses => #{
@@ -118,14 +118,15 @@ schema("/file_transfer") ->
             }
         },
         put => #{
-            tags => [<<"file_transfer">>],
+            tags => ?TAGS,
             summary => <<"Update File Transfer configuration">>,
             description => ?DESC("file_transfer_update_config"),
             'requestBody' => ?SCHEMA_CONFIG,
             responses => #{
                 200 => ?SCHEMA_CONFIG,
                 400 => emqx_dashboard_swagger:error_codes(
-                    ['INVALID_CONFIG'], error_desc('INVALID_CONFIG')
+                    ['UPDATE_FAILED', 'INVALID_CONFIG'],
+                    error_desc('INVALID_CONFIG')
                 )
             }
         }
@@ -175,17 +176,9 @@ check_ft_enabled(Params, _Meta) ->
             {503, error_msg('SERVICE_UNAVAILABLE')}
     end.
 
-'/file_transfer'(get, _Meta) ->
-    {200, format_config(emqx_ft_conf:get())};
-'/file_transfer'(put, #{body := ConfigIn}) ->
-    case emqx_ft_conf:update(ConfigIn) of
-        {ok, #{config := Config}} ->
-            {200, format_config(Config)};
-        {error, Error = #{kind := validation_error}} ->
-            {400, error_msg('INVALID_CONFIG', format_validation_error(Error))};
-        {error, Error} ->
-            {400, error_msg('INVALID_CONFIG', emqx_utils:format(Error))}
-    end.
+%% Forward /file_transfer to /configs/file_transfer
+'/file_transfer'(Method, Data) ->
+    emqx_mgmt_api_configs:request_config([<<"file_transfer">>], Method, Data).
 
 format_page(#{items := Files, cursor := Cursor}) ->
     #{
@@ -196,13 +189,6 @@ format_page(#{items := Files}) ->
     #{
         <<"files">> => lists:map(fun format_file_info/1, Files)
     }.
-
-format_config(Config) ->
-    Schema = emqx_hocon:make_schema(emqx_ft_schema:fields(file_transfer)),
-    hocon_tconf:make_serializable(Schema, emqx_utils_maps:binary_key_map(Config), #{}).
-
-format_validation_error(Error) ->
-    emqx_logger_jsonfmt:best_effort_json(Error).
 
 error_msg(Code) ->
     #{code => Code, message => error_desc(Code)}.
@@ -220,7 +206,7 @@ error_desc('SERVICE_UNAVAILABLE') ->
 roots() ->
     [].
 
--spec fields(hocon_schema:name()) -> [hoconsc:field()].
+-spec fields(hocon_schema:name()) -> [hocon_schema:field()].
 fields(client_id) ->
     [
         {clientid,
@@ -278,7 +264,7 @@ format_file_info(
     end.
 
 format_timestamp(Timestamp) ->
-    iolist_to_binary(calendar:system_time_to_rfc3339(Timestamp, [{unit, second}])).
+    emqx_utils_calendar:epoch_to_rfc3339(Timestamp, second).
 
 format_name(NameBin) when is_binary(NameBin) ->
     NameBin;

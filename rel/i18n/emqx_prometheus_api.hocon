@@ -11,8 +11,28 @@ update_prom_conf_info.label:
 """Update Prometheus config"""
 
 get_prom_data.desc:
-"""Get Prometheus Data"""
+"""Get Prometheus Metrics"""
 get_prom_data.label:
-"""Get Prometheus Data"""
+"""Prometheus Metrics"""
+
+get_prom_auth_data.desc:
+"""Get Prometheus Metrics for AuthN, AuthZ and Banned"""
+get_prom_auth_data.label:
+"""Prometheus Metrics for Auth"""
+
+get_prom_data_integration_data.desc:
+"""Get Prometheus Metrics for Data Integration"""
+get_prom_data_integration_data.label:
+"""Prometheus Metrics for Data Integration"""
+
+get_prom_schema_validation.desc:
+"""Get Prometheus Metrics for Schema Validation"""
+get_prom_schema_validation.label:
+"""Prometheus Metrics for Schema Validation"""
+
+get_prom_message_transformation.desc:
+"""Get Prometheus Metrics for Message Validation"""
+get_prom_message_transformation.label:
+"""Prometheus Metrics for Message Validation"""
 
 }

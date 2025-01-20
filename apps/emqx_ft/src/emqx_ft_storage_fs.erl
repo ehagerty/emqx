@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -56,6 +56,7 @@
 -export_type([filefrag/1]).
 -export_type([filefrag/0]).
 -export_type([transferinfo/0]).
+-export_type([segmentinfo/0]).
 
 -export_type([file_error/0]).
 
@@ -76,7 +77,7 @@
 % TODO naming
 -type filefrag(T) :: #{
     path := file:name(),
-    timestamp := emqx_datetime:epoch_second(),
+    timestamp := emqx_utils_calendar:epoch_second(),
     size := _Bytes :: non_neg_integer(),
     fragment := T
 }.
@@ -104,7 +105,7 @@
     type := 'local',
     enable := true,
     segments := segments(),
-    exporter := emqx_ft_storage_exporter:exporter()
+    exporter := emqx_ft_storage_exporter:exporter_conf()
 }.
 
 -type file_error() ::
@@ -145,7 +146,7 @@ store_filemeta(Storage, Transfer, Meta) ->
             % We won't see conflicts in case of concurrent `store_filemeta`
             % requests. It's rather odd scenario so it's fine not to worry
             % about it too much now.
-            {error, conflict};
+            {error, filemeta_conflict};
         {error, Reason} when Reason =:= notfound; Reason =:= corrupted; Reason =:= enoent ->
             write_file_atomic(Storage, Transfer, Filepath, encode_filemeta(Meta));
         {error, _} = Error ->

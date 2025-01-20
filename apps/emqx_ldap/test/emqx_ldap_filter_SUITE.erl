@@ -1,5 +1,17 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
 %%--------------------------------------------------------------------
 
 -module(emqx_ldap_filter_SUITE).
@@ -222,6 +234,46 @@ t_error(_Config) ->
     ?assertMatch({error, _}, scan_and_parse("(attr=value")),
     ?assertMatch({error, _}, scan_and_parse("attr=value")),
     ?assertMatch({error, _}, scan_and_parse("(a=b)(c=d)")).
+
+t_escape(_Config) ->
+    ?assertEqual(
+        'and'([equalityMatch("a", "(value)")]),
+        parse("(&(a=\\(value\\)))")
+    ),
+    ?assertEqual(
+        'or'([equalityMatch("a", "name (1)")]),
+        parse("(|(a=name \\(1\\)))")
+    ),
+    ?assertEqual(
+        'or'([equalityMatch("a", "name (1) *")]),
+        parse("(|(a=name\\ \\(1\\) \\*))")
+    ),
+    ?assertEqual(
+        'and'([equalityMatch("a", "\\value\\")]),
+        parse("(&(a=\\\\value\\\\))")
+    ).
+
+t_value_eql_dn(_Config) ->
+    ?assertEqual('and'([equalityMatch("a", "dn")]), parse("(&(a=dn))")).
+
+t_member_of(_Config) ->
+    ?assertEqual(
+        'and'([
+            equalityMatch("a", "b"), equalityMatch("memberOf", "CN=GroupName,OU=emqx,DC=WL,DC=com")
+        ]),
+        parse("(&(a=b)(memberOf=CN=GroupName,OU=emqx,DC=WL,DC=com))")
+    ).
+
+t_extensible_member_of(_Config) ->
+    ?assertEqual(
+        'and'([
+            equalityMatch("a", "b"),
+            extensibleMatch("CN=GroupName,OU=emqx,DC=WL,DC=com", [
+                {type, "memberOf"}, {matchingRule, "1.2.840.113556.1.4.1941"}
+            ])
+        ]),
+        parse("(&(a=b)(memberOf:1.2.840.113556.1.4.1941:=CN=GroupName,OU=emqx,DC=WL,DC=com))")
+    ).
 
 % %%------------------------------------------------------------------------------
 % %% Helpers

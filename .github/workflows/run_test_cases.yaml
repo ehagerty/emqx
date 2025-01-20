@@ -7,9 +7,6 @@ concurrency:
 on:
   workflow_call:
     inputs:
-      runner:
-        required: true
-        type: string
       builder:
         required: true
         type: string
@@ -23,12 +20,16 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 env:
   IS_CI: "yes"
 
 jobs:
   eunit_and_proper:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ github.repository_owner == 'emqx' && fromJSON('["self-hosted","ephemeral","linux","x64"]') || 'ubuntu-22.04' }}
+    name: "eunit_and_proper (${{ matrix.profile }})"
     strategy:
       fail-fast: false
       matrix:
@@ -37,38 +38,42 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-ubuntu22.04"
+    container: ${{ inputs.builder }}
+
+    env:
+      PROFILE: ${{ matrix.profile }}
+      ENABLE_COVER_COMPILE: 1
+      CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}
 
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ matrix.profile }}
+
       - name: extract artifact
         run: |
           unzip -o -q ${{ matrix.profile }}.zip
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
         # produces eunit.coverdata
-      - name: eunit
-        env:
-          PROFILE: ${{ matrix.profile }}
-          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-${{ matrix.otp }}
-        run: make eunit
+      - run: make eunit
 
         # produces proper.coverdata
-      - name: proper
-        env:
-          PROFILE: ${{ matrix.profile }}
-          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-${{ matrix.otp }}
-        run: make proper
+      - run: make proper
 
-      - uses: actions/upload-artifact@v3
-        with:
-          name: coverdata
-          path: _build/test/cover
+      - run: make cover
+
+      - name: send to coveralls
+        if: github.repository == 'emqx/emqx'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make coveralls
+
+      - run: cat rebar3.crashdump || true
+        if: failure()
 
   ct_docker:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ github.repository_owner == 'emqx' && fromJSON('["self-hosted","ephemeral","linux","x64"]') || 'ubuntu-22.04' }}
+    name: "${{ matrix.app }}-${{ matrix.suitegroup }} (${{ matrix.profile }})"
     strategy:
       fail-fast: false
       matrix:
@@ -78,20 +83,21 @@ jobs:
       run:
         shell: bash
 
+    env:
+      PROFILE: ${{ matrix.profile }}
+
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ matrix.profile }}
       - name: extract artifact
         run: |
           unzip -o -q ${{ matrix.profile }}.zip
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
         # produces $PROFILE-<app-name>-<otp-vsn>-sg<suitegroup>.coverdata
       - name: run common tests
         env:
-          DOCKER_CT_RUNNER_IMAGE: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-ubuntu22.04"
+          DOCKER_CT_RUNNER_IMAGE: ${{ inputs.builder }}
           MONGO_TAG: "5"
           MYSQL_TAG: "8"
           PGSQL_TAG: "13"
@@ -100,35 +106,59 @@ jobs:
           TDENGINE_TAG: "3.0.2.4"
           OPENTS_TAG: "9aa7f88"
           MINIO_TAG: "RELEASE.2023-03-20T20-16-18Z"
-          PROFILE: ${{ matrix.profile }}
           SUITEGROUP: ${{ matrix.suitegroup }}
-          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-${{ matrix.otp }}-sg${{ matrix.suitegroup }}
-        run: ./scripts/ct/run.sh --ci --app ${{ matrix.app }}
-      - uses: actions/upload-artifact@v3
-        with:
-          name: coverdata
-          path: _build/test/cover
-      - uses: actions/upload-artifact@v3
+          ENABLE_COVER_COMPILE: 1
+          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-sg${{ matrix.suitegroup }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/ct/run.sh --ci --app ${{ matrix.app }} --keep-up
+
+      - name: make cover
+        run: |
+          docker exec -e PROFILE="$PROFILE" -t erlang make cover
+
+      - name: send to coveralls
+        if: github.repository == 'emqx/emqx'
+        run: |
+          ls _build/test/cover/*.coverdata || exit 0
+          docker exec -e PROFILE="$PROFILE" -t erlang make coveralls
+
+      - name: rebar3.crashdump
+        if: failure()
+        run: cat rebar3.crashdump || true
+
+      - name: compress logs
+        if: failure()
+        run: tar -czf logs.tar.gz _build/test/logs
+
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         if: failure()
         with:
-          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-${{ matrix.otp }}-sg${{ matrix.suitegroup }}
-          path: _build/test/logs
+          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-sg${{ matrix.suitegroup }}
+          path: logs.tar.gz
+          compression-level: 0
+          retention-days: 7
 
   ct:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ github.repository_owner == 'emqx' && fromJSON('["self-hosted","ephemeral","linux","x64"]') || 'ubuntu-22.04' }}
+    name: "${{ matrix.app }}-${{ matrix.suitegroup }} (${{ matrix.profile }})"
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(inputs.ct-host) }}
 
-    container: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-ubuntu22.04"
+    container: ${{ inputs.builder }}
     defaults:
       run:
         shell: bash
 
+    env:
+      PROFILE: ${{ matrix.profile }}
+      SUITEGROUP: ${{ matrix.suitegroup }}
+      ENABLE_COVER_COMPILE: 1
+      CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-sg${{ matrix.suitegroup }}
+
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ matrix.profile }}
       - name: extract artifact
@@ -138,75 +168,52 @@ jobs:
 
         # produces $PROFILE-<app-name>-<otp-vsn>-sg<suitegroup>.coverdata
       - name: run common tests
+        run: make "${{ matrix.app }}-ct"
+
+      - run: make cover
+
+      - name: send to coveralls
+        if: github.repository == 'emqx/emqx'
         env:
-          PROFILE: ${{ matrix.profile }}
-          SUITEGROUP: ${{ matrix.suitegroup }}
-          CT_COVER_EXPORT_PREFIX: ${{ matrix.profile }}-${{ matrix.otp }}-sg${{ matrix.suitegroup }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          make "${{ matrix.app }}-ct"
-      - uses: actions/upload-artifact@v3
-        with:
-          name: coverdata
-          path: _build/test/cover
-          if-no-files-found: warn # do not fail if no coverdata found
-      - uses: actions/upload-artifact@v3
+          ls _build/test/cover/*.coverdata || exit 0
+          make coveralls
+
+      - run: cat rebar3.crashdump || true
+        if: failure()
+
+      - name: compress logs
+        if: failure()
+        run: tar -czf logs.tar.gz _build/test/logs
+
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         if: failure()
         with:
-          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-${{ matrix.otp }}-sg${{ matrix.suitegroup }}
-          path: _build/test/logs
+          name: logs-${{ matrix.profile }}-${{ matrix.prefix }}-sg${{ matrix.suitegroup }}
+          path: logs.tar.gz
+          compression-level: 0
+          retention-days: 7
 
-  make_cover:
+  tests_passed:
     needs:
       - eunit_and_proper
       - ct
       - ct_docker
-    runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.builder }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
-      matrix:
-        profile:
-          - emqx-enterprise
+
+    permissions:
+      pull-requests: write
+
     steps:
-      - uses: AutoModality/action-clean@v1
-      - uses: actions/download-artifact@v3
+      - name: Coveralls finished
+        if: github.repository == 'emqx/emqx'
+        uses: coverallsapp/github-action@643bc377ffa44ace6394b2b5d0d3950076de9f63 # v2.3.0
         with:
-          name: ${{ matrix.profile }}
-      - name: extract artifact
-        run: |
-          unzip -o -q ${{ matrix.profile }}.zip
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          parallel-finished: true
+          git-branch: ${{ github.ref }}
+          git-commit: ${{ github.sha }}
 
-      - uses: actions/download-artifact@v3
-        name: download coverdata
-        with:
-          name: coverdata
-          path: _build/test/cover
-
-      - name: make cover
-        env:
-          PROFILE: emqx-enterprise
-        run: make cover
-
-      - name: send to coveralls
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROFILE: emqx-enterprise
-        run: make coveralls
-
-      - name: get coveralls logs
-        if: failure()
-        run: cat rebar3.crashdump
-
-  # do this in a separate job
-  upload_coverdata:
-    needs: make_cover
-    runs-on: ${{ inputs.runner }}
-    steps:
-      - name: Coveralls Finished
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -v -k https://coveralls.io/webhook \
-               --header "Content-Type: application/json" \
-               --data "{\"repo_name\":\"$GITHUB_REPOSITORY\",\"repo_token\":\"$GITHUB_TOKEN\",\"payload\":{\"build_num\":$GITHUB_RUN_ID,\"status\":\"done\"}}" || true
+      - run: echo "All tests passed"

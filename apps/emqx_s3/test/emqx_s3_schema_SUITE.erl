@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3_schema_SUITE).
@@ -23,13 +23,12 @@ t_minimal_config(_Config) ->
             bucket := "bucket",
             host := "s3.us-east-1.endpoint.com",
             port := 443,
+            access_method := path,
             min_part_size := 5242880,
             transport_options :=
                 #{
                     connect_timeout := 15000,
-                    enable_pipelining := 100,
                     pool_size := 8,
-                    pool_type := random,
                     ssl := #{enable := false}
                 }
         },
@@ -49,11 +48,11 @@ t_full_config(_Config) ->
             host := "s3.us-east-1.endpoint.com",
             min_part_size := 10485760,
             port := 443,
+            access_method := vhost,
             secret_access_key := Secret,
             transport_options :=
                 #{
                     connect_timeout := 30000,
-                    enable_pipelining := 200,
                     headers := #{<<"x-amz-acl">> := <<"public-read">>},
                     max_retries := 3,
                     pool_size := 10,
@@ -81,11 +80,11 @@ t_full_config(_Config) ->
             <<"bucket">> => <<"bucket">>,
             <<"host">> => <<"s3.us-east-1.endpoint.com">>,
             <<"port">> => 443,
+            <<"access_method">> => <<"vhost">>,
             <<"min_part_size">> => <<"10mb">>,
             <<"acl">> => <<"public_read">>,
             <<"transport_options">> => #{
                 <<"connect_timeout">> => <<"30s">>,
-                <<"enable_pipelining">> => 200,
                 <<"pool_size">> => 10,
                 <<"pool_type">> => <<"random">>,
                 <<"ssl">> => #{
@@ -132,7 +131,7 @@ t_sensitive_config_no_leak(_Config) ->
             Error = #{
                 kind := validation_error,
                 path := "s3.secret_access_key",
-                reason := {expected_type, string}
+                reason := invalid_type
             }
         ]} when map_size(Error) == 3,
         emqx_s3_schema:translate(

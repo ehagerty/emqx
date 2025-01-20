@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -66,14 +66,14 @@ table(ReaderPid, Bytes) when is_pid(ReaderPid) andalso is_integer(Bytes) andalso
     end,
     qlc:table(fun() -> NextFun(ReaderPid) end, []).
 
--spec start_link(pid(), filename:filename()) -> startlink_ret().
+-spec start_link(pid(), file:name()) -> startlink_ret().
 start_link(CallerPid, Filename) when
     is_pid(CallerPid) andalso
         ?IS_FILENAME(Filename)
 ->
     gen_server:start_link(?MODULE, [CallerPid, Filename], []).
 
--spec start_supervised(pid(), filename:filename()) -> startlink_ret().
+-spec start_supervised(pid(), file:name()) -> startlink_ret().
 start_supervised(CallerPid, Filename) when
     is_pid(CallerPid) andalso
         ?IS_FILENAME(Filename)

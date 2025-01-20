@@ -23,6 +23,8 @@ _build
 .rebar3
 rebar3.crashdump
 .DS_Store
+# emqx_ds_replication_layer_meta:ensure_site/0
+data
 etc/gen.emqx.conf
 compile_commands.json
 cuttlefish
@@ -46,6 +48,8 @@ apps/*/etc/*.all
 _upgrade_base/
 TAGS
 erlang_ls.config
+.elp.toml
+build_info.json
 .els_cache/
 # VSCode files
 .vs/
@@ -55,11 +59,13 @@ erlang_ls.config
 # Emacs temporary files
 .#*
 *#
+# Emacs dir local variables
+.dir-locals.el
 # For direnv
 .envrc
 # elixir
 mix.lock
-apps/emqx/test/emqx_static_checks_data/master.bpapi
+apps/emqx/test/emqx_static_checks_data/master.bpapi2
 # rendered configurations
 *.conf.rendered
 *.conf.rendered.*
@@ -68,3 +74,14 @@ lux_logs/
 bom.json
 ct_run*/
 apps/emqx_conf/etc/emqx.conf.all.rendered*
+rebar-git-cache.tar
+# build docker image locally
+.dockerignore
+.docker_image_tag
+.emqx_docker_image_tags
+.git/
+apps/emqx_utils/src/emqx_variform_parser.erl
+apps/emqx_utils/src/emqx_variform_scan.erl
+default-profile.mk
+
+/_build.*

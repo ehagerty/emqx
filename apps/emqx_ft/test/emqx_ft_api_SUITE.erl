@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+
+-define(SECRET_ACCESS_KEY, <<"fake_secret_access_key">>).
 
 -import(emqx_dashboard_api_test_helpers, [host/0, uri/1]).
 
@@ -85,7 +87,7 @@ t_list_files(Config) ->
     FileId = <<"f1">>,
 
     Node = lists:last(test_nodes(Config)),
-    ok = emqx_ft_test_helpers:upload_file(ClientId, FileId, "f1", <<"data">>, Node),
+    ok = emqx_ft_test_helpers:upload_file(sync, ClientId, FileId, "f1", <<"data">>, Node),
 
     {ok, 200, #{<<"files">> := Files}} =
         request_json(get, uri(["file_transfer", "files"]), Config),
@@ -114,7 +116,7 @@ t_download_transfer(Config) ->
 
     Nodes = [Node | _] = test_nodes(Config),
     NodeUpload = lists:last(Nodes),
-    ok = emqx_ft_test_helpers:upload_file(ClientId, FileId, "f1", <<"data">>, NodeUpload),
+    ok = emqx_ft_test_helpers:upload_file(sync, ClientId, FileId, "f1", <<"data">>, NodeUpload),
 
     ?assertMatch(
         {ok, 400, #{<<"code">> := <<"BAD_REQUEST">>}},
@@ -185,7 +187,7 @@ t_list_files_paging(Config) ->
     ],
     ok = lists:foreach(
         fun({FileId, Name, Node}) ->
-            ok = emqx_ft_test_helpers:upload_file(ClientId, FileId, Name, <<"data">>, Node)
+            ok = emqx_ft_test_helpers:upload_file(sync, ClientId, FileId, Name, <<"data">>, Node)
         end,
         Uploads
     ),
@@ -275,27 +277,88 @@ t_ft_disabled(Config) ->
         )
     ).
 
-t_configure(Config) ->
+t_configure_file_transfer(Config) ->
+    Uri = uri(["file_transfer"]),
+    test_configure(Uri, Config).
+
+t_configure_config_file_transfer(Config) ->
+    Uri = uri(["configs/file_transfer"]),
+    test_configure(Uri, Config).
+
+test_configure(Uri, Config) ->
+    #{
+        cert := Cert,
+        key := Key
+    } = emqx_ft_test_helpers:generate_pki_files(Config),
     ?assertMatch(
-        {ok, 200, #{<<"enable">> := true, <<"storage">> := #{}}},
-        request_json(get, uri(["file_transfer"]), Config)
+        {ok, 200, #{
+            <<"enable">> := true,
+            <<"storage">> :=
+                #{
+                    <<"local">> :=
+                        #{
+                            <<"enable">> := true,
+                            <<"segments">> :=
+                                #{
+                                    <<"gc">> :=
+                                        #{
+                                            %% Match keep the raw conf
+                                            %% 1h is not change to 3600000
+                                            <<"interval">> := <<"1h">>,
+                                            <<"maximum_segments_ttl">> := <<"24h">>,
+                                            <<"minimum_segments_ttl">> := <<"5m">>
+                                        }
+                                }
+                        }
+                }
+        }},
+        request_json(get, Uri, Config)
     ),
     ?assertMatch(
         {ok, 200, #{<<"enable">> := false}},
-        request_json(put, uri(["file_transfer"]), #{<<"enable">> => false}, Config)
+        request_json(put, Uri, #{<<"enable">> => false}, Config)
     ),
     ?assertMatch(
         {ok, 200, #{<<"enable">> := false}},
-        request_json(get, uri(["file_transfer"]), Config)
+        request_json(get, Uri, Config)
+    ),
+    Storage0 = emqx_ft_test_helpers:local_storage(Config),
+    Storage = emqx_utils_maps:deep_put(
+        [
+            <<"local">>,
+            <<"segments">>,
+            <<"gc">>,
+            <<"maximum_segments_ttl">>
+        ],
+        Storage0,
+        <<"10m">>
     ),
     ?assertMatch(
-        {ok, 200, #{}},
+        {ok, 200, #{
+            <<"storage">> :=
+                #{
+                    <<"local">> :=
+                        #{
+                            <<"segments">> :=
+                                #{
+                                    <<"gc">> :=
+                                        #{
+                                            <<"interval">> := <<"1h">>,
+                                            %% Match keep the raw conf
+                                            %% 10m is not change to 600,000
+                                            <<"maximum_segments_ttl">> := <<"10m">>,
+                                            <<"minimum_segments_ttl">> := <<"5m">>
+                                        }
+                                }
+                        }
+                }
+        }},
         request_json(
             put,
-            uri(["file_transfer"]),
+            Uri,
             #{
                 <<"enable">> => true,
-                <<"storage">> => emqx_ft_test_helpers:local_storage(Config)
+                <<"storage">> => Storage
             },
             Config
         )
@@ -304,7 +367,7 @@ t_configure(Config) ->
         {ok, 400, _},
         request(
             put,
-            uri(["file_transfer"]),
+            Uri,
             #{
                 <<"enable">> => true,
                 <<"storage">> => #{
@@ -319,7 +382,7 @@ t_configure(Config) ->
         {ok, 400, _},
         request(
             put,
-            uri(["file_transfer"]),
+            Uri,
             #{
                 <<"enable">> => true,
                 <<"storage">> => #{
@@ -335,36 +398,20 @@ t_configure(Config) ->
         <<"host">> => <<"localhost">>,
         <<"port">> => 9000,
         <<"bucket">> => <<"emqx">>,
+        <<"url_expire_time">> => <<"2h">>,
+        <<"secret_access_key">> => ?SECRET_ACCESS_KEY,
         <<"transport_options">> => #{
             <<"ssl">> => #{
                 <<"enable">> => true,
-                <<"certfile">> => emqx_ft_test_helpers:pem_privkey(),
-                <<"keyfile">> => emqx_ft_test_helpers:pem_privkey()
+                <<"certfile">> => Cert,
+                <<"keyfile">> => Key
             }
         }
     },
-    ?assertMatch(
-        {ok, 200, #{
-            <<"enable">> := true,
-            <<"storage">> := #{
-                <<"local">> := #{
-                    <<"exporter">> := #{
-                        <<"s3">> := #{
-                            <<"transport_options">> := #{
-                                <<"ssl">> := #{
-                                    <<"enable">> := true,
-                                    <<"certfile">> := <<"/", _CertFilepath/bytes>>,
-                                    <<"keyfile">> := <<"/", _KeyFilepath/bytes>>
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }},
+    {ok, 200, GetConfigJson} =
         request_json(
             put,
-            uri(["file_transfer"]),
+            Uri,
             #{
                 <<"enable">> => true,
                 <<"storage">> => #{
@@ -376,13 +423,36 @@ t_configure(Config) ->
                 }
             },
             Config
-        )
+        ),
+    ?assertMatch(
+        #{
+            <<"enable">> := true,
+            <<"storage">> := #{
+                <<"local">> := #{
+                    <<"exporter">> := #{
+                        <<"s3">> := #{
+                            <<"transport_options">> := #{
+                                <<"ssl">> := SSL = #{
+                                    <<"enable">> := true,
+                                    <<"certfile">> := <<"/", _CertFilepath/bytes>>,
+                                    <<"keyfile">> := <<"/", _KeyFilepath/bytes>>
+                                }
+                            },
+                            %% ensure 2h is unchanged
+                            <<"url_expire_time">> := <<"2h">>,
+                            <<"secret_access_key">> := <<"******">>
+                        }
+                    }
+                }
+            }
+        } when not is_map_key(<<"password">>, SSL),
+        GetConfigJson
     ),
     ?assertMatch(
         {ok, 400, _},
         request_json(
             put,
-            uri(["file_transfer"]),
+            Uri,
             #{
                 <<"enable">> => true,
                 <<"storage">> => #{
@@ -404,23 +474,47 @@ t_configure(Config) ->
         {ok, 200, #{}},
         request_json(
             put,
-            uri(["file_transfer"]),
-            #{
-                <<"enable">> => true,
-                <<"storage">> => #{
-                    <<"local">> => #{
-                        <<"exporter">> => #{
-                            <<"s3">> => emqx_utils_maps:deep_put(
-                                [<<"transport_options">>, <<"ssl">>, <<"enable">>],
-                                S3Exporter,
-                                false
-                            )
+            Uri,
+            emqx_utils_maps:deep_merge(
+                GetConfigJson,
+                #{
+                    <<"enable">> => true,
+                    <<"storage">> => #{
+                        <<"local">> => #{
+                            <<"exporter">> => #{
+                                <<"s3">> => emqx_utils_maps:deep_put(
+                                    [<<"transport_options">>, <<"ssl">>, <<"enable">>],
+                                    S3Exporter,
+                                    false
+                                )
+                            }
                         }
                     }
                 }
-            },
+            ),
             Config
         )
+    ),
+    %% put secret as ******, check the secret is unchanged
+    ?assertMatch(
+        #{
+            <<"storage">> :=
+                #{
+                    <<"local">> :=
+                        #{
+                            <<"enable">> := true,
+                            <<"exporter">> :=
+                                #{
+                                    <<"s3">> :=
+                                        #{
+                                            <<"enable">> := true,
+                                            <<"secret_access_key">> := ?SECRET_ACCESS_KEY
+                                        }
+                                }
+                        }
+                }
+        },
+        get_ft_config(Config)
     ),
     ok.
 
@@ -462,7 +556,12 @@ request_json(Method, Url, Config) ->
     request_json(Method, Url, [], Config).
 
 json(Body) when is_binary(Body) ->
-    emqx_utils_json:decode(Body, [return_maps]).
+    try
+        emqx_utils_json:decode(Body, [return_maps])
+    catch
+        _:_ ->
+            error({bad_json, Body})
+    end.
 
 query(Params) ->
     KVs = lists:map(fun({K, V}) -> uri_encode(K) ++ "=" ++ uri_encode(V) end, maps:to_list(Params)),
@@ -494,9 +593,20 @@ reset_ft_config(Config, Enable) ->
             <<"enable">> => Enable,
             <<"storage">> => #{
                 <<"local">> => #{
-                    <<"enable">> => true
+                    <<"enable">> => true,
+                    <<"segments">> => #{
+                        <<"gc">> => #{
+                            <<"interval">> => <<"1h">>,
+                            <<"maximum_segments_ttl">> => "24h",
+                            <<"minimum_segments_ttl">> => "5m"
+                        }
+                    }
                 }
             }
         },
     {ok, _} = rpc:call(Node, emqx_ft_conf, update, [LocalConfig]),
     ok.
+
+get_ft_config(Config) ->
+    [Node | _] = test_nodes(Config),
+    rpc:call(Node, emqx_ft_conf, get_raw, []).

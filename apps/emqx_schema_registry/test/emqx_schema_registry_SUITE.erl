@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_registry_SUITE).
 
@@ -14,8 +14,6 @@
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
--define(APPS, [emqx_conf, emqx_rule_engine, emqx_schema_registry]).
-
 %%------------------------------------------------------------------------------
 %% CT boilerplate
 %%------------------------------------------------------------------------------
@@ -23,14 +21,22 @@
 all() ->
     [
         {group, avro},
-        {group, protobuf}
-    ] ++ sparkplug_tests().
+        {group, protobuf},
+        {group, json}
+    ] ++ sparkplug_tests() ++ only_once_tcs().
 
 groups() ->
-    AllTCsExceptSP = emqx_common_test_helpers:all(?MODULE) -- sparkplug_tests(),
+    OnlyOnceTCs = only_once_tcs(),
+    AllTCsExceptSP = emqx_common_test_helpers:all(?MODULE) -- (sparkplug_tests() ++ OnlyOnceTCs),
     ProtobufOnlyTCs = protobuf_only_tcs(),
     TCs = AllTCsExceptSP -- ProtobufOnlyTCs,
-    [{avro, TCs}, {protobuf, AllTCsExceptSP}].
+    [{avro, TCs}, {json, TCs}, {protobuf, AllTCsExceptSP}].
+
+only_once_tcs() ->
+    [
+        t_import_config,
+        t_external_registry_load_config
+    ].
 
 protobuf_only_tcs() ->
     [
@@ -42,20 +48,34 @@ sparkplug_tests() ->
     [
         t_sparkplug_decode,
         t_sparkplug_encode,
-        t_sparkplug_decode_encode_with_message_name
+        t_sparkplug_decode_encode_with_message_name,
+        t_sparkplug_encode_float_to_uint64_key,
+        t_decode_fail
     ].
 
 init_per_suite(Config) ->
-    emqx_config:save_schema_mod_and_names(emqx_schema_registry_schema),
-    emqx_mgmt_api_test_util:init_suite(?APPS),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine,
+            emqx_schema_registry,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(lists:reverse(?APPS)),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_group(avro, Config) ->
     [{serde_type, avro} | Config];
+init_per_group(json, Config) ->
+    [{serde_type, json} | Config];
 init_per_group(protobuf, Config) ->
     [{serde_type, protobuf} | Config];
 init_per_group(_Group, Config) ->
@@ -72,6 +92,7 @@ end_per_testcase(_TestCase, _Config) ->
     ok = snabbkaffe:stop(),
     emqx_common_test_helpers:call_janitor(),
     clear_schemas(),
+    clear_external_registries(),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -130,6 +151,8 @@ create_rule_http(RuleParams, Overrides) ->
 schema_params(avro) ->
     Source = #{
         type => record,
+        name => <<"test">>,
+        namespace => <<"emqx.com">>,
         fields => [
             #{name => <<"i">>, type => <<"int">>},
             #{name => <<"s">>, type => <<"string">>}
@@ -137,6 +160,18 @@ schema_params(avro) ->
     },
     SourceBin = emqx_utils_json:encode(Source),
     #{type => avro, source => SourceBin};
+schema_params(json) ->
+    Source =
+        #{
+            type => object,
+            properties => #{
+                i => #{type => integer},
+                s => #{type => string}
+            },
+            required => [<<"i">>, <<"s">>]
+        },
+    SourceBin = emqx_utils_json:encode(Source),
+    #{type => json, source => SourceBin};
 schema_params(protobuf) ->
     SourceBin =
         <<
@@ -159,7 +194,7 @@ create_serde(SerdeType, SerdeName) ->
     ok = emqx_schema_registry:add_schema(SerdeName, Schema),
     ok.
 
-test_params_for(avro, encode_decode1) ->
+test_params_for(Type, encode_decode1) when Type =:= avro; Type =:= json ->
     SQL =
         <<
             "select\n"
@@ -183,7 +218,7 @@ test_params_for(avro, encode_decode1) ->
         expected_rule_output => ExpectedRuleOutput,
         extra_args => ExtraArgs
     };
-test_params_for(avro, encode1) ->
+test_params_for(Type, encode1) when Type =:= avro; Type =:= json ->
     SQL =
         <<
             "select\n"
@@ -199,7 +234,7 @@ test_params_for(avro, encode1) ->
         payload_template => PayloadTemplate,
         extra_args => ExtraArgs
     };
-test_params_for(avro, decode1) ->
+test_params_for(Type, decode1) when Type =:= avro; Type =:= json ->
     SQL =
         <<
             "select\n"
@@ -318,6 +353,14 @@ clear_schemas() ->
         emqx_schema_registry:list_schemas()
     ).
 
+clear_external_registries() ->
+    maps:foreach(
+        fun(Name, _Schema) ->
+            ok = emqx_schema_registry_config:delete_external_registry(Name)
+        end,
+        emqx_schema_registry_config:list_external_registries()
+    ).
+
 receive_action_results() ->
     receive
         {action, #{data := _} = Res} ->
@@ -345,62 +388,6 @@ receive_published(Line) ->
         ct:fail("publish not received, line ~b", [Line])
     end.
 
-cluster(Config) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    PeerModule =
-        case os:getenv("IS_CI") of
-            false ->
-                slave;
-            _ ->
-                ct_slave
-        end,
-    Cluster = emqx_common_test_helpers:emqx_cluster(
-        [core, core],
-        [
-            {apps, ?APPS},
-            {listener_ports, []},
-            {peer_mod, PeerModule},
-            {priv_data_dir, PrivDataDir},
-            {load_schema, true},
-            {start_autocluster, true},
-            {schema_mod, emqx_enterprise_schema},
-            {load_apps, [emqx_machine]},
-            {env_handler, fun
-                (emqx) ->
-                    application:set_env(emqx, boot_modules, [broker, router]),
-                    ok;
-                (emqx_conf) ->
-                    ok;
-                (_) ->
-                    ok
-            end}
-        ]
-    ),
-    ct:pal("cluster:\n  ~p", [Cluster]),
-    Cluster.
-
-start_cluster(Cluster) ->
-    Nodes = [
-        emqx_common_test_helpers:start_slave(Name, Opts)
-     || {Name, Opts} <- Cluster
-    ],
-    NumNodes = length(Nodes),
-    on_exit(fun() ->
-        emqx_utils:pmap(
-            fun(N) ->
-                ct:pal("stopping ~p", [N]),
-                ok = emqx_common_test_helpers:stop_slave(N)
-            end,
-            Nodes
-        )
-    end),
-    {ok, _} = snabbkaffe:block_until(
-        %% -1 because only those that join the first node will emit the event.
-        ?match_n_events(NumNodes - 1, #{?snk_kind := emqx_machine_boot_apps_started}),
-        30_000
-    ),
-    Nodes.
-
 wait_for_cluster_rpc(Node) ->
     %% need to wait until the config handler is ready after
     %% restarting during the cluster join.
@@ -409,16 +396,6 @@ wait_for_cluster_rpc(Node) ->
         _Attempts0 = 50,
         true = is_pid(erpc:call(Node, erlang, whereis, [emqx_config_handler]))
     ).
-
-serde_deletion_calls_destructor_spec(#{serde_type := SerdeType}, Trace) ->
-    ?assert(
-        ?strict_causality(
-            #{?snk_kind := will_delete_schema},
-            #{?snk_kind := serde_destroyed, type := SerdeType},
-            Trace
-        )
-    ),
-    ok.
 
 protobuf_unique_cache_hit_spec(#{serde_type := protobuf} = Res, Trace) ->
     #{nodes := Nodes} = Res,
@@ -518,13 +495,35 @@ t_encode(Config) ->
     PayloadBin = emqx_utils_json:encode(Payload),
     emqx:publish(emqx_message:make(<<"t">>, PayloadBin)),
     Published = receive_published(?LINE),
-    ?assertMatch(
-        #{payload := P} when is_binary(P),
-        Published
+    case SerdeType of
+        json ->
+            %% should have received binary
+            %% but since it's valid json, so it got
+            %% 'safe_decode' decoded in receive_published
+            ?assertMatch(#{payload := #{<<"i">> := _, <<"s">> := _}}, Published);
+        _ ->
+            ?assertMatch(#{payload := B} when is_binary(B), Published),
+            #{payload := Encoded} = Published,
+            {ok, Serde} = emqx_schema_registry:get_serde(SerdeName),
+            ?assertEqual(Payload, eval_decode(Serde, [Encoded | ExtraArgs]))
+    end,
+    ok.
+
+t_decode_fail(_Config) ->
+    SerdeName = my_serde,
+    SerdeType = protobuf,
+    ok = create_serde(SerdeType, SerdeName),
+    Payload = <<"ss">>,
+    ?assertThrow(
+        {schema_decode_error, #{
+            data := <<"ss">>,
+            error_type := decoding_failure,
+            explain := _,
+            message_type := 'Person',
+            schema_name := <<"my_serde">>
+        }},
+        emqx_rule_funcs:schema_decode(<<"my_serde">>, Payload, <<"Person">>)
     ),
-    #{payload := Encoded} = Published,
-    {ok, #{deserializer := Deserializer}} = emqx_schema_registry:get_serde(SerdeName),
-    ?assertEqual(Payload, apply(Deserializer, [Encoded | ExtraArgs])),
     ok.
 
 t_decode(Config) ->
@@ -537,8 +536,8 @@ t_decode(Config) ->
         extra_args := ExtraArgs
     } = test_params_for(SerdeType, decode1),
     {ok, _} = create_rule_http(#{sql => SQL}),
-    {ok, #{serializer := Serializer}} = emqx_schema_registry:get_serde(SerdeName),
-    EncodedBin = apply(Serializer, [Payload | ExtraArgs]),
+    {ok, Serde} = emqx_schema_registry:get_serde(SerdeName),
+    EncodedBin = eval_encode(Serde, [Payload | ExtraArgs]),
     emqx:publish(emqx_message:make(<<"t">>, EncodedBin)),
     Published = receive_published(?LINE),
     ?assertMatch(
@@ -560,9 +559,9 @@ t_protobuf_union_encode(Config) ->
         extra_args := ExtraArgs
     } = test_params_for(SerdeType, union1),
     {ok, _} = create_rule_http(#{sql => SQL}),
-    {ok, #{serializer := Serializer}} = emqx_schema_registry:get_serde(SerdeName),
+    {ok, Serde} = emqx_schema_registry:get_serde(SerdeName),
 
-    EncodedBinA = apply(Serializer, [PayloadA | ExtraArgs]),
+    EncodedBinA = eval_encode(Serde, [PayloadA | ExtraArgs]),
     emqx:publish(emqx_message:make(<<"t">>, EncodedBinA)),
     PublishedA = receive_published(?LINE),
     ?assertMatch(
@@ -572,7 +571,7 @@ t_protobuf_union_encode(Config) ->
     #{payload := #{<<"decoded">> := DecodedA}} = PublishedA,
     ?assertEqual(PayloadA, DecodedA),
 
-    EncodedBinB = apply(Serializer, [PayloadB | ExtraArgs]),
+    EncodedBinB = eval_encode(Serde, [PayloadB | ExtraArgs]),
     emqx:publish(emqx_message:make(<<"t">>, EncodedBinB)),
     PublishedB = receive_published(?LINE),
     ?assertMatch(
@@ -595,7 +594,7 @@ t_protobuf_union_decode(Config) ->
         extra_args := ExtraArgs
     } = test_params_for(SerdeType, union2),
     {ok, _} = create_rule_http(#{sql => SQL}),
-    {ok, #{deserializer := Deserializer}} = emqx_schema_registry:get_serde(SerdeName),
+    {ok, Serde} = emqx_schema_registry:get_serde(SerdeName),
 
     EncodedBinA = emqx_utils_json:encode(PayloadA),
     emqx:publish(emqx_message:make(<<"t">>, EncodedBinA)),
@@ -605,7 +604,7 @@ t_protobuf_union_decode(Config) ->
         PublishedA
     ),
     #{payload := #{<<"encoded">> := EncodedA}} = PublishedA,
-    ?assertEqual(PayloadA, apply(Deserializer, [EncodedA | ExtraArgs])),
+    ?assertEqual(PayloadA, eval_decode(Serde, [EncodedA | ExtraArgs])),
 
     EncodedBinB = emqx_utils_json:encode(PayloadB),
     emqx:publish(emqx_message:make(<<"t">>, EncodedBinB)),
@@ -615,15 +614,20 @@ t_protobuf_union_decode(Config) ->
         PublishedB
     ),
     #{payload := #{<<"encoded">> := EncodedB}} = PublishedB,
-    ?assertEqual(PayloadB, apply(Deserializer, [EncodedB | ExtraArgs])),
+    ?assertEqual(PayloadB, eval_decode(Serde, [EncodedB | ExtraArgs])),
 
     ok.
 
 t_fail_rollback(Config) ->
     SerdeType = ?config(serde_type, Config),
     OkSchema = emqx_utils_maps:binary_key_map(schema_params(SerdeType)),
-    BrokenSchema = OkSchema#{<<"source">> := <<"{}">>},
-
+    BrokenSchema =
+        case SerdeType of
+            json ->
+                OkSchema#{<<"source">> := <<"not a json value">>};
+            _ ->
+                OkSchema#{<<"source">> := <<"{}">>}
+        end,
     ?assertMatch(
         {ok, _},
         emqx_conf:update(
@@ -640,14 +644,22 @@ t_fail_rollback(Config) ->
             #{}
         )
     ),
-    ?assertMatch({ok, #{name := <<"a">>}}, emqx_schema_registry:get_serde(<<"a">>)),
+    ?assertMatch({ok, #serde{name = <<"a">>}}, emqx_schema_registry:get_serde(<<"a">>)),
     %% no z serdes should be in the table
     ?assertEqual({error, not_found}, emqx_schema_registry:get_serde(<<"z">>)),
     ok.
 
 t_cluster_serde_build(Config) ->
     SerdeType = ?config(serde_type, Config),
-    Cluster = cluster(Config),
+    AppSpecs = [
+        emqx_conf,
+        emqx_rule_engine,
+        emqx_schema_registry
+    ],
+    ClusterSpec = [
+        {cluster_serde_build1, #{apps => AppSpecs}},
+        {cluster_serde_build2, #{apps => AppSpecs}}
+    ],
     SerdeName = my_serde,
     Schema = schema_params(SerdeType),
     #{
@@ -656,9 +668,13 @@ t_cluster_serde_build(Config) ->
     } = test_params_for(SerdeType, encode_decode1),
     ?check_trace(
         begin
-            Nodes = [N1, N2 | _] = start_cluster(Cluster),
+            Nodes =
+                [N1, N2 | _] = emqx_cth_cluster:start(
+                    ClusterSpec,
+                    #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+                ),
+            on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
             NumNodes = length(Nodes),
-            wait_for_cluster_rpc(N2),
             ?assertMatch(
                 ok,
                 erpc:call(N2, emqx_schema_registry, add_schema, [SerdeName, Schema])
@@ -666,16 +682,13 @@ t_cluster_serde_build(Config) ->
             %% check that we can serialize/deserialize in all nodes
             lists:foreach(
                 fun(N) ->
-                    erpc:call(N, fun() ->
+                    ok = erpc:call(N, fun() ->
                         Res0 = emqx_schema_registry:get_serde(SerdeName),
-                        ?assertMatch({ok, #{}}, Res0, #{node => N}),
-                        {ok, #{serializer := Serializer, deserializer := Deserializer}} = Res0,
+                        ?assertMatch({ok, #serde{}}, Res0, #{node => N}),
+                        {ok, Serde} = Res0,
                         ?assertEqual(
                             Payload,
-                            apply(
-                                Deserializer,
-                                [apply(Serializer, [Payload | ExtraArgs]) | ExtraArgs]
-                            ),
+                            encode_then_decode(Serde, Payload, ExtraArgs),
                             #{node => N}
                         ),
                         ok
@@ -683,8 +696,6 @@ t_cluster_serde_build(Config) ->
                 end,
                 Nodes
             ),
-            %% now we delete and check it's removed from the table
-            ?tp(will_delete_schema, #{}),
             {ok, SRef1} = snabbkaffe:subscribe(
                 ?match_event(#{?snk_kind := schema_registry_serdes_deleted}),
                 NumNodes,
@@ -694,7 +705,9 @@ t_cluster_serde_build(Config) ->
                 ok,
                 erpc:call(N1, emqx_schema_registry, delete_schema, [SerdeName])
             ),
-            {ok, _} = snabbkaffe:receive_events(SRef1),
+            {ok, DeleteEvents} = snabbkaffe:receive_events(SRef1),
+            %% expect all nodes to delete (local) serdes
+            ?assertEqual(NumNodes, length(DeleteEvents)),
             lists:foreach(
                 fun(N) ->
                     erpc:call(N, fun() ->
@@ -711,10 +724,97 @@ t_cluster_serde_build(Config) ->
             #{serde_type => SerdeType, nodes => Nodes}
         end,
         [
-            {"destructor is always called", fun ?MODULE:serde_deletion_calls_destructor_spec/2},
             {"protobuf is only built on one node", fun ?MODULE:protobuf_unique_cache_hit_spec/2}
         ]
     ),
+    ok.
+
+%% Verifies that importing in both `merge' and `replace' modes work with external
+%% registries, when importing configurations from the CLI interface.
+t_external_registry_load_config(_Config) ->
+    %% Existing config
+    Name0 = <<"preexisting">>,
+    Config0 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(),
+    {201, _} = emqx_schema_registry_http_api_SUITE:create_external_registry(Config0#{
+        <<"name">> => Name0
+    }),
+    [_] = emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name0),
+
+    %% Config to load
+    %% Will update existing config
+    Name1 = Name0,
+    URL1 = <<"http://new_url:8081">>,
+    Config1 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL1
+    }),
+    %% New config
+    Name2 = <<"new">>,
+    URL2 = <<"http://yet_another_url:8081">>,
+    Config2 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL2
+    }),
+    ConfigToLoad1 = #{
+        <<"schema_registry">> => #{
+            <<"external">> => #{
+                Name1 => Config1,
+                Name2 => Config2
+            }
+        }
+    },
+    ConfigToLoad1Bin = iolist_to_binary(hocon_pp:do(ConfigToLoad1, #{})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(ConfigToLoad1Bin, #{mode => merge})),
+
+    Path = [schema_registry, external],
+    PathBin = [emqx_utils_conv:bin(PS) || PS <- Path],
+    Name1Atom = binary_to_atom(Name1),
+    Name2Atom = binary_to_atom(Name2),
+    ?assertMatch(
+        #{
+            Name1 := #{<<"url">> := URL1},
+            Name2 := #{<<"url">> := URL2}
+        },
+        emqx_config:get_raw(PathBin)
+    ),
+    ?assertMatch(
+        #{
+            Name1Atom := #{url := URL1},
+            Name2Atom := #{url := URL2}
+        },
+        emqx_config:get(Path)
+    ),
+    %% Correctly starts new processes
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name1)),
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name2)),
+
+    %% New config; will replace everything
+    Name3 = Name0,
+    URL3 = <<"http://final_url:8081">>,
+    Config3 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL3
+    }),
+    ConfigToLoad2 = #{
+        <<"schema_registry">> => #{
+            <<"external">> => #{
+                Name3 => Config3
+            }
+        }
+    },
+    ConfigToLoad2Bin = iolist_to_binary(hocon_pp:do(ConfigToLoad2, #{})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(ConfigToLoad2Bin, #{mode => replace})),
+
+    Name3Atom = binary_to_atom(Name3),
+    ?assertMatch(
+        #{Name3 := #{<<"url">> := URL3}},
+        emqx_config:get_raw(PathBin)
+    ),
+    ?assertMatch(
+        #{Name3Atom := #{url := URL3}},
+        emqx_config:get(Path)
+    ),
+    %% Correctly stops old processes
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name3)),
+    ?assertMatch([], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name2)),
+
     ok.
 
 t_import_config(_Config) ->
@@ -730,6 +830,8 @@ t_import_config(_Config) ->
                                     emqx_utils_json:encode(
                                         #{
                                             type => <<"record">>,
+                                            name => <<"ct">>,
+                                            namespace => <<"emqx.com">>,
                                             fields => [
                                                 #{type => <<"int">>, name => <<"i">>},
                                                 #{type => <<"string">>, name => <<"s">>}
@@ -746,14 +848,14 @@ t_import_config(_Config) ->
         RawConf,
         <<"Updated description">>
     ),
-    Path = [schema_registry, schemas, <<"my_avro_schema">>],
+    Path = [schema_registry, schemas, my_avro_schema],
     ?assertEqual(
-        {ok, #{root_key => schema_registry, changed => []}},
-        emqx_schema_registry:import_config(RawConf)
+        {ok, #{root_key => schema_registry, changed => [Path]}},
+        emqx_schema_registry_config:import_config(RawConf)
     ),
     ?assertEqual(
         {ok, #{root_key => schema_registry, changed => [Path]}},
-        emqx_schema_registry:import_config(RawConf1)
+        emqx_schema_registry_config:import_config(RawConf1)
     ).
 
 sparkplug_example_data_base64() ->
@@ -847,6 +949,18 @@ t_sparkplug_encode(_Config) ->
     ?assertMatch(#{data := ExpectedRuleOutput}, Res),
     ok.
 
+t_sparkplug_encode_float_to_uint64_key(_Config) ->
+    %% Test that the following bug is fixed:
+    %% https://emqx.atlassian.net/browse/EMQX-10775
+    %% When one assign a float value to a uint64 key, one should get a
+    %% gpb_type_error and not a badarith error
+    wait_for_sparkplug_schema_registered(),
+    ?assertException(
+        error,
+        {gpb_type_error, _},
+        emqx_rule_funcs:sparkplug_encode(#{<<"seq">> => 1.5})
+    ).
+
 t_sparkplug_decode_encode_with_message_name(_Config) ->
     SQL =
         <<
@@ -864,3 +978,13 @@ t_sparkplug_decode_encode_with_message_name(_Config) ->
     Res = receive_action_results(),
     ?assertMatch(#{data := ExpectedRuleOutput}, Res),
     ok.
+
+eval_encode(Serde, Args) ->
+    emqx_schema_registry_serde:eval_encode(Serde, Args).
+
+eval_decode(Serde, Args) ->
+    emqx_schema_registry_serde:eval_decode(Serde, Args).
+
+encode_then_decode(Serde, Payload, ExtraArgs) ->
+    Encoded = eval_encode(Serde, [Payload | ExtraArgs]),
+    eval_decode(Serde, [Encoded | ExtraArgs]).

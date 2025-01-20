@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -33,14 +33,8 @@
     desc/1,
     types/0,
     short_paths/0,
-    calc_capacity/1,
-    extract_with_type/2,
-    default_client_config/0,
-    default_bucket_config/0,
-    short_paths_fields/1,
-    get_listener_opts/1,
-    get_node_opts/1,
-    convert_node_opts/1
+    short_paths_fields/0,
+    rate_type/0
 ]).
 
 -define(KILOBYTE, 1024).
@@ -110,11 +104,11 @@ roots() ->
     ].
 
 fields(limiter) ->
-    short_paths_fields(?MODULE, ?IMPORTANCE_HIDDEN) ++
+    short_paths_fields(?IMPORTANCE_HIDDEN) ++
         [
             {Type,
                 ?HOCON(?R_REF(node_opts), #{
-                    desc => ?DESC(Type),
+                    desc => deprecated_desc(Type),
                     importance => ?IMPORTANCE_HIDDEN,
                     required => {false, recursively},
                     aliases => alias_of_type(Type)
@@ -127,7 +121,7 @@ fields(limiter) ->
                 ?HOCON(
                     ?R_REF(client_fields),
                     #{
-                        desc => ?DESC(client),
+                        desc => deprecated_desc(client),
                         importance => ?IMPORTANCE_HIDDEN,
                         required => {false, recursively},
                         deprecated => {since, "5.0.25"}
@@ -136,10 +130,10 @@ fields(limiter) ->
         ];
 fields(node_opts) ->
     [
-        {rate, ?HOCON(rate(), #{desc => ?DESC(rate), default => <<"infinity">>})},
+        {rate, ?HOCON(rate_type(), #{desc => deprecated_desc(rate), default => <<"infinity">>})},
         {burst,
-            ?HOCON(burst_rate(), #{
-                desc => ?DESC(burst),
+            ?HOCON(burst_rate_type(), #{
+                desc => deprecated_desc(burst),
                 default => <<"0">>
             })}
     ];
@@ -149,11 +143,12 @@ fields(bucket_opts) ->
     fields_of_bucket(<<"infinity">>);
 fields(client_opts) ->
     [
-        {rate, ?HOCON(rate(), #{default => <<"infinity">>, desc => ?DESC(rate)})},
+        {rate, ?HOCON(rate_type(), #{default => <<"infinity">>, desc => deprecated_desc(rate)})},
         {initial,
             ?HOCON(initial(), #{
                 default => <<"0">>,
-                desc => ?DESC(initial),
+
+                desc => deprecated_desc(initial),
                 importance => ?IMPORTANCE_HIDDEN
             })},
         %% low_watermark add for emqx_channel and emqx_session
@@ -164,14 +159,14 @@ fields(client_opts) ->
             ?HOCON(
                 initial(),
                 #{
-                    desc => ?DESC(low_watermark),
+                    desc => deprecated_desc(low_watermark),
                     default => <<"0">>,
                     importance => ?IMPORTANCE_HIDDEN
                 }
             )},
         {burst,
-            ?HOCON(burst(), #{
-                desc => ?DESC(burst),
+            ?HOCON(burst_type(), #{
+                desc => deprecated_desc(burst),
                 default => <<"0">>,
                 importance => ?IMPORTANCE_HIDDEN,
                 aliases => [capacity]
@@ -180,7 +175,7 @@ fields(client_opts) ->
             ?HOCON(
                 boolean(),
                 #{
-                    desc => ?DESC(divisible),
+                    desc => deprecated_desc(divisible),
                     default => true,
                     importance => ?IMPORTANCE_HIDDEN
                 }
@@ -189,7 +184,7 @@ fields(client_opts) ->
             ?HOCON(
                 emqx_schema:timeout_duration(),
                 #{
-                    desc => ?DESC(max_retry_time),
+                    desc => deprecated_desc(max_retry_time),
                     default => <<"1h">>,
                     importance => ?IMPORTANCE_HIDDEN
                 }
@@ -198,7 +193,7 @@ fields(client_opts) ->
             ?HOCON(
                 failure_strategy(),
                 #{
-                    desc => ?DESC(failure_strategy),
+                    desc => deprecated_desc(failure_strategy),
                     default => force,
                     importance => ?IMPORTANCE_HIDDEN
                 }
@@ -211,21 +206,34 @@ fields(listener_client_fields) ->
 fields(Type) ->
     simple_bucket_field(Type).
 
-short_paths_fields(DesModule) ->
-    short_paths_fields(DesModule, ?DEFAULT_IMPORTANCE).
+short_paths_fields() ->
+    short_paths_fields(?DEFAULT_IMPORTANCE).
 
-short_paths_fields(DesModule, Importance) ->
+short_paths_fields(Importance) ->
     [
         {Name,
-            ?HOCON(rate(), #{
-                desc => ?DESC(DesModule, Name),
-                required => false,
-                importance => Importance,
-                example => Example
-            })}
+            ?HOCON(
+                rate_type(),
+                maps:merge(
+                    #{
+                        desc => ?DESC(Name),
+                        required => false,
+                        importance => Importance,
+                        example => Example
+                    },
+                    short_paths_fields_extra(Name)
+                )
+            )}
      || {Name, Example} <-
             lists:zip(short_paths(), [<<"1000/s">>, <<"1000/s">>, <<"100MB/s">>])
     ].
+
+short_paths_fields_extra(max_conn_rate) ->
+    #{
+        default => infinity
+    };
+short_paths_fields_extra(_Name) ->
+    #{}.
 
 desc(limiter) ->
     "Settings for the rate limiter.";
@@ -262,80 +270,6 @@ types() ->
 
 short_paths() ->
     [max_conn_rate, messages_rate, bytes_rate].
-
-calc_capacity(#{rate := infinity}) ->
-    infinity;
-calc_capacity(#{rate := Rate, burst := Burst}) ->
-    erlang:floor(1000 * Rate / default_period()) + Burst.
-
-extract_with_type(_Type, undefined) ->
-    undefined;
-extract_with_type(Type, #{client := ClientCfg} = BucketCfg) ->
-    BucketVal = maps:find(Type, BucketCfg),
-    ClientVal = maps:find(Type, ClientCfg),
-    merge_client_bucket(Type, ClientVal, BucketVal);
-extract_with_type(Type, BucketCfg) ->
-    BucketVal = maps:find(Type, BucketCfg),
-    merge_client_bucket(Type, undefined, BucketVal).
-
-%% Since the client configuration can be absent and be a undefined value,
-%% but we must need some basic settings to control the behaviour of the limiter,
-%% so here add this helper function to generate a default setting.
-%% This is a temporary workaround until we found a better way to simplify.
-default_client_config() ->
-    #{
-        rate => infinity,
-        initial => 0,
-        low_watermark => 0,
-        burst => 0,
-        divisible => true,
-        max_retry_time => timer:hours(1),
-        failure_strategy => force
-    }.
-
-default_bucket_config() ->
-    #{
-        rate => infinity,
-        burst => 0,
-        initial => 0
-    }.
-
-get_listener_opts(Conf) ->
-    Limiter = maps:get(limiter, Conf, undefined),
-    ShortPaths = maps:with(short_paths(), Conf),
-    get_listener_opts(Limiter, ShortPaths).
-
-get_node_opts(Type) ->
-    Opts = emqx:get_config([limiter, Type], default_bucket_config()),
-    case type_to_short_path_name(Type) of
-        undefined ->
-            Opts;
-        Name ->
-            case emqx:get_config([limiter, Name], undefined) of
-                undefined ->
-                    Opts;
-                Rate ->
-                    Opts#{rate := Rate}
-            end
-    end.
-
-convert_node_opts(Conf) ->
-    DefBucket = default_bucket_config(),
-    ShorPaths = short_paths(),
-    Fun = fun
-        %% The `client` in the node options was deprecated
-        (client, _Value, Acc) ->
-            Acc;
-        (Name, Value, Acc) ->
-            case lists:member(Name, ShorPaths) of
-                true ->
-                    Type = short_path_name_to_type(Name),
-                    Acc#{Type => DefBucket#{rate => Value}};
-                _ ->
-                    Acc#{Name => Value}
-            end
-    end,
-    maps:fold(Fun, #{}, Conf).
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -435,7 +369,7 @@ to_quota(Str, Regex) ->
             {match, [Quota, Unit]} ->
                 Val = erlang:list_to_integer(Quota),
                 Unit2 = string:to_lower(Unit),
-                {ok, apply_unit(Unit2, Val)};
+                apply_unit(Unit2, Val);
             {match, [Quota, ""]} ->
                 {ok, erlang:list_to_integer(Quota)};
             {match, ""} ->
@@ -448,11 +382,11 @@ to_quota(Str, Regex) ->
             {error, Error}
     end.
 
-apply_unit("", Val) -> Val;
-apply_unit("kb", Val) -> Val * ?KILOBYTE;
-apply_unit("mb", Val) -> Val * ?KILOBYTE * ?KILOBYTE;
-apply_unit("gb", Val) -> Val * ?KILOBYTE * ?KILOBYTE * ?KILOBYTE;
-apply_unit(Unit, _) -> throw("invalid unit:" ++ Unit).
+apply_unit("", Val) -> {ok, Val};
+apply_unit("kb", Val) -> {ok, Val * ?KILOBYTE};
+apply_unit("mb", Val) -> {ok, Val * ?KILOBYTE * ?KILOBYTE};
+apply_unit("gb", Val) -> {ok, Val * ?KILOBYTE * ?KILOBYTE * ?KILOBYTE};
+apply_unit(Unit, _) -> {error, "invalid unit:" ++ Unit}.
 
 %% A bucket with only one type
 simple_bucket_field(Type) when is_atom(Type) ->
@@ -462,7 +396,7 @@ simple_bucket_field(Type) when is_atom(Type) ->
                 ?HOCON(
                     ?R_REF(?MODULE, client_opts),
                     #{
-                        desc => ?DESC(client),
+                        desc => deprecated_desc(client),
                         required => {false, recursively},
                         importance => importance_of_type(Type),
                         aliases => alias_of_type(Type)
@@ -475,7 +409,7 @@ composite_bucket_fields(Types, ClientRef) ->
     [
         {Type,
             ?HOCON(?R_REF(?MODULE, bucket_opts), #{
-                desc => ?DESC(?MODULE, Type),
+                desc => deprecated_desc(Type),
                 required => {false, recursively},
                 importance => importance_of_type(Type),
                 aliases => alias_of_type(Type)
@@ -487,7 +421,7 @@ composite_bucket_fields(Types, ClientRef) ->
                 ?HOCON(
                     ?R_REF(?MODULE, ClientRef),
                     #{
-                        desc => ?DESC(client),
+                        desc => deprecated_desc(client),
                         required => {false, recursively}
                     }
                 )}
@@ -495,10 +429,10 @@ composite_bucket_fields(Types, ClientRef) ->
 
 fields_of_bucket(Default) ->
     [
-        {rate, ?HOCON(rate(), #{desc => ?DESC(rate), default => Default})},
+        {rate, ?HOCON(rate_type(), #{desc => deprecated_desc(rate), default => Default})},
         {burst,
             ?HOCON(burst(), #{
-                desc => ?DESC(burst),
+                desc => deprecated_desc(burst),
                 default => <<"0">>,
                 importance => ?IMPORTANCE_HIDDEN,
                 aliases => [capacity]
@@ -506,7 +440,7 @@ fields_of_bucket(Default) ->
         {initial,
             ?HOCON(initial(), #{
                 default => <<"0">>,
-                desc => ?DESC(initial),
+                desc => deprecated_desc(initial),
                 importance => ?IMPORTANCE_HIDDEN
             })}
     ].
@@ -515,7 +449,7 @@ client_fields(Types) ->
     [
         {Type,
             ?HOCON(?R_REF(client_opts), #{
-                desc => ?DESC(Type),
+                desc => deprecated_desc(Type),
                 required => false,
                 importance => importance_of_type(Type),
                 aliases => alias_of_type(Type)
@@ -539,50 +473,14 @@ alias_of_type(bytes) ->
 alias_of_type(_) ->
     [].
 
-merge_client_bucket(Type, {ok, ClientVal}, {ok, BucketVal}) ->
-    #{Type => BucketVal, client => #{Type => ClientVal}};
-merge_client_bucket(Type, {ok, ClientVal}, _) ->
-    #{client => #{Type => ClientVal}};
-merge_client_bucket(Type, _, {ok, BucketVal}) ->
-    #{Type => BucketVal};
-merge_client_bucket(_, _, _) ->
-    undefined.
+deprecated_desc(_Field) ->
+    <<"Deprecated since v5.0.25">>.
 
-short_path_name_to_type(max_conn_rate) ->
-    connection;
-short_path_name_to_type(messages_rate) ->
-    messages;
-short_path_name_to_type(bytes_rate) ->
-    bytes.
+rate_type() ->
+    typerefl:alias("string", rate()).
 
-type_to_short_path_name(connection) ->
-    max_conn_rate;
-type_to_short_path_name(messages) ->
-    messages_rate;
-type_to_short_path_name(bytes) ->
-    bytes_rate;
-type_to_short_path_name(_) ->
-    undefined.
+burst_type() ->
+    typerefl:alias("string", burst()).
 
-get_listener_opts(Limiter, ShortPaths) when map_size(ShortPaths) =:= 0 ->
-    Limiter;
-get_listener_opts(undefined, ShortPaths) ->
-    convert_listener_short_paths(ShortPaths);
-get_listener_opts(Limiter, ShortPaths) ->
-    Shorts = convert_listener_short_paths(ShortPaths),
-    emqx_utils_maps:deep_merge(Limiter, Shorts).
-
-convert_listener_short_paths(ShortPaths) ->
-    DefBucket = default_bucket_config(),
-    DefClient = default_client_config(),
-    Fun = fun(Name, Rate, Acc) ->
-        Type = short_path_name_to_type(Name),
-        case Name of
-            max_conn_rate ->
-                Acc#{Type => DefBucket#{rate => Rate}};
-            _ ->
-                Client = maps:get(client, Acc, #{}),
-                Acc#{client => Client#{Type => DefClient#{rate => Rate}}}
-        end
-    end,
-    maps:fold(Fun, #{}, ShortPaths).
+burst_rate_type() ->
+    typerefl:alias("string", burst_rate()).

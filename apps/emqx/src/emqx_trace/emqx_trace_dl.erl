@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -53,6 +53,7 @@ update(Name, Enable) ->
 insert_new_trace(Trace) ->
     case mnesia:read(?TRACE, Trace#?TRACE.name) of
         [] ->
+            %% allow one new trace for each filter in the same second
             #?TRACE{start_at = StartAt, type = Type, filter = Filter} = Trace,
             Match = #?TRACE{_ = '_', start_at = StartAt, type = Type, filter = Filter},
             case mnesia:match_object(?TRACE, Match, read) of

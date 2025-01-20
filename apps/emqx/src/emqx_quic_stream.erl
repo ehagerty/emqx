@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,13 +32,16 @@
     wait/1,
     getstat/2,
     fast_close/1,
+    shutdown/2,
+    shutdown/3,
     ensure_ok_or_exit/2,
-    async_send/3,
+    send/2,
     setopts/2,
     getopts/2,
     peername/1,
     sockname/1,
-    peercert/1
+    peercert/1,
+    peersni/1
 ]).
 -include_lib("quicer/include/quicer.hrl").
 -include_lib("emqx/include/emqx_quic.hrl").
@@ -60,7 +63,7 @@
 
 -export_type([socket/0]).
 
--opaque socket() :: {quic, connection_handle(), stream_handle(), socket_info()}.
+-type socket() :: {quic, connection_handle(), stream_handle(), socket_info()}.
 
 -type socket_info() :: #{
     is_orphan => boolean(),
@@ -105,6 +108,10 @@ peercert(_S) ->
     %% @todo but unsupported by msquic
     nossl.
 
+peersni(_S) ->
+    %% @todo
+    undefined.
+
 getstat({quic, Conn, _Stream, _Info}, Stats) ->
     case quicer:getstat(Conn, Stats) of
         {error, _} -> {error, closed};
@@ -139,13 +146,20 @@ fast_close({ConnOwner, Conn, _ConnInfo}) when is_pid(ConnOwner) ->
     _ = quicer:async_shutdown_connection(Conn, ?QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0),
     ok;
 fast_close({quic, _Conn, Stream, _Info}) ->
-    %% Force flush
-    _ = quicer:async_shutdown_stream(Stream),
+    %% Force flush, cutoff time 3s
+    _ = quicer:shutdown_stream(Stream, 3000),
     %% @FIXME Since we shutdown the control stream, we shutdown the connection as well
     %% *BUT* Msquic does not flush the send buffer if we shutdown the connection after
     %% gracefully shutdown the stream.
     % quicer:async_shutdown_connection(Conn, ?QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0),
     ok.
+
+shutdown(Socket, Dir) ->
+    shutdown(Socket, Dir, 3000).
+
+shutdown({quic, _Conn, Stream, _Info}, read_write, Timeout) ->
+    %% A graceful shutdown means both side shutdown the read and write gracefully.
+    quicer:shutdown_stream(Stream, ?QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 1, Timeout).
 
 -spec ensure_ok_or_exit(atom(), list(term())) -> term().
 ensure_ok_or_exit(Fun, Args = [Sock | _]) when is_atom(Fun), is_list(Args) ->
@@ -160,7 +174,7 @@ ensure_ok_or_exit(Fun, Args = [Sock | _]) when is_atom(Fun), is_list(Args) ->
             Result
     end.
 
-async_send({quic, _Conn, Stream, _Info}, Data, _Options) ->
+send({quic, _Conn, Stream, _Info}, Data) ->
     case quicer:async_send(Stream, Data, ?QUICER_SEND_FLAG_SYNC) of
         {ok, _Len} -> ok;
         {error, X, Y} -> {error, {X, Y}};
@@ -184,14 +198,14 @@ peer_send_aborted(Stream, ErrorCode, S) ->
 
 -spec peer_send_shutdown(stream_handle(), undefined, cb_data()) -> cb_ret().
 peer_send_shutdown(Stream, undefined, S) ->
-    ok = quicer:async_shutdown_stream(Stream, ?QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0),
+    _ = quicer:async_shutdown_stream(Stream, ?QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0),
     {ok, S}.
 
 -spec send_complete(stream_handle(), boolean(), cb_data()) -> cb_ret().
 send_complete(_Stream, false, S) ->
     {ok, S};
 send_complete(_Stream, true = _IsCancelled, S) ->
-    ?SLOG(error, #{message => "send cancelled"}),
+    ?SLOG(error, #{msg => "send_cancelled"}),
     {ok, S}.
 
 -spec send_shutdown_complete(stream_handle(), boolean(), cb_data()) -> cb_ret().
@@ -202,7 +216,7 @@ send_shutdown_complete(_Stream, _IsGraceful, S) ->
 passive(Stream, undefined, S) ->
     case quicer:setopt(Stream, active, 10) of
         ok -> ok;
-        Error -> ?SLOG(error, #{message => "set active error", error => Error})
+        Error -> ?SLOG(error, #{msg => "set_active_error", error => Error})
     end,
     {ok, S}.
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 -module(emqx_stomp_SUITE).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include("emqx_stomp.hrl").
 
 -compile(export_all).
@@ -57,14 +59,32 @@ all() -> emqx_common_test_helpers:all(?MODULE).
 %% Setups
 %%--------------------------------------------------------------------
 
-init_per_suite(Cfg) ->
+init_per_suite(Config) ->
     application:load(emqx_gateway_stomp),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_authn, emqx_gateway]),
-    Cfg.
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, ?CONF_DEFAULT},
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Cfg) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_authn, emqx_conf]),
+end_per_suite(Config) ->
+    emqx_common_test_http:delete_default_app(),
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok.
+
+init_per_testcase(_TestCase, Config) ->
+    snabbkaffe:start_trace(),
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
+    snabbkaffe:stop(),
     ok.
 
 default_config() ->
@@ -87,11 +107,18 @@ restart_stomp_with_mountpoint(Mountpoint) ->
 t_connect(_) ->
     %% Successful connect
     ConnectSucced = fun(Sock) ->
+        emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
         ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
         {ok, Frame} = recv_a_frame(Sock),
         ?assertMatch(<<"CONNECTED">>, Frame#stomp_frame.command),
         ?assertEqual(
             <<"2000,1000">>, proplists:get_value(<<"heart-beat">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            ['client.connect' | _],
+            emqx_gateway_test_utils:collect_emqx_hooks_calls()
         ),
 
         ok = send_disconnect_frame(Sock, <<"12345">>),
@@ -130,6 +157,58 @@ t_connect(_) ->
     end,
     with_connection(ProtocolError).
 
+t_auth_expire(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 500}}
+        end
+    ),
+
+    ConnectWithExpire = fun(Sock) ->
+        ?assertWaitEvent(
+            begin
+                ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+                {ok, Frame} = recv_a_frame(Sock),
+                ?assertMatch(<<"CONNECTED">>, Frame#stomp_frame.command)
+            end,
+            #{
+                ?snk_kind := conn_process_terminated,
+                clientid := _,
+                reason := {shutdown, expired}
+            },
+            5000
+        )
+    end,
+    with_connection(ConnectWithExpire),
+    meck:unload(emqx_access_control).
+
+t_auth_failed(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {error, not_authenticated}
+        end
+    ),
+
+    %% restart gateway to clear the shutdown count history
+    emqx_gateway:stop(stomp),
+    emqx_gateway:start(stomp),
+
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, Frame),
+
+        ListenerId = {'stomp:tcp:default', 61613},
+        ?assertEqual([{not_authenticated, 1}], esockd:get_shutdown_count(ListenerId))
+    end),
+    meck:unload(emqx_access_control).
+
 t_heartbeat(_) ->
     %% Test heart beat
     with_connection(fun(Sock) ->
@@ -142,7 +221,7 @@ t_heartbeat(_) ->
                     {<<"host">>, <<"127.0.0.1:61613">>},
                     {<<"login">>, <<"guest">>},
                     {<<"passcode">>, <<"guest">>},
-                    {<<"heart-beat">>, <<"1000,800">>}
+                    {<<"heart-beat">>, <<"500,800">>}
                 ]
             )
         ),
@@ -170,11 +249,15 @@ t_subscribe(_) ->
 
         %% 'user-defined' header will be retain
         ok = send_message_frame(Sock, <<"/queue/foo">>, <<"hello">>, [
-            {<<"user-defined">>, <<"emq">>}
+            {<<"user-defined">>, <<"emq">>},
+            {<<"content-type">>, <<"text/html">>}
         ]),
         ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
 
         {ok, Frame} = recv_a_frame(Sock),
+        ?assertEqual(
+            <<"text/html">>, proplists:get_value(<<"content-type">>, Frame#stomp_frame.headers)
+        ),
 
         ?assertMatch(
             #stomp_frame{
@@ -273,6 +356,67 @@ t_subscribe_inuse(_) ->
     with_connection(SubscriptionInuse),
     with_connection(TopicIdInuseViaHttp),
     with_connection(SubscriptionInuseViaHttp).
+
+t_receive_from_mqtt_publish(_) ->
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        ok = send_subscribe_frame(Sock, 0, <<"/queue/foo">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% send mqtt publish with content-type
+        Msg = emqx_message:make(
+            _From = from_testsuite,
+            _QoS = 1,
+            _Topic = <<"/queue/foo">>,
+            _Payload = <<"hello">>,
+            _Flags = #{},
+            _Headers = #{properties => #{'Content-Type' => <<"application/json">>}}
+        ),
+        emqx:publish(Msg),
+
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertEqual(
+            <<"application/json">>,
+            proplists:get_value(<<"content-type">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            #stomp_frame{
+                command = <<"MESSAGE">>,
+                headers = _,
+                body = <<"hello">>
+            },
+            Frame
+        ),
+        lists:foreach(
+            fun({Key, Val}) ->
+                Val = proplists:get_value(Key, Frame#stomp_frame.headers)
+            end,
+            [
+                {<<"destination">>, <<"/queue/foo">>},
+                {<<"subscription">>, <<"0">>}
+            ]
+        ),
+
+        %% assert subscription stats
+        [ClientInfo1] = clients(),
+        ?assertMatch(#{subscriptions_cnt := 1}, ClientInfo1),
+
+        %% Unsubscribe
+        ok = send_unsubscribe_frame(Sock, 0),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        %% assert subscription stats
+        [ClientInfo2] = clients(),
+        ?assertMatch(#{subscriptions_cnt := 0}, ClientInfo2),
+
+        ok = send_message_frame(Sock, <<"/queue/foo">>, <<"You will not receive this msg">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        {error, timeout} = gen_tcp:recv(Sock, 0, 500)
+    end).
 
 t_transaction(_) ->
     with_connection(fun(Sock) ->
@@ -782,7 +926,7 @@ test_frame_error(Frame, AssertFun) ->
         AssertFun(Sock)
     end).
 
-t_rest_clienit_info(_) ->
+t_rest_clientid_info(_) ->
     with_connection(fun(Sock) ->
         send_connection_frame(Sock, <<"guest">>, <<"guest">>),
         ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
@@ -836,6 +980,9 @@ t_rest_clienit_info(_) ->
             ],
             StompClient
         ),
+
+        %% assert keepalive
+        ?assertEqual(10, maps:get(keepalive, StompClient)),
 
         %% sub & unsub
         {200, []} = request(get, ClientPath ++ "/subscriptions"),
@@ -965,6 +1112,10 @@ t_mountpoint(_) ->
             body = <<"hello">>
         }} = recv_a_frame(Sock),
         ?assertEqual(<<"t/a">>, proplists:get_value(<<"destination">>, Headers)),
+
+        ?assertEqual(
+            <<"text/plain">>, proplists:get_value(<<"content-type">>, Headers)
+        ),
 
         ok = send_disconnect_frame(Sock)
     end,
@@ -1098,7 +1249,7 @@ get_field(body, #stomp_frame{body = Body}) ->
     Body.
 
 send_connection_frame(Sock, Username, Password) ->
-    send_connection_frame(Sock, Username, Password, <<"0,0">>).
+    send_connection_frame(Sock, Username, Password, <<"10000,10000">>).
 
 send_connection_frame(Sock, Username, Password, Heartbeat) ->
     Headers =

@@ -1,25 +1,26 @@
-% %%--------------------------------------------------------------------
-% %% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
-% %%
-% %% Licensed under the Apache License, Version 2.0 (the "License");
-% %% you may not use this file except in compliance with the License.
-% %% You may obtain a copy of the License at
-% %% http://www.apache.org/licenses/LICENSE-2.0
-% %%
-% %% Unless required by applicable law or agreed to in writing, software
-% %% distributed under the License is distributed on an "AS IS" BASIS,
-% %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-% %% See the License for the specific language governing permissions and
-% %% limitations under the License.
-% %%--------------------------------------------------------------------
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%% http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
 
 -module(emqx_redis_SUITE).
 
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_connector.hrl").
+-include("../../emqx_connector/include/emqx_connector.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -44,14 +45,20 @@ init_per_suite(Config) ->
             _ -> 1
         end,
     ok = wait_for_redis(Checks),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:start_apps([emqx_resource]),
-    {ok, _} = application:ensure_all_started(emqx_connector),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_connector,
+            emqx_redis
+        ],
+        #{work_dir => ?config(priv_dir, Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_resource]),
-    _ = application:stop(emqx_connector).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
     Config.
@@ -137,6 +144,31 @@ perform_lifecycle_check(ResourceId, InitialConfig, RedisCommand) ->
             #{timeout => 500}
         )
     ),
+    % check authentication methods
+    ?assertEqual(
+        {ok, <<"OK">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "public"]})
+    ),
+    ?assertEqual(
+        {error, <<"WRONGPASS invalid username-password pair or user is disabled.">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "test_passwd"]})
+    ),
+    ?assertEqual(
+        {ok, <<"OK">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "test_user", "test_passwd"]})
+    ),
+    ?assertEqual(
+        {error, <<"WRONGPASS invalid username-password pair or user is disabled.">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "test_user", "public"]})
+    ),
+    ?assertEqual(
+        {error, <<"WRONGPASS invalid username-password pair or user is disabled.">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "wrong_user", "test_passwd"]})
+    ),
+    ?assertEqual(
+        {error, <<"WRONGPASS invalid username-password pair or user is disabled.">>},
+        emqx_resource:query(ResourceId, {cmd, ["AUTH", "wrong_user", "public"]})
+    ),
     ?assertEqual(ok, emqx_resource:stop(ResourceId)),
     % Resource will be listed still, but state will be changed and healthcheck will fail
     % as the worker no longer exists.
@@ -165,9 +197,9 @@ perform_lifecycle_check(ResourceId, InitialConfig, RedisCommand) ->
     % Should not even be able to get the resource data out of ets now unlike just stopping.
     ?assertEqual({error, not_found}, emqx_resource:get_instance(ResourceId)).
 
-% %%------------------------------------------------------------------------------
-% %% Helpers
-% %%------------------------------------------------------------------------------
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
 
 redis_config_single() ->
     redis_config_base("single", "server").
@@ -186,7 +218,8 @@ redis_config_sentinel() ->
         "    redis_type = ~s\n" ++
         MaybeSentinel ++
         MaybeDatabase ++
-        "    password = public\n" ++
+        "    username = test_user\n" ++
+        "    password = test_passwd\n" ++
         "    ~s = \"~s:~b\"\n" ++
         "    " ++
         ""
@@ -197,7 +230,7 @@ redis_config_base(Type, ServerKey) ->
         "sentinel" ->
             Host = ?REDIS_SENTINEL_HOST,
             Port = ?REDIS_SENTINEL_PORT,
-            MaybeSentinel = "    sentinel = mymaster\n",
+            MaybeSentinel = "    sentinel = mytcpmaster\n",
             MaybeDatabase = "    database = 1\n";
         "single" ->
             Host = ?REDIS_SINGLE_HOST,

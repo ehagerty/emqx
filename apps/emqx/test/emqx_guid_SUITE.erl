@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -35,7 +35,3 @@ t_guid_gen(_) ->
 t_guid_hexstr(_) ->
     Guid = emqx_guid:gen(),
     ?assertEqual(Guid, emqx_guid:from_hexstr(emqx_guid:to_hexstr(Guid))).
-
-t_guid_base62(_) ->
-    Guid = emqx_guid:gen(),
-    ?assertEqual(Guid, emqx_guid:from_base62(emqx_guid:to_base62(Guid))).

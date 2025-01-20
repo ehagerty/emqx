@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 -module(emqx_mgmt_api_topics).
 
 -include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/emqx_router.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 
@@ -28,7 +28,8 @@
     api_spec/0,
     paths/0,
     schema/1,
-    fields/1
+    fields/1,
+    namespace/0
 ]).
 
 -export([
@@ -36,12 +37,12 @@
     topic/2
 ]).
 
--export([qs2ms/2, format/1]).
-
 -define(TOPIC_NOT_FOUND, 'TOPIC_NOT_FOUND').
 
 -define(TOPICS_QUERY_SCHEMA, [{<<"topic">>, binary}, {<<"node">>, atom}]).
 -define(TAGS, [<<"Topics">>]).
+
+namespace() -> undefined.
 
 api_spec() ->
     emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true, translate_body => true}).
@@ -95,37 +96,36 @@ fields(topic) ->
             hoconsc:mk(binary(), #{
                 desc => <<"Node">>,
                 required => true
+            })},
+        {session,
+            hoconsc:mk(binary(), #{
+                desc => <<"Session ID">>,
+                required => false
             })}
     ].
 
 %%%==============================================================================================
 %% parameters trans
 topics(get, #{query_string := Qs}) ->
-    do_list(generate_topic(Qs)).
+    do_list(Qs).
 
 topic(get, #{bindings := Bindings}) ->
-    lookup(generate_topic(Bindings)).
+    lookup(Bindings).
 
 %%%==============================================================================================
 %% api apply
 do_list(Params) ->
-    case
-        emqx_mgmt_api:node_query(
-            node(),
-            ?ROUTE_TAB,
-            Params,
-            ?TOPICS_QUERY_SCHEMA,
-            fun ?MODULE:qs2ms/2,
-            fun ?MODULE:format/1
-        )
-    of
-        {error, page_limit_invalid} ->
+    try
+        Pager = parse_pager_params(Params),
+        {_, Query} = emqx_mgmt_api:parse_qstring(Params, ?TOPICS_QUERY_SCHEMA),
+        Stream = mk_topic_stream(qs2ms(Query)),
+        QResult = eval_topic_query(Stream, Pager, emqx_mgmt_api:init_query_result()),
+        {200, format_list_response(Pager, Query, QResult)}
+    catch
+        throw:{error, page_limit_invalid} ->
             {400, #{code => <<"INVALID_PARAMETER">>, message => <<"page_limit_invalid">>}};
-        {error, Node, Error} ->
-            Message = list_to_binary(io_lib:format("bad rpc call ~p, Reason ~p", [Node, Error])),
-            {500, #{code => <<"NODE_DOWN">>, message => Message}};
-        Response ->
-            {200, Response}
+        error:{invalid_topic_filter, _} ->
+            {400, #{code => <<"INVALID_PARAMTER">>, message => <<"topic_filter_invalid">>}}
     end.
 
 lookup(#{topic := Topic}) ->
@@ -139,31 +139,100 @@ lookup(#{topic := Topic}) ->
 
 %%%==============================================================================================
 %% internal
-generate_topic(Params = #{<<"topic">> := Topic}) ->
-    Params#{<<"topic">> => Topic};
-generate_topic(Params = #{topic := Topic}) ->
-    Params#{topic => Topic};
-generate_topic(Params) ->
-    Params.
 
--spec qs2ms(atom(), {list(), list()}) -> emqx_mgmt_api:match_spec_and_filter().
-qs2ms(_Tab, {Qs, _}) ->
+parse_pager_params(Params) ->
+    try emqx_mgmt_api:parse_pager_params(Params) of
+        Pager = #{} ->
+            Pager;
+        false ->
+            throw({error, page_limit_invalid})
+    catch
+        error:badarg ->
+            throw({error, page_limit_invalid})
+    end.
+
+-spec qs2ms({list(), list()}) -> tuple().
+qs2ms({Qs, _}) ->
+    lists:foldl(fun gen_match_spec/2, {'_', '_'}, Qs).
+
+gen_match_spec({topic, '=:=', QTopic}, {_MTopic, MNode}) when is_atom(MNode) ->
+    case emqx_topic:parse(QTopic) of
+        {#share{group = Group, topic = Topic}, _SubOpts} ->
+            {Topic, {Group, MNode}};
+        {Topic, _SubOpts} ->
+            {Topic, MNode}
+    end;
+gen_match_spec({node, '=:=', QNode}, {MTopic, _MDest}) ->
+    {MTopic, QNode}.
+
+mk_topic_stream(Spec = {MTopic, _MDest = '_'}) ->
+    emqx_utils_stream:chain(emqx_router:stream(Spec), mk_persistent_topic_stream(MTopic));
+mk_topic_stream(Spec) ->
+    %% NOTE: Assuming that no persistent topic ever matches a query with `node` filter.
+    emqx_router:stream(Spec).
+
+mk_persistent_topic_stream(Spec) ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            emqx_persistent_session_ds_router:stream(Spec);
+        false ->
+            emqx_utils_stream:empty()
+    end.
+
+eval_count() ->
+    emqx_router:stats(n_routes) + eval_persistent_count().
+
+eval_persistent_count() ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            emqx_persistent_session_ds_router:stats(n_routes);
+        false ->
+            0
+    end.
+
+eval_topic_query(Stream, QState = #{limit := Limit}, QResult) ->
+    case emqx_utils_stream:consume(Limit, Stream) of
+        {Rows, NStream} ->
+            case emqx_mgmt_api:accumulate_query_rows(node(), Rows, QState, QResult) of
+                {more, NQResult} ->
+                    eval_topic_query(NStream, QState, NQResult);
+                {enough, NQResult} ->
+                    finalize_query(false, NQResult)
+            end;
+        Rows when is_list(Rows) ->
+            {_, NQResult} = emqx_mgmt_api:accumulate_query_rows(node(), Rows, QState, QResult),
+            finalize_query(true, NQResult)
+    end.
+
+finalize_query(Complete, QResult = #{overflow := Overflow}) ->
+    HasNext = Overflow orelse not Complete,
+    QResult#{complete => Complete, hasnext => HasNext}.
+
+format_list_response(Meta, Query, QResult = #{rows := RowsAcc}) ->
     #{
-        match_spec => gen_match_spec(Qs, [{{route, '_', '_'}, [], ['$_']}]),
-        fuzzy_fun => undefined
+        meta => format_response_meta(Meta, Query, QResult),
+        data => lists:flatmap(
+            fun({_Node, Rows}) -> [format(R) || R <- Rows] end,
+            RowsAcc
+        )
     }.
 
-gen_match_spec([], Res) ->
-    Res;
-gen_match_spec([{topic, '=:=', T} | Qs], [{{route, _, N}, [], ['$_']}]) ->
-    gen_match_spec(Qs, [{{route, T, N}, [], ['$_']}]);
-gen_match_spec([{node, '=:=', N} | Qs], [{{route, T, _}, [], ['$_']}]) ->
-    gen_match_spec(Qs, [{{route, T, N}, [], ['$_']}]).
+format_response_meta(Meta, _Query, #{hasnext := HasNext, complete := true, cursor := Cursor}) ->
+    Meta#{hasnext => HasNext, count => Cursor};
+format_response_meta(Meta, _Query = {[], []}, #{hasnext := HasNext}) ->
+    Meta#{hasnext => HasNext, count => eval_count()};
+format_response_meta(Meta, _Query, #{hasnext := HasNext}) ->
+    Meta#{hasnext => HasNext}.
 
-format(#route{topic = Topic, dest = {_, Node}}) ->
+format(#route{topic = Topic, dest = {Group, Node}}) ->
+    #{
+        topic => emqx_topic:maybe_format_share(emqx_topic:make_shared_record(Group, Topic)),
+        node => Node
+    };
+format(#route{topic = Topic, dest = Node}) when is_atom(Node) ->
     #{topic => Topic, node => Node};
-format(#route{topic = Topic, dest = Node}) ->
-    #{topic => Topic, node => Node}.
+format(#route{topic = Topic, dest = SessionId}) when is_binary(SessionId) ->
+    #{topic => Topic, session => SessionId}.
 
 topic_param(In) ->
     {

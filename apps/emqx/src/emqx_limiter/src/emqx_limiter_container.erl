@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@
     retry_list/2
 ]).
 
--export_type([container/0, check_result/0]).
+-export_type([limiter/0, container/0, check_result/0, limiter_type/0]).
 
 -type container() ::
     infinity
@@ -51,7 +51,7 @@
 -type limiter_id() :: emqx_limiter_schema:limiter_id().
 -type limiter_type() :: emqx_limiter_schema:limiter_type().
 -type limiter() :: emqx_htb_limiter:limiter().
--type retry_context() :: emqx_htb_limiter:retry_context().
+-type retry_context() :: emqx_htb_limiter:retry_context(limiter()).
 -type millisecond() :: non_neg_integer().
 -type check_result() ::
     {ok, container()}
@@ -70,7 +70,7 @@
 -spec get_limiter_by_types(
     limiter_id() | {atom(), atom()},
     list(limiter_type()),
-    #{limiter_type() => hocons:config()}
+    #{limiter_type() => hocon:config()}
 ) -> container().
 get_limiter_by_types({Type, Listener}, Types, BucketCfgs) ->
     Id = emqx_listeners:listener_id(Type, Listener),

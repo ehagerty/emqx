@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -143,7 +143,7 @@ on_client_authorize(ClientInfo, Action, Topic, Result) ->
     Req = #{
         clientinfo => clientinfo(ClientInfo),
         type => Type,
-        topic => Topic,
+        topic => emqx_topic:get_shared_real_topic(Topic),
         result => Bool
     },
     case
@@ -191,15 +191,16 @@ on_session_created(ClientInfo, _SessInfo) ->
 on_session_subscribed(ClientInfo, Topic, SubOpts) ->
     Req = #{
         clientinfo => clientinfo(ClientInfo),
-        topic => Topic,
-        subopts => maps:with([qos, share, rh, rap, nl], SubOpts)
+        topic => emqx_topic:maybe_format_share(Topic),
+        subopts => subopts(SubOpts)
     },
     cast('session.subscribed', Req).
 
 on_session_unsubscribed(ClientInfo, Topic, _SubOpts) ->
     Req = #{
         clientinfo => clientinfo(ClientInfo),
-        topic => Topic
+        topic => emqx_topic:maybe_format_share(Topic)
+        %% no subopts when unsub
     },
     cast('session.unsubscribed', Req).
 
@@ -294,7 +295,7 @@ conninfo(
     ConnInfo =
         #{
             clientid := ClientId,
-            peername := {Peerhost, _},
+            peername := {Peerhost, PeerPort},
             sockname := {_, SockPort}
         }
 ) ->
@@ -305,8 +306,9 @@ conninfo(
     #{
         node => stringfy(node()),
         clientid => ClientId,
-        username => maybe(Username),
+        username => option(Username),
         peerhost => ntoa(Peerhost),
+        peerport => PeerPort,
         sockport => SockPort,
         proto_name => ProtoName,
         proto_ver => stringfy(ProtoVer),
@@ -318,7 +320,7 @@ clientinfo(
         #{
             clientid := ClientId,
             username := Username,
-            peerhost := PeerHost,
+            peername := {PeerHost, PeerPort},
             sockport := SockPort,
             protocol := Protocol,
             mountpoint := Mountpoiont
@@ -327,16 +329,17 @@ clientinfo(
     #{
         node => stringfy(node()),
         clientid => ClientId,
-        username => maybe(Username),
-        password => maybe(maps:get(password, ClientInfo, undefined)),
+        username => option(Username),
+        password => option(maps:get(password, ClientInfo, undefined)),
         peerhost => ntoa(PeerHost),
+        peerport => PeerPort,
         sockport => SockPort,
         protocol => stringfy(Protocol),
-        mountpoint => maybe(Mountpoiont),
+        mountpoint => option(Mountpoiont),
         is_superuser => maps:get(is_superuser, ClientInfo, false),
         anonymous => maps:get(anonymous, ClientInfo, true),
-        cn => maybe(maps:get(cn, ClientInfo, undefined)),
-        dn => maybe(maps:get(dn, ClientInfo, undefined))
+        cn => option(maps:get(cn, ClientInfo, undefined)),
+        dn => option(maps:get(dn, ClientInfo, undefined))
     }.
 
 message(#message{
@@ -413,15 +416,26 @@ enrich_header(Headers, Message) ->
     end.
 
 topicfilters(Tfs) when is_list(Tfs) ->
-    [#{name => Topic, qos => Qos} || {Topic, #{qos := Qos}} <- Tfs].
+    [
+        #{name => emqx_topic:maybe_format_share(Topic), subopts => subopts(SubOpts)}
+     || {Topic, SubOpts} <- Tfs
+    ].
+
+subopts(SubOpts) ->
+    #{
+        qos => maps:get(qos, SubOpts, 0),
+        rh => maps:get(rh, SubOpts, 0),
+        rap => maps:get(rap, SubOpts, 0),
+        nl => maps:get(nl, SubOpts, 0)
+    }.
 
 ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
     list_to_binary(inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256}));
 ntoa(IP) ->
     list_to_binary(inet_parse:ntoa(IP)).
 
-maybe(undefined) -> <<>>;
-maybe(B) -> B.
+option(undefined) -> <<>>;
+option(B) -> B.
 
 %% @private
 stringfy(Term) when is_binary(Term) ->

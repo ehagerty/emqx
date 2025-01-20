@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,4 +32,14 @@ init([]) ->
             intensity => 100,
             period => 10
         },
-    {ok, {SupFlags, []}}.
+    ChildSpecs = [child_spec(emqx_plugins_serde)],
+    {ok, {SupFlags, ChildSpecs}}.
+
+child_spec(Mod) ->
+    #{
+        id => Mod,
+        start => {Mod, start_link, []},
+        restart => permanent,
+        shutdown => 5_000,
+        type => worker
+    }.

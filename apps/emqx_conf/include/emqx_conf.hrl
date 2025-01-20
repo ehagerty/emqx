@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 
 -define(CLUSTER_MFA, cluster_rpc_mfa).
 -define(CLUSTER_COMMIT, cluster_rpc_commit).
+-define(DEFAULT_INIT_TXN_ID, -1).
 
 -record(cluster_rpc_mfa, {
     tnx_id :: pos_integer(),
@@ -34,6 +35,15 @@
     tnx_id :: pos_integer() | '$1'
 }).
 
--define(READONLY_KEYS, [cluster, rpc, node]).
+-define(SUGGESTION(Node),
+    lists:flatten(
+        io_lib:format(
+            "run `./bin/emqx_ctl conf cluster_sync fix`"
+            " on ~p(config leader) to force sync the configs, "
+            "if this node has been lagging for more than 3 minutes.",
+            [Node]
+        )
+    )
+).
 
 -endif.

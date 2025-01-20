@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_hstreamdb_connector).
 
@@ -7,19 +7,26 @@
 -include_lib("typerefl/include/types.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+-include("emqx_bridge_hstreamdb.hrl").
 
--import(hoconsc, [mk/2, enum/1]).
+-import(hoconsc, [mk/2]).
 
 -behaviour(emqx_resource).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
     on_query/3,
     on_batch_query/3,
-    on_get_status/2
+    on_get_status/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3
 ]).
 
 -export([
@@ -33,72 +40,136 @@
     desc/1
 ]).
 
-%% Allocatable resources
--define(hstreamdb_client, hstreamdb_client).
-
--define(DEFAULT_GRPC_TIMEOUT, timer:seconds(30)).
--define(DEFAULT_GRPC_TIMEOUT_RAW, <<"30s">>).
-
 %% -------------------------------------------------------------------------------------------------
 %% resource callback
+resource_type() -> hstreamdb.
+
 callback_mode() -> always_sync.
 
 on_start(InstId, Config) ->
-    start_client(InstId, Config).
+    try
+        do_on_start(InstId, Config)
+    catch
+        E:R:S ->
+            Error = #{
+                msg => "start_hstreamdb_connector_error",
+                connector => InstId,
+                error => E,
+                reason => R,
+                stack => S
+            },
+            ?SLOG(error, Error),
+            {error, Error}
+    end.
+
+on_add_channel(
+    _InstId,
+    #{
+        installed_channels := InstalledChannels,
+        client_options := ClientOptions
+    } = OldState,
+    ChannelId,
+    ChannelConfig
+) ->
+    %{ok, ChannelState} = create_channel_state(ChannelId, PoolName, ChannelConfig),
+    Parameters0 = maps:get(parameters, ChannelConfig),
+    Parameters = Parameters0#{client_options => ClientOptions},
+    PartitionKey = emqx_placeholder:preproc_tmpl(maps:get(partition_key, Parameters, <<"">>)),
+    try
+        ChannelState = #{
+            producer => start_producer(ChannelId, Parameters),
+            record_template => record_template(Parameters),
+            partition_key => PartitionKey
+        },
+        NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
+        %% Update state
+        NewState = OldState#{installed_channels => NewInstalledChannels},
+        {ok, NewState}
+    catch
+        Error:Reason:Stack ->
+            {error, {Error, Reason, Stack}}
+    end.
+
+on_remove_channel(
+    _InstId,
+    #{
+        installed_channels := InstalledChannels
+    } = OldState,
+    ChannelId
+) ->
+    #{
+        producer := Producer
+    } = maps:get(ChannelId, InstalledChannels),
+    _ = hstreamdb:stop_producer(Producer),
+    NewInstalledChannels = maps:remove(ChannelId, InstalledChannels),
+    %% Update state
+    NewState = OldState#{installed_channels => NewInstalledChannels},
+    {ok, NewState}.
+
+on_get_channel_status(
+    _ResId,
+    _ChannelId,
+    _State
+) ->
+    ?status_connected.
+
+on_get_channels(ResId) ->
+    emqx_bridge_v2:get_channels_for_connector(ResId).
 
 on_stop(InstId, _State) ->
-    case emqx_resource:get_allocated_resources(InstId) of
-        #{client := Client, producer := Producer} ->
-            StopClientRes = hstreamdb:stop_client(Client),
-            StopProducerRes = hstreamdb:stop_producer(Producer),
-            ?SLOG(info, #{
-                msg => "stop hstreamdb connector",
-                connector => InstId,
-                client => Client,
-                producer => Producer,
-                stop_client => StopClientRes,
-                stop_producer => StopProducerRes
-            });
-        _ ->
-            ok
-    end.
+    ?tp(
+        hstreamdb_connector_on_stop,
+        #{instance_id => InstId}
+    ).
 
 -define(FAILED_TO_APPLY_HRECORD_TEMPLATE,
     {error, {unrecoverable_error, failed_to_apply_hrecord_template}}
 ).
 
 on_query(
-    _InstId,
-    {send_message, Data},
-    _State = #{
-        producer := Producer, partition_key := PartitionKey, record_template := HRecordTemplate
-    }
+    InstId,
+    {ChannelID, Data},
+    #{installed_channels := Channels} = _State
 ) ->
-    try to_record(PartitionKey, HRecordTemplate, Data) of
-        Record -> append_record(Producer, Record)
+    #{
+        producer := Producer, partition_key := PartitionKey, record_template := HRecordTemplate
+    } = maps:get(ChannelID, Channels),
+    try
+        KeyAndRawRecord = to_key_and_raw_record(PartitionKey, HRecordTemplate, Data),
+        emqx_trace:rendered_action_template(ChannelID, #{record => KeyAndRawRecord}),
+        Record = to_record(KeyAndRawRecord),
+        append_record(InstId, Producer, Record, false)
     catch
         _:_ -> ?FAILED_TO_APPLY_HRECORD_TEMPLATE
     end.
 
 on_batch_query(
-    _InstId,
-    BatchList,
-    _State = #{
-        producer := Producer, partition_key := PartitionKey, record_template := HRecordTemplate
-    }
+    InstId,
+    [{ChannelID, _Data} | _] = BatchList,
+    #{installed_channels := Channels} = _State
 ) ->
-    try to_multi_part_records(PartitionKey, HRecordTemplate, BatchList) of
-        Records -> append_record(Producer, Records)
+    #{
+        producer := Producer, partition_key := PartitionKey, record_template := HRecordTemplate
+    } = maps:get(ChannelID, Channels),
+    try
+        KeyAndRawRecordList = to_multi_part_key_and_partition_key(
+            PartitionKey, HRecordTemplate, BatchList
+        ),
+        emqx_trace:rendered_action_template(ChannelID, #{records => KeyAndRawRecordList}),
+        Records = [to_record(Item) || Item <- KeyAndRawRecordList],
+        append_record(InstId, Producer, Records, true)
     catch
         _:_ -> ?FAILED_TO_APPLY_HRECORD_TEMPLATE
     end.
 
-on_get_status(_InstId, #{client := Client}) ->
-    case is_alive(Client) of
-        true ->
-            connected;
-        false ->
-            disconnected
+on_get_status(_InstId, State) ->
+    case check_status(State) of
+        ok ->
+            ?status_connected;
+        Error ->
+            %% We set it to ?status_connecting so that the channels are not deleted.
+            %% The producers in the channels contains buffers so we don't want to delete them.
+            {?status_connecting, Error}
     end.
 
 %% -------------------------------------------------------------------------------------------------
@@ -140,200 +211,210 @@ desc(config) ->
 
 %% -------------------------------------------------------------------------------------------------
 %% internal functions
-start_client(InstId, Config) ->
-    try
-        do_start_client(InstId, Config)
-    catch
-        E:R:S ->
-            Error = #{
-                msg => "start hstreamdb connector error",
-                connector => InstId,
-                error => E,
-                reason => R,
-                stack => S
-            },
-            ?SLOG(error, Error),
-            {error, Error}
-    end.
 
-do_start_client(InstId, Config = #{url := Server, pool_size := PoolSize}) ->
+do_on_start(InstId, Config) ->
     ?SLOG(info, #{
-        msg => "starting hstreamdb connector: client",
+        msg => "starting_hstreamdb_connector_client",
         connector => InstId,
         config => Config
     }),
-    ClientName = client_name(InstId),
-    ClientOptions = [
-        {url, binary_to_list(Server)},
-        {rpc_options, #{pool_size => PoolSize}}
-    ],
-    case hstreamdb:start_client(ClientName, ClientOptions) of
-        {ok, Client} ->
-            case is_alive(Client) of
-                true ->
-                    ?SLOG(info, #{
-                        msg => "hstreamdb connector: client started",
-                        connector => InstId,
-                        client => Client
-                    }),
-                    start_producer(InstId, Client, Config);
-                _ ->
-                    ?tp(
-                        hstreamdb_connector_start_failed,
-                        #{error => client_not_alive}
-                    ),
-                    ?SLOG(error, #{
-                        msg => "hstreamdb connector: client not alive",
-                        connector => InstId
-                    }),
-                    {error, connect_failed}
-            end;
-        {error, {already_started, Pid}} ->
+    ClientOptions = client_options(Config),
+    State = #{
+        client_options => ClientOptions,
+        installed_channels => #{}
+    },
+    case check_status(State) of
+        ok ->
             ?SLOG(info, #{
-                msg => "starting hstreamdb connector: client, find old client. restart client",
-                old_client_pid => Pid,
-                old_client_name => ClientName
+                msg => "hstreamdb_connector_client_started",
+                connector => InstId
             }),
-            _ = hstreamdb:stop_client(ClientName),
-            start_client(InstId, Config);
-        {error, Error} ->
+            {ok, State};
+        Error ->
+            ?tp(
+                hstreamdb_connector_start_failed,
+                #{error => client_not_alive}
+            ),
             ?SLOG(error, #{
-                msg => "hstreamdb connector: client failed",
+                msg => "hstreamdb_connector_client_not_alive",
                 connector => InstId,
-                reason => Error
+                error => Error
             }),
+            {error, {connect_failed, Error}}
+    end.
+
+client_options(#{url := ServerURL, ssl := SSL, grpc_timeout := GRPCTimeout}) ->
+    %% NOTE: Disable gun's retry mechanism.
+    GunOpts0 = #{retry => 0},
+    RpcOpts0 = #{pool_size => 1},
+    case maps:get(enable, SSL) of
+        false ->
+            RpcOpts = RpcOpts0#{gun_opts => GunOpts0};
+        true ->
+            RpcOpts = RpcOpts0#{
+                gun_opts => GunOpts0#{
+                    transport => tls,
+                    tls_opts => emqx_tls_lib:to_client_opts(SSL)
+                }
+            }
+    end,
+    ClientOptions = #{
+        url => to_string(ServerURL),
+        grpc_timeout => GRPCTimeout,
+        rpc_options => RpcOpts
+    },
+    ClientOptions.
+
+check_status(ConnectorState) ->
+    try start_client(ConnectorState) of
+        {ok, Client} ->
+            check_status_with_client(Client);
+        {error, _} = StartClientError ->
+            StartClientError
+    catch
+        ErrorType:Reason:_ST ->
+            {error, {ErrorType, Reason}}
+    end.
+
+check_status_with_client(Client) ->
+    try hstreamdb_client:echo(Client) of
+        ok -> ok;
+        {error, _} = ErrorEcho -> ErrorEcho
+    after
+        _ = hstreamdb:stop_client(Client)
+    end.
+
+start_client(Opts) ->
+    ClientOptions = maps:get(client_options, Opts),
+    case hstreamdb:start_client(ClientOptions) of
+        {ok, Client} ->
+            {ok, Client};
+        {error, Error} ->
             {error, Error}
     end.
 
-is_alive(Client) ->
-    case hstreamdb:echo(Client) of
-        {ok, _Echo} ->
-            true;
-        _ErrorEcho ->
-            false
-    end.
-
 start_producer(
-    InstId,
-    Client,
-    Options = #{stream := Stream, pool_size := PoolSize}
+    ActionId,
+    #{
+        stream := Stream,
+        batch_size := BatchSize,
+        batch_interval := Interval
+    } = Opts
 ) ->
-    %% TODO: change these batch options after we have better disk cache.
-    BatchSize = maps:get(batch_size, Options, 100),
-    Interval = maps:get(batch_interval, Options, 1000),
-    ProducerOptions = [
-        {stream, Stream},
-        {callback, {?MODULE, on_flush_result, []}},
-        {max_records, BatchSize},
-        {interval, Interval},
-        {pool_size, PoolSize},
-        {grpc_timeout, maps:get(grpc_timeout, Options, ?DEFAULT_GRPC_TIMEOUT)}
-    ],
-    Name = produce_name(InstId),
-    ?SLOG(info, #{
-        msg => "starting hstreamdb connector: producer",
-        connector => InstId
-    }),
-    case hstreamdb:start_producer(Client, Name, ProducerOptions) of
-        {ok, Producer} ->
-            ?SLOG(info, #{
-                msg => "hstreamdb connector: producer started"
-            }),
-            State = #{
-                client => Client,
-                producer => Producer,
-                enable_batch => maps:get(enable_batch, Options, false),
-                partition_key => emqx_placeholder:preproc_tmpl(
-                    maps:get(partition_key, Options, <<"">>)
-                ),
-                record_template => record_template(Options)
-            },
-            ok = emqx_resource:allocate_resource(InstId, ?hstreamdb_client, #{
-                client => Client, producer => Producer
-            }),
-            {ok, State};
-        {error, {already_started, Pid}} ->
-            ?SLOG(info, #{
-                msg =>
-                    "starting hstreamdb connector: producer, find old producer. restart producer",
-                old_producer_pid => Pid,
-                old_producer_name => Name
-            }),
-            _ = hstreamdb:stop_producer(Name),
-            start_producer(InstId, Client, Options);
+    MaxBatches = maps:get(max_batches, Opts, ?DEFAULT_MAX_BATCHES),
+    AggPoolSize = maps:get(aggregation_pool_size, Opts, ?DEFAULT_AGG_POOL_SIZE),
+    WriterPoolSize = maps:get(writer_pool_size, Opts, ?DEFAULT_WRITER_POOL_SIZE),
+    GRPCTimeout = maps:get(grpc_flush_timeout, Opts, ?DEFAULT_GRPC_FLUSH_TIMEOUT),
+    ClientOptions = maps:get(client_options, Opts),
+    ProducerOptions = #{
+        stream => to_string(Stream),
+        buffer_options => #{
+            interval => Interval,
+            callback => {?MODULE, on_flush_result, [ActionId]},
+            max_records => BatchSize,
+            max_batches => MaxBatches
+        },
+        buffer_pool_size => AggPoolSize,
+        writer_options => #{
+            grpc_timeout => GRPCTimeout
+        },
+        writer_pool_size => WriterPoolSize,
+        client_options => ClientOptions
+    },
+    Name = produce_name(ActionId),
+    ensure_start_producer(Name, ProducerOptions).
+
+ensure_start_producer(ProducerName, ProducerOptions) ->
+    case hstreamdb:start_producer(ProducerName, ProducerOptions) of
+        ok ->
+            ok;
+        {error, {already_started, _Pid}} ->
+            %% HStreamDB producer already started, restart it
+            _ = hstreamdb:stop_producer(ProducerName),
+            %% the pool might have been leaked after relup
+            _ = ecpool:stop_sup_pool(ProducerName),
+            ok = hstreamdb:start_producer(ProducerName, ProducerOptions);
+        {error, {
+            {shutdown,
+                {failed_to_start_child, {pool_sup, Pool},
+                    {shutdown,
+                        {failed_to_start_child, worker_sup,
+                            {shutdown, {failed_to_start_child, _, {badarg, _}}}}}}},
+            _
+        }} ->
+            %% HStreamDB producer was not properly cleared, restart it
+            %% the badarg error in gproc maybe caused by the pool is leaked after relup
+            _ = ecpool:stop_sup_pool(Pool),
+            ok = hstreamdb:start_producer(ProducerName, ProducerOptions);
         {error, Reason} ->
-            ?SLOG(error, #{
-                msg => "starting hstreamdb connector: producer, failed",
-                reason => Reason
-            }),
-            {error, Reason}
-    end.
-
-to_record(PartitionKeyTmpl, HRecordTmpl, Data) ->
-    PartitionKey = emqx_placeholder:proc_tmpl(PartitionKeyTmpl, Data),
-    RawRecord = emqx_placeholder:proc_tmpl(HRecordTmpl, Data),
-    to_record(PartitionKey, RawRecord).
-
-to_record(PartitionKey, RawRecord) when is_binary(PartitionKey) ->
-    to_record(binary_to_list(PartitionKey), RawRecord);
-to_record(PartitionKey, RawRecord) ->
-    hstreamdb:to_record(PartitionKey, raw, RawRecord).
-
-to_multi_part_records(PartitionKeyTmpl, HRecordTmpl, BatchList) ->
-    Records0 = lists:map(
-        fun({send_message, Data}) ->
-            to_record(PartitionKeyTmpl, HRecordTmpl, Data)
-        end,
-        BatchList
-    ),
-    PartitionKeys = proplists:get_keys(Records0),
-    [
-        {PartitionKey, proplists:get_all_values(PartitionKey, Records0)}
-     || PartitionKey <- PartitionKeys
-    ].
-
-append_record(Producer, MultiPartsRecords) when is_list(MultiPartsRecords) ->
-    lists:foreach(fun(Record) -> append_record(Producer, Record) end, MultiPartsRecords);
-append_record(Producer, Record) when is_tuple(Record) ->
-    do_append_records(false, Producer, Record).
-
-%% TODO: only sync request supported. implement async request later.
-do_append_records(false, Producer, Record) ->
-    case hstreamdb:append_flush(Producer, Record) of
-        {ok, _Result} ->
-            ?tp(
-                hstreamdb_connector_query_return,
-                #{result => _Result}
-            ),
-            ?SLOG(debug, #{
-                msg => "HStreamDB producer sync append success",
-                record => Record
-            });
-        %% the HStream is warming up or buzy, something are not ready yet, retry after a while
-        {error, {unavailable, _} = Reason} ->
-            {error,
-                {recoverable_error, #{
-                    msg => "HStreamDB is warming up or buzy, will retry after a moment",
-                    reason => Reason
-                }}};
-        {error, Reason} = Err ->
-            ?tp(
-                hstreamdb_connector_query_return,
-                #{error => Reason}
-            ),
-            ?SLOG(error, #{
-                msg => "HStreamDB producer sync append failed",
-                reason => Reason,
-                record => Record
-            }),
-            Err
-    end.
-
-client_name(InstId) ->
-    "client:" ++ to_string(InstId).
+            %% HStreamDB start producer failed
+            throw({start_producer_failed, Reason})
+    end,
+    ProducerName.
 
 produce_name(ActionId) ->
-    list_to_atom("producer:" ++ to_string(ActionId)).
+    list_to_binary("backend_hstream_producer:" ++ to_string(ActionId)).
+
+to_key_and_raw_record(PartitionKeyTmpl, HRecordTmpl, Data) ->
+    PartitionKey = emqx_placeholder:proc_tmpl(PartitionKeyTmpl, Data),
+    RawRecord = emqx_placeholder:proc_tmpl(HRecordTmpl, Data),
+    #{partition_key => PartitionKey, raw_record => RawRecord}.
+
+to_record(#{partition_key := PartitionKey, raw_record := RawRecord}) when is_binary(PartitionKey) ->
+    to_record(#{partition_key => binary_to_list(PartitionKey), raw_record => RawRecord});
+to_record(#{partition_key := PartitionKey, raw_record := RawRecord}) ->
+    hstreamdb:to_record(PartitionKey, raw, RawRecord).
+
+to_multi_part_key_and_partition_key(PartitionKeyTmpl, HRecordTmpl, BatchList) ->
+    lists:map(
+        fun({_, Data}) ->
+            to_key_and_raw_record(PartitionKeyTmpl, HRecordTmpl, Data)
+        end,
+        BatchList
+    ).
+
+append_record(ResourceId, Producer, MultiPartsRecords, MaybeBatch) when
+    is_list(MultiPartsRecords)
+->
+    lists:foreach(
+        fun(Record) -> append_record(ResourceId, Producer, Record, MaybeBatch) end,
+        MultiPartsRecords
+    );
+append_record(ResourceId, Producer, Record, MaybeBatch) when is_tuple(Record) ->
+    do_append_records(ResourceId, Producer, Record, MaybeBatch).
+
+%% TODO: only sync request supported. implement async request later.
+do_append_records(ResourceId, Producer, Record, true = IsBatch) ->
+    Result = hstreamdb:append(Producer, Record),
+    handle_result(ResourceId, Result, Record, IsBatch);
+do_append_records(ResourceId, Producer, Record, false = IsBatch) ->
+    Result = hstreamdb:append_flush(Producer, Record),
+    handle_result(ResourceId, Result, Record, IsBatch).
+
+handle_result(ResourceId, ok = Result, Record, IsBatch) ->
+    handle_result(ResourceId, {ok, Result}, Record, IsBatch);
+handle_result(ResourceId, {ok, Result}, Record, IsBatch) ->
+    ?tp(
+        hstreamdb_connector_query_append_return,
+        #{result => Result, is_batch => IsBatch, instance_id => ResourceId}
+    ),
+    ?SLOG(debug, #{
+        msg => "hstreamdb_producer_sync_append_success",
+        record => Record,
+        is_batch => IsBatch
+    });
+handle_result(ResourceId, {error, Reason} = Err, Record, IsBatch) ->
+    ?tp(
+        hstreamdb_connector_query_append_return,
+        #{error => Reason, is_batch => IsBatch, instance_id => ResourceId}
+    ),
+    ?SLOG(error, #{
+        msg => "hstreamdb_producer_sync_append_failed",
+        reason => Reason,
+        record => Record,
+        is_batch => IsBatch
+    }),
+    Err.
 
 record_template(#{record_template := RawHRecordTemplate}) ->
     emqx_placeholder:preproc_tmpl(RawHRecordTemplate);

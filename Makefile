@@ -1,34 +1,22 @@
+ifeq ($(DEBUG),1)
+DEBUG_INFO = $(info $1)
+else
+DEBUG_INFO = @:
+endif
 REBAR = $(CURDIR)/rebar3
 BUILD = $(CURDIR)/build
 SCRIPTS = $(CURDIR)/scripts
-export EMQX_RELUP ?= true
-export EMQX_DEFAULT_BUILDER = ghcr.io/emqx/emqx-builder/5.1-3:1.14.5-25.3.2-1-debian11
-export EMQX_DEFAULT_RUNNER = debian:11-slim
-export EMQX_REL_FORM ?= tgz
-export QUICER_DOWNLOAD_FROM_RELEASE = 1
-ifeq ($(OS),Windows_NT)
-	export REBAR_COLOR=none
-	FIND=/usr/bin/find
-else
-	FIND=find
-endif
+include env.sh
 
 # Dashboard version
 # from https://github.com/emqx/emqx-dashboard5
-export EMQX_DASHBOARD_VERSION ?= v1.3.2
-export EMQX_EE_DASHBOARD_VERSION ?= e1.1.1
+export EMQX_DASHBOARD_VERSION ?= v1.10.4
+export EMQX_EE_DASHBOARD_VERSION ?= e1.8.4
 
-# `:=` should be used here, otherwise the `$(shell ...)` will be executed every time when the variable is used
-# In make 4.4+, for backward-compatibility the value from the original environment is used.
-# so the shell script will be executed tons of times.
-# https://github.com/emqx/emqx/pull/10627
-ifeq ($(strip $(OTP_VSN)),)
-	export OTP_VSN := $(shell $(SCRIPTS)/get-otp-vsn.sh)
-endif
-ifeq ($(strip $(ELIXIR_VSN)),)
-	export ELIXIR_VSN := $(shell $(SCRIPTS)/get-elixir-vsn.sh)
-endif
+export EMQX_RELUP ?= true
+export EMQX_REL_FORM ?= tgz
 
+-include default-profile.mk
 PROFILE ?= emqx
 REL_PROFILES := emqx emqx-enterprise
 PKG_PROFILES := emqx-pkg emqx-enterprise-pkg
@@ -39,6 +27,8 @@ CT_READABLE ?= true
 CT_COVER_EXPORT_PREFIX ?= $(PROFILE)
 
 export REBAR_GIT_CLONE_OPTIONS += --depth=1
+
+ELIXIR_COMMON_DEPS := ensure-hex ensure-mix-rebar3 ensure-mix-rebar
 
 .PHONY: default
 default: $(REBAR) $(PROFILE)
@@ -59,7 +49,8 @@ $(REBAR): .prepare ensure-rebar3
 
 .PHONY: ensure-hex
 ensure-hex:
-	@mix local.hex --if-missing --force
+	# @mix local.hex --if-missing --force
+	@mix local.hex 2.0.6 --if-missing --force
 
 .PHONY: ensure-mix-rebar3
 ensure-mix-rebar3: $(REBAR)
@@ -69,17 +60,21 @@ ensure-mix-rebar3: $(REBAR)
 ensure-mix-rebar: $(REBAR)
 	@mix local.rebar --if-missing --force
 
+
+.PHONY: elixir-common-deps
+elixir-common-deps: $(ELIXIR_COMMON_DEPS)
+
 .PHONY: mix-deps-get
-mix-deps-get: $(ELIXIR_COMMON_DEPS)
+mix-deps-get: elixir-common-deps
 	@mix deps.get
 
 .PHONY: eunit
 eunit: $(REBAR) merge-config
-	@ENABLE_COVER_COMPILE=1 $(REBAR) eunit -v -c --cover_export_name $(CT_COVER_EXPORT_PREFIX)-eunit
+	@$(REBAR) eunit --name eunit@127.0.0.1 -c -v --cover_export_name $(CT_COVER_EXPORT_PREFIX)-eunit
 
 .PHONY: proper
 proper: $(REBAR)
-	@ENABLE_COVER_COMPILE=1 $(REBAR) proper -d test/props -c
+	@$(REBAR) proper -d test/props -c
 
 .PHONY: test-compile
 test-compile: $(REBAR) merge-config
@@ -91,7 +86,7 @@ $(REL_PROFILES:%=%-compile): $(REBAR) merge-config
 
 .PHONY: ct
 ct: $(REBAR) merge-config
-	@ENABLE_COVER_COMPILE=1 $(REBAR) ct --name $(CT_NODE_NAME) -c -v --cover_export_name $(CT_COVER_EXPORT_PREFIX)-ct
+	@env ERL_FLAGS="-kernel prevent_overlapping_partitions false" $(REBAR) ct --name $(CT_NODE_NAME) -c -v --cover_export_name $(CT_COVER_EXPORT_PREFIX)-ct
 
 ## only check bpapi for enterprise profile because it's a super-set.
 .PHONY: static_checks
@@ -101,31 +96,56 @@ static_checks:
 	./scripts/check-i18n-style.sh
 	./scripts/check_missing_reboot_apps.exs
 
-APPS=$(shell $(SCRIPTS)/find-apps.sh)
+# Allow user-set CASES environment variable
+ifneq ($(CASES),)
+CASES_ARG := --case $(CASES)
+endif
 
-.PHONY: $(APPS:%=%-ct)
+# Allow user-set GROUPS environment variable
+ifneq ($(GROUPS),)
+GROUPS_ARG := --group $(GROUPS)
+endif
+
+ifeq ($(ENABLE_COVER_COMPILE),1)
+cover_args = --cover --cover_export_name $(CT_COVER_EXPORT_PREFIX)-$(subst /,-,$1)
+else
+cover_args =
+endif
+
+## example:
+## env SUITES=apps/appname/test/test_SUITE.erl CASES=t_foo make apps/appname-ct
 define gen-app-ct-target
 $1-ct: $(REBAR) merge-config clean-test-cluster-config
 	$(eval SUITES := $(shell $(SCRIPTS)/find-suites.sh $1))
 ifneq ($(SUITES),)
-		ENABLE_COVER_COMPILE=1 $(REBAR) ct -c -v \
-			--readable=$(CT_READABLE) \
-			--name $(CT_NODE_NAME) \
-			--cover_export_name $(CT_COVER_EXPORT_PREFIX)-$(subst /,-,$1) \
-			--suite $(SUITES)
+	env ERL_FLAGS="-kernel prevent_overlapping_partitions false" $(REBAR) ct -v \
+		--readable=$(CT_READABLE) \
+		--name $(CT_NODE_NAME) \
+		$(call cover_args,$1) \
+		--suite $(SUITES) \
+		$(GROUPS_ARG) \
+		$(CASES_ARG)
 else
-		@echo 'No suites found for $1'
+	@echo 'No suites found for $1'
 endif
 endef
-$(foreach app,$(APPS),$(eval $(call gen-app-ct-target,$(app))))
+
+ifneq ($(filter %-ct,$(MAKECMDGOALS)),)
+app_to_test := $(patsubst %-ct,%,$(filter %-ct,$(MAKECMDGOALS)))
+$(call DEBUG_INFO,app_to_test $(app_to_test))
+$(eval $(call gen-app-ct-target,$(app_to_test)))
+endif
 
 ## apps/name-prop targets
-.PHONY: $(APPS:%=%-prop)
 define gen-app-prop-target
 $1-prop:
 	$(REBAR) proper -d test/props -v -m $(shell $(SCRIPTS)/find-props.sh $1)
 endef
-$(foreach app,$(APPS),$(eval $(call gen-app-prop-target,$(app))))
+ifneq ($(filter %-prop,$(MAKECMDGOALS)),)
+app_to_test := $(patsubst %-prop,%,$(filter %-prop,$(MAKECMDGOALS)))
+$(call DEBUG_INFO,app_to_test $(app_to_test))
+$(eval $(call gen-app-prop-target,$(app_to_test)))
+endif
 
 .PHONY: ct-suite
 ct-suite: $(REBAR) merge-config clean-test-cluster-config
@@ -175,8 +195,8 @@ $(PROFILES:%=clean-%):
 	@if [ -d _build/$(@:clean-%=%) ]; then \
 		rm -f rebar.lock; \
 		rm -rf _build/$(@:clean-%=%)/rel; \
-		$(FIND) _build/$(@:clean-%=%) -name '*.beam' -o -name '*.so' -o -name '*.app' -o -name '*.appup' -o -name '*.o' -o -name '*.d' -type f | xargs rm -f; \
-		$(FIND) _build/$(@:clean-%=%) -type l -delete; \
+		find _build/$(@:clean-%=%) -name '*.beam' -o -name '*.so' -o -name '*.app' -o -name '*.appup' -o -name '*.o' -o -name '*.d' -type f | xargs rm -f; \
+		find _build/$(@:clean-%=%) -type l -delete; \
 	fi
 
 .PHONY: clean-all
@@ -224,7 +244,7 @@ $(foreach zt,$(ALL_ZIPS),$(eval $(call download-relup-packages,$(zt))))
 ## relup target is to create relup instructions
 .PHONY: $(REL_PROFILES:%=%-relup)
 define gen-relup-target
-$1-relup: $1-relup-downloads $(COMMON_DEPS)
+$1-relup: $(COMMON_DEPS)
 	@$(BUILD) $1 relup
 endef
 ALL_TGZS = $(REL_PROFILES)
@@ -233,7 +253,7 @@ $(foreach zt,$(ALL_TGZS),$(eval $(call gen-relup-target,$(zt))))
 ## tgz target is to create a release package .tar.gz with relup
 .PHONY: $(REL_PROFILES:%=%-tgz)
 define gen-tgz-target
-$1-tgz: $1-relup
+$1-tgz: $(COMMON_DEPS)
 	@$(BUILD) $1 tgz
 endef
 ALL_TGZS = $(REL_PROFILES)
@@ -296,10 +316,34 @@ $(foreach tt,$(ALL_ELIXIR_TGZS),$(eval $(call gen-elixir-tgz-target,$(tt))))
 
 .PHONY: fmt
 fmt: $(REBAR)
-	@$(SCRIPTS)/erlfmt -w '{apps,lib-ee}/*/{src,include,priv,test}/**/*.{erl,hrl,app.src,eterm}'
-	@$(SCRIPTS)/erlfmt -w 'rebar.config.erl'
+	@find . \( -name '*.app.src' -o \
+						 -name '*.erl' -o \
+					   -name '*.hrl' -o \
+			  		 -name 'rebar.config' -o \
+			  		 -name '*.eterm' -o \
+			  		 -name '*.escript' \) \
+	                          -not -path '*/_build/*' \
+	                          -not -path '*/deps/*' \
+	                          -not -path '*/_checkouts/*' \
+	                          -type f \
+		| xargs $(SCRIPTS)/erlfmt -w
+	@$(SCRIPTS)/erlfmt -w 'apps/emqx/rebar.config.script'
+	@$(SCRIPTS)/erlfmt -w 'elvis.config'
+	@$(SCRIPTS)/erlfmt -w 'bin/nodetool'
 	@mix format
+
+.PHONY: fmt-diff
+fmt-diff:
+	@env ERLFMT_WRITE=true ./scripts/git-hook-pre-commit.sh
 
 .PHONY: clean-test-cluster-config
 clean-test-cluster-config:
 	@rm -f apps/emqx_conf/data/configs/cluster.hocon || true
+
+.PHONY: spellcheck
+spellcheck:
+	./scripts/spellcheck/spellcheck.sh _build/docgen/$(PROFILE)/schema-en.json
+
+.PHONY: nothing
+nothing:
+	@:

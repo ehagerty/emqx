@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_node_rebalance_api).
 
@@ -31,7 +31,9 @@
     '/load_rebalance/:node/start'/2,
     '/load_rebalance/:node/stop'/2,
     '/load_rebalance/:node/evacuation/start'/2,
-    '/load_rebalance/:node/evacuation/stop'/2
+    '/load_rebalance/:node/evacuation/stop'/2,
+    '/load_rebalance/:node/purge/start'/2,
+    '/load_rebalance/:node/purge/stop'/2
 ]).
 
 %% Schema examples
@@ -48,6 +50,7 @@
 -define(NODE_EVACUATING, 'NODE_EVACUATING').
 -define(RPC_ERROR, 'RPC_ERROR').
 -define(NOT_FOUND, 'NOT_FOUND').
+-define(TAGS, [<<"Load Rebalance">>]).
 
 %%--------------------------------------------------------------------
 %% API Spec
@@ -67,13 +70,16 @@ paths() ->
         "/load_rebalance/:node/stop",
         "/load_rebalance/:node/evacuation/start",
         "/load_rebalance/:node/evacuation/stop"
+        %% TODO: uncomment after we officially release the feature.
+        %% "/load_rebalance/:node/purge/start",
+        %% "/load_rebalance/:node/purge/stop"
     ].
 
 schema("/load_rebalance/status") ->
     #{
         'operationId' => '/load_rebalance/status',
         get => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Get rebalance status">>,
             description => ?DESC("load_rebalance_status"),
             responses => #{
@@ -85,7 +91,7 @@ schema("/load_rebalance/global_status") ->
     #{
         'operationId' => '/load_rebalance/global_status',
         get => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Get global rebalance status">>,
             description => ?DESC("load_rebalance_global_status"),
             responses => #{
@@ -97,20 +103,21 @@ schema("/load_rebalance/availability_check") ->
     #{
         'operationId' => '/load_rebalance/availability_check',
         get => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Node rebalance availability check">>,
             description => ?DESC("load_rebalance_availability_check"),
             responses => #{
                 200 => response_schema(),
                 503 => error_codes([?NODE_EVACUATING], <<"Node Evacuating">>)
-            }
+            },
+            security => []
         }
     };
 schema("/load_rebalance/:node/start") ->
     #{
         'operationId' => '/load_rebalance/:node/start',
         post => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Start rebalancing with the node as coordinator">>,
             description => ?DESC("load_rebalance_start"),
             parameters => [param_node()],
@@ -130,7 +137,7 @@ schema("/load_rebalance/:node/stop") ->
     #{
         'operationId' => '/load_rebalance/:node/stop',
         post => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Stop rebalancing coordinated by the node">>,
             description => ?DESC("load_rebalance_stop"),
             parameters => [param_node()],
@@ -145,7 +152,7 @@ schema("/load_rebalance/:node/evacuation/start") ->
     #{
         'operationId' => '/load_rebalance/:node/evacuation/start',
         post => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Start evacuation on a node">>,
             description => ?DESC("load_rebalance_evacuation_start"),
             parameters => [param_node()],
@@ -165,7 +172,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
     #{
         'operationId' => '/load_rebalance/:node/evacuation/stop',
         post => #{
-            tags => [<<"load_rebalance">>],
+            tags => ?TAGS,
             summary => <<"Stop evacuation on a node">>,
             description => ?DESC("load_rebalance_evacuation_stop"),
             parameters => [param_node()],
@@ -176,6 +183,42 @@ schema("/load_rebalance/:node/evacuation/stop") ->
             }
         }
     }.
+%% TODO: uncomment after we officially release the feature.
+%% schema("/load_rebalance/:node/purge/start") ->
+%%     #{
+%%         'operationId' => '/load_rebalance/:node/purge/start',
+%%         post => #{
+%%             tags => ?TAGS,
+%%             summary => <<"Start purge on the whole cluster">>,
+%%             description => ?DESC("cluster_purge_start"),
+%%             parameters => [param_node()],
+%%             'requestBody' =>
+%%                 emqx_dashboard_swagger:schema_with_examples(
+%%                     ref(purge_start),
+%%                     purge_example()
+%%                 ),
+%%             responses => #{
+%%                 200 => response_schema(),
+%%                 400 => error_codes([?BAD_REQUEST], <<"Bad Request">>),
+%%                 404 => error_codes([?NOT_FOUND], <<"Not Found">>)
+%%             }
+%%         }
+%%     };
+%% schema("/load_rebalance/:node/purge/stop") ->
+%%     #{
+%%         'operationId' => '/load_rebalance/:node/purge/stop',
+%%         post => #{
+%%             tags => ?TAGS,
+%%             summary => <<"Stop purge on the whole cluster">>,
+%%             description => ?DESC("cluster_purge_stop"),
+%%             parameters => [param_node()],
+%%             responses => #{
+%%                 200 => response_schema(),
+%%                 400 => error_codes([?BAD_REQUEST], <<"Bad Request">>),
+%%                 404 => error_codes([?NOT_FOUND], <<"Not Found">>)
+%%             }
+%%         }
+%%     }.
 
 %%--------------------------------------------------------------------
 %% Handlers
@@ -188,24 +231,28 @@ schema("/load_rebalance/:node/evacuation/stop") ->
         {rebalance, Stats} ->
             {200, format_status(rebalance, Stats)};
         {evacuation, Stats} ->
-            {200, format_status(evacuation, Stats)}
+            {200, format_status(evacuation, Stats)};
+        {purge, Stats} ->
+            {200, format_status(purge, Stats)}
     end.
 
 '/load_rebalance/global_status'(get, #{}) ->
     #{
         evacuations := Evacuations,
+        purges := Purges,
         rebalances := Rebalances
     } = emqx_node_rebalance_status:global_status(),
     {200, #{
         evacuations => format_as_map_list(Evacuations),
+        purges => format_as_map_list(Purges),
         rebalances => format_as_map_list(Rebalances)
     }}.
 
 '/load_rebalance/availability_check'(get, #{}) ->
-    case emqx_node_rebalance_status:local_status() of
-        disabled ->
+    case emqx_node_rebalance_status:availability_status() of
+        available ->
             {200, #{}};
-        _ ->
+        unavailable ->
             error_response(503, ?NODE_EVACUATING, <<"Node Evacuating">>)
     end.
 
@@ -214,7 +261,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
         Params1 = translate(rebalance_start, Params0),
         with_nodes_at_key(nodes, Params1, fun(Params2) ->
             wrap_rpc(
-                Node, emqx_node_rebalance_api_proto_v1:node_rebalance_start(Node, Params2)
+                Node, emqx_node_rebalance_api_proto_v2:node_rebalance_start(Node, Params2)
             )
         end)
     end).
@@ -222,7 +269,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
 '/load_rebalance/:node/stop'(post, #{bindings := #{node := NodeBin}}) ->
     emqx_utils_api:with_node(NodeBin, fun(Node) ->
         wrap_rpc(
-            Node, emqx_node_rebalance_api_proto_v1:node_rebalance_stop(Node)
+            Node, emqx_node_rebalance_api_proto_v2:node_rebalance_stop(Node)
         )
     end).
 
@@ -234,7 +281,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
         with_nodes_at_key(migrate_to, Params1, fun(Params2) ->
             wrap_rpc(
                 Node,
-                emqx_node_rebalance_api_proto_v1:node_rebalance_evacuation_start(
+                emqx_node_rebalance_api_proto_v2:node_rebalance_evacuation_start(
                     Node, Params2
                 )
             )
@@ -244,7 +291,27 @@ schema("/load_rebalance/:node/evacuation/stop") ->
 '/load_rebalance/:node/evacuation/stop'(post, #{bindings := #{node := NodeBin}}) ->
     emqx_utils_api:with_node(NodeBin, fun(Node) ->
         wrap_rpc(
-            Node, emqx_node_rebalance_api_proto_v1:node_rebalance_evacuation_stop(Node)
+            Node, emqx_node_rebalance_api_proto_v2:node_rebalance_evacuation_stop(Node)
+        )
+    end).
+
+'/load_rebalance/:node/purge/start'(post, #{
+    bindings := #{node := NodeBin}, body := Params0
+}) ->
+    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+        Params1 = translate(purge_start, Params0),
+        wrap_rpc(
+            Node,
+            emqx_node_rebalance_api_proto_v2:node_rebalance_purge_start(
+                Node, Params1
+            )
+        )
+    end).
+
+'/load_rebalance/:node/purge/stop'(post, #{bindings := #{node := NodeBin}}) ->
+    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+        wrap_rpc(
+            Node, emqx_node_rebalance_api_proto_v2:node_rebalance_purge_stop(Node)
         )
     end).
 
@@ -356,7 +423,7 @@ param_node() ->
 
 fields(rebalance_start) ->
     [
-        {"wait_health_check",
+        {wait_health_check,
             mk(
                 emqx_schema:timeout_duration_s(),
                 #{
@@ -364,7 +431,7 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"conn_evict_rate",
+        {conn_evict_rate,
             mk(
                 pos_integer(),
                 #{
@@ -372,7 +439,15 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"sess_evict_rate",
+        {conn_evict_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(conn_evict_rpc_timeout),
+                    required => false
+                }
+            )},
+        {sess_evict_rate,
             mk(
                 pos_integer(),
                 #{
@@ -380,7 +455,15 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"abs_conn_threshold",
+        {sess_evict_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(sess_evict_rpc_timeout),
+                    required => false
+                }
+            )},
+        {abs_conn_threshold,
             mk(
                 pos_integer(),
                 #{
@@ -388,7 +471,7 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"rel_conn_threshold",
+        {rel_conn_threshold,
             mk(
                 number(),
                 #{
@@ -397,7 +480,7 @@ fields(rebalance_start) ->
                     validator => [fun(Value) -> Value > 1.0 end]
                 }
             )},
-        {"abs_sess_threshold",
+        {abs_sess_threshold,
             mk(
                 pos_integer(),
                 #{
@@ -405,7 +488,7 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"rel_sess_threshold",
+        {rel_sess_threshold,
             mk(
                 number(),
                 #{
@@ -414,7 +497,7 @@ fields(rebalance_start) ->
                     validator => [fun(Value) -> Value > 1.0 end]
                 }
             )},
-        {"wait_takeover",
+        {wait_takeover,
             mk(
                 emqx_schema:timeout_duration_s(),
                 #{
@@ -422,7 +505,7 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
-        {"nodes",
+        {nodes,
             mk(
                 list(binary()),
                 #{
@@ -434,7 +517,7 @@ fields(rebalance_start) ->
     ];
 fields(rebalance_evacuation_start) ->
     [
-        {"wait_health_check",
+        {wait_health_check,
             mk(
                 emqx_schema:timeout_duration_s(),
                 #{
@@ -442,7 +525,7 @@ fields(rebalance_evacuation_start) ->
                     required => false
                 }
             )},
-        {"conn_evict_rate",
+        {conn_evict_rate,
             mk(
                 pos_integer(),
                 #{
@@ -450,7 +533,7 @@ fields(rebalance_evacuation_start) ->
                     required => false
                 }
             )},
-        {"sess_evict_rate",
+        {sess_evict_rate,
             mk(
                 pos_integer(),
                 #{
@@ -458,7 +541,7 @@ fields(rebalance_evacuation_start) ->
                     required => false
                 }
             )},
-        {"redirect_to",
+        {redirect_to,
             mk(
                 binary(),
                 #{
@@ -466,7 +549,7 @@ fields(rebalance_evacuation_start) ->
                     required => false
                 }
             )},
-        {"wait_takeover",
+        {wait_takeover,
             mk(
                 emqx_schema:timeout_duration_s(),
                 #{
@@ -474,7 +557,7 @@ fields(rebalance_evacuation_start) ->
                     required => false
                 }
             )},
-        {"migrate_to",
+        {migrate_to,
             mk(
                 nonempty_list(binary()),
                 #{
@@ -483,9 +566,20 @@ fields(rebalance_evacuation_start) ->
                 }
             )}
     ];
+fields(purge_start) ->
+    [
+        {purge_rate,
+            mk(
+                pos_integer(),
+                #{
+                    desc => ?DESC(purge_rate),
+                    required => false
+                }
+            )}
+    ];
 fields(local_status_disabled) ->
     [
-        {"status",
+        {status,
             mk(
                 disabled,
                 #{
@@ -496,7 +590,7 @@ fields(local_status_disabled) ->
     ];
 fields(local_status_enabled) ->
     [
-        {"status",
+        {status,
             mk(
                 enabled,
                 #{
@@ -504,7 +598,7 @@ fields(local_status_enabled) ->
                     required => true
                 }
             )},
-        {"process",
+        {process,
             mk(
                 hoconsc:enum([rebalance, evacuation]),
                 #{
@@ -512,7 +606,7 @@ fields(local_status_enabled) ->
                     required => true
                 }
             )},
-        {"state",
+        {state,
             mk(
                 atom(),
                 #{
@@ -520,7 +614,7 @@ fields(local_status_enabled) ->
                     required => true
                 }
             )},
-        {"coordinator_node",
+        {coordinator_node,
             mk(
                 binary(),
                 #{
@@ -528,7 +622,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"connection_eviction_rate",
+        {connection_eviction_rate,
             mk(
                 pos_integer(),
                 #{
@@ -536,7 +630,15 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"session_eviction_rate",
+        {connection_eviction_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(local_status_connection_eviction_rpc_timeout),
+                    required => false
+                }
+            )},
+        {session_eviction_rate,
             mk(
                 pos_integer(),
                 #{
@@ -544,7 +646,15 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"connection_goal",
+        {session_eviction_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_s(),
+                #{
+                    desc => ?DESC(local_status_session_eviction_rpc_timeout),
+                    required => false
+                }
+            )},
+        {connection_goal,
             mk(
                 non_neg_integer(),
                 #{
@@ -552,7 +662,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"session_goal",
+        {session_goal,
             mk(
                 non_neg_integer(),
                 #{
@@ -560,7 +670,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"disconnected_session_goal",
+        {disconnected_session_goal,
             mk(
                 non_neg_integer(),
                 #{
@@ -568,7 +678,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"session_recipients",
+        {session_recipients,
             mk(
                 list(binary()),
                 #{
@@ -576,7 +686,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"recipients",
+        {recipients,
             mk(
                 list(binary()),
                 #{
@@ -584,7 +694,7 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
-        {"stats",
+        {stats,
             mk(
                 ref(status_stats),
                 #{
@@ -595,7 +705,7 @@ fields(local_status_enabled) ->
     ];
 fields(status_stats) ->
     [
-        {"initial_connected",
+        {initial_connected,
             mk(
                 non_neg_integer(),
                 #{
@@ -603,7 +713,7 @@ fields(status_stats) ->
                     required => true
                 }
             )},
-        {"current_connected",
+        {current_connected,
             mk(
                 non_neg_integer(),
                 #{
@@ -611,7 +721,7 @@ fields(status_stats) ->
                     required => true
                 }
             )},
-        {"initial_sessions",
+        {initial_sessions,
             mk(
                 non_neg_integer(),
                 #{
@@ -619,7 +729,7 @@ fields(status_stats) ->
                     required => true
                 }
             )},
-        {"current_sessions",
+        {current_sessions,
             mk(
                 non_neg_integer(),
                 #{
@@ -627,7 +737,7 @@ fields(status_stats) ->
                     required => true
                 }
             )},
-        {"current_disconnected_sessions",
+        {current_disconnected_sessions,
             mk(
                 non_neg_integer(),
                 #{
@@ -638,11 +748,11 @@ fields(status_stats) ->
     ];
 fields(global_coordinator_status) ->
     without(
-        ["status", "process", "session_goal", "session_recipients", "stats"],
+        [status, process, session_goal, session_recipients, stats],
         fields(local_status_enabled)
     ) ++
         [
-            {"donors",
+            {donors,
                 mk(
                     list(binary()),
                     #{
@@ -650,7 +760,7 @@ fields(global_coordinator_status) ->
                         required => false
                     }
                 )},
-            {"donor_conn_avg",
+            {donor_conn_avg,
                 mk(
                     non_neg_integer(),
                     #{
@@ -658,7 +768,7 @@ fields(global_coordinator_status) ->
                         required => false
                     }
                 )},
-            {"donor_sess_avg",
+            {donor_sess_avg,
                 mk(
                     non_neg_integer(),
                     #{
@@ -666,7 +776,7 @@ fields(global_coordinator_status) ->
                         required => false
                     }
                 )},
-            {"node",
+            {node,
                 mk(
                     binary(),
                     #{
@@ -676,9 +786,41 @@ fields(global_coordinator_status) ->
                 )}
         ];
 fields(global_evacuation_status) ->
-    without(["status", "process"], fields(local_status_enabled)) ++
+    without([status, process], fields(local_status_enabled)) ++
         [
-            {"node",
+            {node,
+                mk(
+                    binary(),
+                    #{
+                        desc => ?DESC(evacuation_status_node),
+                        required => true
+                    }
+                )}
+        ];
+fields(global_purge_status) ->
+    without(
+        [
+            status,
+            process,
+            connection_eviction_rate,
+            session_eviction_rate,
+            connection_goal,
+            disconnected_session_goal,
+            session_recipients,
+            recipients
+        ],
+        fields(local_status_enabled)
+    ) ++
+        [
+            {purge_rate,
+                mk(
+                    pos_integer(),
+                    #{
+                        desc => ?DESC(local_status_purge_rate),
+                        required => false
+                    }
+                )},
+            {node,
                 mk(
                     binary(),
                     #{
@@ -689,7 +831,7 @@ fields(global_evacuation_status) ->
         ];
 fields(global_status) ->
     [
-        {"evacuations",
+        {evacuations,
             mk(
                 hoconsc:array(ref(global_evacuation_status)),
                 #{
@@ -697,7 +839,15 @@ fields(global_status) ->
                     required => false
                 }
             )},
-        {"rebalances",
+        {purges,
+            mk(
+                hoconsc:array(ref(global_purge_status)),
+                #{
+                    desc => ?DESC(global_status_purges),
+                    required => false
+                }
+            )},
+        {rebalances,
             mk(
                 hoconsc:array(ref(global_coordinator_status)),
                 #{
@@ -734,6 +884,10 @@ rebalance_evacuation_example() ->
             migrate_to => [<<"othernode@127.0.0.1">>]
         }
     }.
+
+%% TODO: uncomment after we officially release the feature.
+%% purge_example() ->
+%%     #{purge => #{purge_rate => 100}}.
 
 local_status_response_schema() ->
     hoconsc:union([ref(local_status_disabled), ref(local_status_enabled)]).

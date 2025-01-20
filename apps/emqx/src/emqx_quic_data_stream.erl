@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -82,11 +82,11 @@ activate_data(StreamPid, {PS, Serialize, Channel}) ->
     {ok, cb_state()}.
 init_handoff(
     Stream,
-    _StreamOpts,
+    #{conn_shared_state := ConnSharedState} = _StreamOpts,
     Connection,
     #{is_orphan := true, flags := Flags}
 ) ->
-    {ok, init_state(Stream, Connection, Flags)}.
+    {ok, init_state(Stream, Connection, Flags, ConnSharedState)}.
 
 %%
 %% @doc Post handoff data stream
@@ -124,7 +124,7 @@ send_complete(_Stream, false, S) ->
 send_complete(_Stream, true = _IsCanceled, S) ->
     {ok, S}.
 
--spec send_shutdown_complete(stream_handle(), error_code(), cb_state()) -> cb_ret().
+-spec send_shutdown_complete(stream_handle(), IsGraceful :: boolean(), cb_state()) -> cb_ret().
 send_shutdown_complete(_Stream, _Flags, S) ->
     {ok, S}.
 
@@ -215,10 +215,17 @@ do_handle_appl_msg(
         {error, E} ->
             {stop, E, S}
     end;
-do_handle_appl_msg({incoming, #mqtt_packet{} = Packet}, #{channel := Channel} = S) when
+do_handle_appl_msg(
+    {incoming, #mqtt_packet{} = Packet},
+    #{
+        channel := Channel,
+        conn_shared_state := #{cnts_ref := SharedCntsRef}
+    } = S
+) when
     Channel =/= undefined
 ->
     ok = inc_incoming_stats(Packet),
+    _ = emqx_quic_connection:step_cnt(SharedCntsRef, control_packet, 1),
     with_channel(handle_in, [Packet], S);
 do_handle_appl_msg({incoming, {frame_error, _} = FE}, #{channel := Channel} = S) when
     Channel =/= undefined
@@ -321,14 +328,15 @@ serialize_packet(Packet, Serialize) ->
 -spec init_state(
     quicer:stream_handle(),
     quicer:connection_handle(),
-    quicer:new_stream_props()
+    non_neg_integer(),
+    map()
 ) ->
     % @TODO
     map().
-init_state(Stream, Connection, OpenFlags) ->
-    init_state(Stream, Connection, OpenFlags, undefined).
+init_state(Stream, Connection, OpenFlags, ConnSharedState) ->
+    init_state(Stream, Connection, OpenFlags, ConnSharedState, undefined).
 
-init_state(Stream, Connection, OpenFlags, PS) ->
+init_state(Stream, Connection, OpenFlags, ConnSharedState, PS) ->
     %% quic stream handle
     #{
         stream => Stream,
@@ -350,7 +358,9 @@ init_state(Stream, Connection, OpenFlags, PS) ->
         %% serialize opts for connection
         serialize => undefined,
         %% Current working queue
-        task_queue => queue:new()
+        task_queue => queue:new(),
+        %% Connection Shared State
+        conn_shared_state => ConnSharedState
     }.
 
 -spec do_handle_call(term(), cb_state()) -> cb_ret().
@@ -368,7 +378,7 @@ do_handle_call(
         ok ->
             {reply, ok, NewS};
         {error, E} ->
-            ?SLOG(error, #{msg => "set stream active failed", error => E}),
+            ?SLOG(error, #{msg => "set_stream_active_failed", error => E}),
             {stop, E, NewS}
     end;
 do_handle_call(_Call, _S) ->
@@ -381,12 +391,14 @@ parse_incoming(Data, PS) ->
     catch
         throw:{?FRAME_PARSE_ERROR, Reason} ->
             ?SLOG(info, #{
+                msg => "frame_parse_error",
                 reason => Reason,
                 input_bytes => Data
             }),
             {[{frame_error, Reason}], PS};
         error:Reason:Stacktrace ->
             ?SLOG(error, #{
+                msg => "frame_parse_failed",
                 input_bytes => Data,
                 reason => Reason,
                 stacktrace => Stacktrace
@@ -400,7 +412,7 @@ do_parse_incoming(Data, Packets, ParseState) ->
     case emqx_frame:parse(Data, ParseState) of
         {more, NParseState} ->
             {Packets, NParseState};
-        {ok, Packet, Rest, NParseState} ->
+        {Packet, Rest, NParseState} ->
             do_parse_incoming(Rest, [Packet | Packets], NParseState)
     end.
 

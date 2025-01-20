@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,7 +26,14 @@
 -export([init/1]).
 
 ensure_child(ResId, Group, ResourceType, Config, Opts) ->
-    _ = supervisor:start_child(?MODULE, child_spec(ResId, Group, ResourceType, Config, Opts)),
+    case supervisor:start_child(?MODULE, child_spec(ResId, Group, ResourceType, Config, Opts)) of
+        {error, Reason} ->
+            %% This should not happen in production but it can be a huge time sink in
+            %% development environments if the error is just silently ignored.
+            error(Reason);
+        _ ->
+            ok
+    end,
     ok.
 
 delete_child(ResId) ->
@@ -49,12 +56,18 @@ init([]) ->
     {ok, {SupFlags, ChildSpecs}}.
 
 child_spec(ResId, Group, ResourceType, Config, Opts) ->
+    RestartType =
+        case emqx_resource:is_dry_run(ResId) of
+            true -> temporary;
+            false -> transient
+        end,
     #{
         id => ResId,
-        start => {emqx_resource_manager, start_link, [ResId, Group, ResourceType, Config, Opts]},
-        restart => transient,
+        start =>
+            {emqx_resource_manager, start_link, [ResId, Group, ResourceType, Config, Opts]},
+        restart => RestartType,
         %% never force kill a resource manager.
-        %% becasue otherwise it may lead to release leak,
+        %% because otherwise it may lead to release leak,
         %% resource_manager's terminate callback calls resource on_stop
         shutdown => infinity,
         type => worker,

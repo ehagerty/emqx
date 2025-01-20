@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,11 +24,14 @@
     request/2,
     request/3,
     request/4,
+    request/5,
+    request/6,
     multipart_formdata_request/3,
     multipart_formdata_request/4,
     host/0,
     uri/0,
-    uri/1
+    uri/1,
+    uri/2
 ]).
 
 -define(HOST, "http://127.0.0.1:18083").
@@ -60,7 +63,8 @@ set_default_config(DefaultUsername, HAProxyEnabled, Opts) ->
         },
         default_username => DefaultUsername,
         default_password => <<"public">>,
-        i18n_lang => en
+        i18n_lang => en,
+        password_expired_time => 0
     },
     emqx_config:put([dashboard], Config),
     ok.
@@ -72,16 +76,25 @@ request(Method, Url, Body) ->
     request(<<"admin">>, Method, Url, Body).
 
 request(Username, Method, Url, Body) ->
+    request(Username, <<"public">>, Method, Url, Body).
+
+request(Username, Password, Method, Url, Body) ->
+    request(Username, Password, Method, Url, Body, #{}).
+
+request(Username, Password, Method, Url, Body0, Headers) ->
     Request =
-        case Body of
+        case Body0 of
             [] when
                 Method =:= get orelse Method =:= put orelse
                     Method =:= head orelse Method =:= delete orelse
                     Method =:= trace
             ->
-                {Url, [auth_header(Username)]};
+                {Url, [auth_header(Username, Password)]};
             _ ->
-                {Url, [auth_header(Username)], "application/json", emqx_utils_json:encode(Body)}
+                ContentType = maps:get("content-type", Headers, "application/json"),
+                HeadersList = maps:to_list(maps:without(["content-type"], Headers)),
+                Body = maybe_encode(Body0),
+                {Url, [auth_header(Username, Password) | HeadersList], ContentType, Body}
         end,
     ct:pal("Method: ~p, Request: ~p", [Method, Request]),
     case httpc:request(Method, Request, [], [{body_format, binary}]) of
@@ -93,17 +106,27 @@ request(Username, Method, Url, Body) ->
             {error, Reason}
     end.
 
+maybe_encode(Body) when is_binary(Body) -> Body;
+maybe_encode(Body) -> emqx_utils_json:encode(Body).
+
 host() ->
     ?HOST.
 
-uri() -> uri([]).
+uri() ->
+    uri([]).
+
 uri(Parts) when is_list(Parts) ->
+    uri(host(), Parts).
+
+uri(Host, Parts) when is_list(Host), is_list(Parts) ->
     NParts = [E || E <- Parts],
-    host() ++ "/" ++ to_list(filename:join([?BASE_PATH, ?API_VERSION | NParts])).
+    Host ++ "/" ++ to_list(filename:join([?BASE_PATH, ?API_VERSION | NParts])).
 
 auth_header(Username) ->
-    Password = <<"public">>,
-    {ok, Token} = emqx_dashboard_admin:sign_token(Username, Password),
+    auth_header(Username, <<"public">>).
+
+auth_header(Username, Password) ->
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
     {"Authorization", "Bearer " ++ binary_to_list(Token)}.
 
 multipart_formdata_request(Url, Fields, Files) ->

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 -include("rule_engine.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("stdlib/include/qlc.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -export([start_link/0]).
 
@@ -46,14 +47,10 @@
     get_rules_for_topic/1,
     get_rules_with_same_event/1,
     get_rule_ids_by_action/1,
+    get_rule_ids_by_bridge_action/1,
+    get_rule_ids_by_bridge_source/1,
     ensure_action_removed/2,
     get_rules_ordered_by_ts/0
-]).
-
-%% exported for cluster_call
--export([
-    do_delete_rule/1,
-    do_insert_rule/1
 ]).
 
 -export([
@@ -61,7 +58,8 @@
     unload_hooks_for_rule/1,
     maybe_add_metrics_for_rule/1,
     clear_metrics_for_rule/1,
-    reset_metrics_for_rule/1
+    reset_metrics_for_rule/1,
+    reset_metrics_for_rule/2
 ]).
 
 %% exported for `emqx_telemetry'
@@ -106,12 +104,15 @@
     'actions.success',
     'actions.failed',
     'actions.failed.out_of_service',
-    'actions.failed.unknown'
+    'actions.failed.unknown',
+    'actions.discarded'
 ]).
 
 -define(RATE_METRICS, ['matched']).
 
 -type action_name() :: binary() | #{function := binary()}.
+-type bridge_action_id() :: binary().
+-type bridge_source_id() :: binary().
 
 -spec start_link() -> {ok, pid()} | ignore | {error, Reason :: term()}.
 start_link() ->
@@ -120,10 +121,10 @@ start_link() ->
 %%----------------------------------------------------------------------------------------
 %% The config handler for emqx_rule_engine
 %%------------------------------------------------------------------------------
-post_config_update(?RULE_PATH(RuleId), _Req, NewRule, undefined, _AppEnvs) ->
-    create_rule(NewRule#{id => bin(RuleId)});
 post_config_update(?RULE_PATH(RuleId), '$remove', undefined, _OldRule, _AppEnvs) ->
     delete_rule(bin(RuleId));
+post_config_update(?RULE_PATH(RuleId), _Req, NewRule, undefined, _AppEnvs) ->
+    create_rule(NewRule#{id => bin(RuleId)});
 post_config_update(?RULE_PATH(RuleId), _Req, NewRule, _OldRule, _AppEnvs) ->
     update_rule(NewRule#{id => bin(RuleId)});
 post_config_update([rule_engine], _Req, #{rules := NewRules}, #{rules := OldRules}, _AppEnvs) ->
@@ -176,7 +177,7 @@ create_rule(Params) ->
 
 create_rule(Params = #{id := RuleId}, CreatedAt) when is_binary(RuleId) ->
     case get_rule(RuleId) of
-        not_found -> parse_and_insert(Params, CreatedAt);
+        not_found -> with_parsed_rule(Params, CreatedAt, fun insert_rule/1);
         {ok, _} -> {error, already_exists}
     end.
 
@@ -185,17 +186,26 @@ update_rule(Params = #{id := RuleId}) when is_binary(RuleId) ->
     case get_rule(RuleId) of
         not_found ->
             {error, not_found};
-        {ok, #{created_at := CreatedAt}} ->
-            parse_and_insert(Params, CreatedAt)
+        {ok, RulePrev = #{created_at := CreatedAt}} ->
+            with_parsed_rule(Params, CreatedAt, fun(Rule) -> update_rule(Rule, RulePrev) end)
     end.
 
 -spec delete_rule(RuleId :: rule_id()) -> ok.
 delete_rule(RuleId) when is_binary(RuleId) ->
-    gen_server:call(?RULE_ENGINE, {delete_rule, RuleId}, ?T_CALL).
+    case get_rule(RuleId) of
+        not_found ->
+            ok;
+        {ok, Rule} ->
+            gen_server:call(?RULE_ENGINE, {delete_rule, Rule}, ?T_CALL)
+    end.
 
 -spec insert_rule(Rule :: rule()) -> ok.
 insert_rule(Rule) ->
     gen_server:call(?RULE_ENGINE, {insert_rule, Rule}, ?T_CALL).
+
+-spec update_rule(Rule :: rule(), RulePrev :: rule()) -> ok.
+update_rule(Rule, RulePrev) ->
+    gen_server:call(?RULE_ENGINE, {update_rule, Rule, RulePrev}, ?T_CALL).
 
 %%----------------------------------------------------------------------------------------
 %% Rule Management
@@ -217,8 +227,8 @@ get_rules_ordered_by_ts() ->
 get_rules_for_topic(Topic) ->
     [
         Rule
-     || Rule = #{from := From} <- get_rules(),
-        emqx_topic:match_any(Topic, From)
+     || M <- emqx_topic_index:matches(Topic, ?RULE_TOPIC_INDEX, [unique]),
+        Rule <- lookup_rule(emqx_topic_index:get_id(M))
     ].
 
 -spec get_rules_with_same_event(Topic :: binary()) -> [rule()].
@@ -250,6 +260,24 @@ get_rule_ids_by_action(#{function := FuncName}) when is_binary(FuncName) ->
         contains_actions(Acts, Mod, Fun)
     ].
 
+-spec get_rule_ids_by_bridge_action(bridge_action_id()) -> [binary()].
+get_rule_ids_by_bridge_action(ActionId) ->
+    %% ActionId = <<"type:name">>
+    [
+        Id
+     || #{actions := Acts, id := Id} <- get_rules(),
+        forwards_to_bridge(Acts, ActionId)
+    ].
+
+-spec get_rule_ids_by_bridge_source(bridge_source_id()) -> [binary()].
+get_rule_ids_by_bridge_source(SourceId) ->
+    %% SourceId = <<"type:name">>
+    [
+        Id
+     || #{from := Froms, id := Id} <- get_rules(),
+        references_ingress_bridge(Froms, SourceId)
+    ].
+
 -spec ensure_action_removed(rule_id(), action_name()) -> ok.
 ensure_action_removed(RuleId, ActionName) ->
     FilterFunc =
@@ -276,10 +304,13 @@ is_of_event_name(EventName, Topic) ->
 
 -spec get_rule(Id :: rule_id()) -> {ok, rule()} | not_found.
 get_rule(Id) ->
-    case ets:lookup(?RULE_TAB, Id) of
-        [{Id, Rule}] -> {ok, Rule#{id => Id}};
+    case lookup_rule(Id) of
+        [Rule] -> {ok, Rule};
         [] -> not_found
     end.
+
+lookup_rule(Id) ->
+    [Rule || {_Id, Rule} <- ets:lookup(?RULE_TAB, Id)].
 
 load_hooks_for_rule(#{from := Topics}) ->
     lists:foreach(fun emqx_rule_events:load/1, Topics).
@@ -295,8 +326,13 @@ maybe_add_metrics_for_rule(Id) ->
 clear_metrics_for_rule(Id) ->
     ok = emqx_metrics_worker:clear_metrics(rule_metrics, Id).
 
+%% Tip: Don't delete reset_metrics_for_rule/1, use before v572 rpc
 -spec reset_metrics_for_rule(rule_id()) -> ok.
 reset_metrics_for_rule(Id) ->
+    reset_metrics_for_rule(Id, #{}).
+
+-spec reset_metrics_for_rule(rule_id(), map()) -> ok.
+reset_metrics_for_rule(Id, _Opts) ->
     emqx_metrics_worker:reset_metrics(rule_metrics, Id).
 
 unload_hooks_for_rule(#{id := Id, from := Topics}) ->
@@ -411,21 +447,28 @@ init([]) ->
     {ok, #{}}.
 
 handle_call({insert_rule, Rule}, _From, State) ->
-    do_insert_rule(Rule),
+    ok = do_insert_rule(Rule),
+    ok = do_update_rule_index(Rule),
+    {reply, ok, State};
+handle_call({update_rule, Rule, RulePrev}, _From, State) ->
+    ok = do_delete_rule_index(RulePrev),
+    ok = do_insert_rule(Rule),
+    ok = do_update_rule_index(Rule),
     {reply, ok, State};
 handle_call({delete_rule, Rule}, _From, State) ->
-    do_delete_rule(Rule),
+    ok = do_delete_rule_index(Rule),
+    ok = do_delete_rule(Rule),
     {reply, ok, State};
 handle_call(Req, _From, State) ->
-    ?SLOG(error, #{msg => "unexpected_call", request => Req}),
+    ?SLOG(error, #{msg => "unexpected_call", request => Req}, #{tag => ?TAG}),
     {reply, ignored, State}.
 
 handle_cast(Msg, State) ->
-    ?SLOG(error, #{msg => "unexpected_cast", request => Msg}),
+    ?SLOG(error, #{msg => "unexpected_cast", request => Msg}, #{tag => ?TAG}),
     {noreply, State}.
 
 handle_info(Info, State) ->
-    ?SLOG(error, #{msg => "unexpected_info", request => Info}),
+    ?SLOG(error, #{msg => "unexpected_info", request => Info}, #{tag => ?TAG}),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -438,15 +481,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Functions
 %%----------------------------------------------------------------------------------------
 
-parse_and_insert(Params = #{id := RuleId, sql := Sql, actions := Actions}, CreatedAt) ->
+with_parsed_rule(Params = #{id := RuleId, sql := Sql, actions := Actions}, CreatedAt, Fun) ->
     case emqx_rule_sqlparser:parse(Sql) of
         {ok, Select} ->
-            Rule = #{
+            Rule0 = #{
                 id => RuleId,
                 name => maps:get(name, Params, <<"">>),
                 created_at => CreatedAt,
                 updated_at => now_ms(),
-                enable => maps:get(enable, Params, true),
                 sql => Sql,
                 actions => parse_actions(Actions),
                 description => maps:get(description, Params, ""),
@@ -459,7 +501,19 @@ parse_and_insert(Params = #{id := RuleId, sql := Sql, actions := Actions}, Creat
                 conditions => emqx_rule_sqlparser:select_where(Select)
                 %% -- calculated fields end
             },
-            ok = insert_rule(Rule),
+            InputEnable = maps:get(enable, Params, true),
+            case validate_bridge_existence_in_actions(Rule0) of
+                ok ->
+                    ok;
+                {error, NonExistentBridgeIDs} ->
+                    ?tp(error, "action_references_nonexistent_bridges", #{
+                        rule_id => RuleId,
+                        nonexistent_bridge_ids => NonExistentBridgeIDs,
+                        hint => "this rule will be disabled"
+                    })
+            end,
+            Rule = Rule0#{enable => InputEnable},
+            ok = Fun(Rule),
             {ok, Rule};
         {error, Reason} ->
             {error, Reason}
@@ -468,28 +522,36 @@ parse_and_insert(Params = #{id := RuleId, sql := Sql, actions := Actions}, Creat
 do_insert_rule(#{id := Id} = Rule) ->
     ok = load_hooks_for_rule(Rule),
     ok = maybe_add_metrics_for_rule(Id),
-    true = ets:insert(?RULE_TAB, {Id, maps:remove(id, Rule)}),
+    true = ets:insert(?RULE_TAB, {Id, Rule}),
     ok.
 
-do_delete_rule(RuleId) ->
-    case get_rule(RuleId) of
-        {ok, Rule} ->
-            ok = unload_hooks_for_rule(Rule),
-            ok = clear_metrics_for_rule(RuleId),
-            true = ets:delete(?RULE_TAB, RuleId),
-            ok;
-        not_found ->
-            ok
-    end.
+do_delete_rule(#{id := Id} = Rule) ->
+    ok = unload_hooks_for_rule(Rule),
+    ok = clear_metrics_for_rule(Id),
+    true = ets:delete(?RULE_TAB, Id),
+    ok.
+
+do_update_rule_index(#{id := Id, from := From}) ->
+    ok = lists:foreach(
+        fun(Topic) ->
+            true = emqx_topic_index:insert(Topic, Id, [], ?RULE_TOPIC_INDEX)
+        end,
+        From
+    ).
+
+do_delete_rule_index(#{id := Id, from := From}) ->
+    ok = lists:foreach(
+        fun(Topic) ->
+            true = emqx_topic_index:delete(Topic, Id, ?RULE_TOPIC_INDEX)
+        end,
+        From
+    ).
 
 parse_actions(Actions) ->
     [do_parse_action(Act) || Act <- Actions].
 
-do_parse_action(Action) when is_map(Action) ->
-    emqx_rule_actions:parse_action(Action);
-do_parse_action(BridgeId) when is_binary(BridgeId) ->
-    {Type, Name} = emqx_bridge_resource:parse_bridge_id(BridgeId),
-    {bridge, Type, Name, emqx_bridge_resource:resource_id(Type, Name)}.
+do_parse_action(Action) ->
+    emqx_rule_actions:parse_action(Action).
 
 get_all_records(Tab) ->
     [Rule#{id => Id} || {Id, Rule} <- ets:tab2list(Tab)].
@@ -544,10 +606,18 @@ get_referenced_hookpoints(Froms) ->
     ].
 
 get_egress_bridges(Actions) ->
-    [
-        emqx_bridge_resource:bridge_id(BridgeType, BridgeName)
-     || {bridge, BridgeType, BridgeName, _ResId} <- Actions
-    ].
+    lists:foldr(
+        fun
+            ({bridge, BridgeType, BridgeName, _ResId}, Acc) ->
+                [emqx_bridge_resource:bridge_id(BridgeType, BridgeName) | Acc];
+            ({bridge_v2, BridgeType, BridgeName}, Acc) ->
+                [emqx_bridge_resource:bridge_id(BridgeType, BridgeName) | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        Actions
+    ).
 
 %% For allowing an external application to add extra "built-in" functions to the
 %% rule engine SQL like language. The module set by
@@ -566,3 +636,52 @@ extra_functions_module() ->
 set_extra_functions_module(Mod) ->
     persistent_term:put({?MODULE, extra_functions}, Mod),
     ok.
+
+%% Checks whether the referenced bridges in actions all exist.  If there are non-existent
+%% ones, the rule shouldn't be allowed to be enabled.
+%% The actions here are already parsed.
+validate_bridge_existence_in_actions(#{actions := Actions, from := Froms} = _Rule) ->
+    BridgeIDs0 =
+        lists:map(
+            fun(BridgeID) ->
+                %% FIXME: this supposedly returns an upgraded type, but it's fuzzy: it
+                %% returns v1 types when attempting to "upgrade".....
+                {Type, Name} =
+                    emqx_bridge_resource:parse_bridge_id(BridgeID, #{atom_name => false}),
+                case emqx_action_info:is_action_type(Type) of
+                    true -> {source, Type, Name};
+                    false -> {bridge_v1, Type, Name}
+                end
+            end,
+            get_referenced_hookpoints(Froms)
+        ),
+    BridgeIDs1 =
+        lists:filtermap(
+            fun
+                ({bridge_v2, Type, Name}) -> {true, {action, Type, Name}};
+                ({bridge, Type, Name, _ResId}) -> {true, {bridge_v1, Type, Name}};
+                (_) -> false
+            end,
+            Actions
+        ),
+    NonExistentBridgeIDs =
+        lists:filter(
+            fun({Kind, Type, Name}) ->
+                IsExist =
+                    case Kind of
+                        action -> fun emqx_bridge_v2:is_action_exist/2;
+                        source -> fun emqx_bridge_v2:is_source_exist/2;
+                        bridge_v1 -> fun emqx_bridge:is_exist_v1/2
+                    end,
+                try
+                    not IsExist(Type, Name)
+                catch
+                    _:_ -> true
+                end
+            end,
+            BridgeIDs0 ++ BridgeIDs1
+        ),
+    case NonExistentBridgeIDs of
+        [] -> ok;
+        _ -> {error, #{nonexistent_bridge_ids => NonExistentBridgeIDs}}
+    end.

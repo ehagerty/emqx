@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 
 -include_lib("er_coap_client/include/coap.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
@@ -57,13 +58,23 @@ all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
     application:load(emqx_gateway_coap),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_authn, emqx_gateway]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, ?CONF_DEFAULT},
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_) ->
-    {ok, _} = emqx:remove_config([<<"gateway">>, <<"coap">>]),
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_authn, emqx_conf]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    emqx_config:delete_override_conf_files(),
+    ok.
 
 init_per_testcase(t_connection_with_authn_failed, Config) ->
     ok = meck:new(emqx_access_control, [passthrough]),
@@ -73,10 +84,41 @@ init_per_testcase(t_connection_with_authn_failed, Config) ->
         fun(_) -> {error, bad_username_or_password} end
     ),
     Config;
+init_per_testcase(t_connection_with_expire, Config) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 100}}
+        end
+    ),
+    snabbkaffe:start_trace(),
+    Config;
+init_per_testcase(t_heartbeat, Config) ->
+    NewHeartbeat = 800,
+    OldConf = emqx:get_raw_config([gateway, coap]),
+    {ok, _} = emqx_gateway_conf:update_gateway(
+        coap,
+        OldConf#{<<"heartbeat">> => <<"1s">>}
+    ),
+    [
+        {old_conf, OldConf},
+        {new_heartbeat, NewHeartbeat}
+        | Config
+    ];
 init_per_testcase(_, Config) ->
     ok = meck:new(emqx_access_control, [passthrough]),
     Config.
 
+end_per_testcase(t_heartbeat, Config) ->
+    OldConf = ?config(old_conf, Config),
+    {ok, _} = emqx_gateway_conf:update_gateway(coap, OldConf),
+    ok;
+end_per_testcase(t_connection_with_expire, Config) ->
+    snabbkaffe:stop(),
+    meck:unload(emqx_access_control),
+    Config;
 end_per_testcase(_, Config) ->
     ok = meck:unload(emqx_access_control),
     Config.
@@ -103,6 +145,8 @@ restart_coap_with_connection_mode(Bool) ->
 
 t_connection(_) ->
     Action = fun(Channel) ->
+        emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
         %% connection
         Token = connection(Channel),
 
@@ -112,14 +156,81 @@ t_connection(_) ->
             emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
         ),
 
-        %% heartbeat
-        HeartURI =
-            ?MQTT_PREFIX ++
-                "/connection?clientid=client1&token=" ++
-                Token,
+        ?assertMatch(
+            ['client.connect' | _],
+            emqx_gateway_test_utils:collect_emqx_hooks_calls()
+        ),
 
-        ?LOGT("send heartbeat request:~ts~n", [HeartURI]),
-        {ok, changed, _} = er_coap_client:request(put, HeartURI),
+        %% heartbeat
+        {ok, changed, _} = send_heartbeat(Token),
+
+        disconnection(Channel, Token),
+
+        timer:sleep(100),
+        ?assertEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        )
+    end,
+    do(Action),
+    ok.
+
+t_connection_with_short_param_name(_) ->
+    Action = fun(Channel) ->
+        %% connection
+        Token = connection(Channel, true),
+
+        timer:sleep(100),
+        ?assertNotEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        ),
+
+        %% heartbeat
+        {ok, changed, _} = send_heartbeat(Token, true),
+
+        disconnection(Channel, Token, true),
+
+        timer:sleep(100),
+        ?assertEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        )
+    end,
+    do(Action).
+
+t_heartbeat(Config) ->
+    Heartbeat = ?config(new_heartbeat, Config),
+    Action = fun(Channel) ->
+        Token = connection(Channel),
+
+        timer:sleep(100),
+        ?assertNotEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        ),
+
+        %% must keep client connection alive
+        Delay = Heartbeat div 2,
+        lists:foreach(
+            fun(_) ->
+                ?assertMatch({ok, changed, _}, send_heartbeat(Token)),
+                timer:sleep(Delay)
+            end,
+            lists:seq(1, 5)
+        ),
+
+        ?assertNotEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        ),
+        %% The minimum timeout time is 1 second.
+        %% 1.5 * Heartbeat + 0.5 * Heartbeat(< 1s) = 1.5 * 1 + 1 = 2.5
+        timer:sleep(Heartbeat * 2 + 1000),
+        ?assertEqual(
+            [],
+            emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        ),
 
         disconnection(Channel, Token),
 
@@ -184,6 +295,26 @@ t_connection_with_authn_failed(_) ->
     ),
     ok.
 
+t_connection_with_expire(_) ->
+    ChId = {{127, 0, 0, 1}, 5683},
+    {ok, Sock} = er_coap_udp_socket:start_link(),
+    {ok, Channel} = er_coap_udp_socket:get_channel(Sock, ChId),
+
+    URI = ?MQTT_PREFIX ++ "/connection?clientid=client1",
+
+    ?assertWaitEvent(
+        begin
+            Req = make_req(post),
+            {ok, created, _Data} = do_request(Channel, URI, Req)
+        end,
+        #{
+            ?snk_kind := conn_process_terminated,
+            clientid := <<"client1">>,
+            reason := {shutdown, expired}
+        },
+        5000
+    ).
+
 t_publish(_) ->
     %% can publish to a normal topic
     Topics = [
@@ -207,7 +338,8 @@ t_publish(_) ->
                 ?assertEqual(Payload, Msg#message.payload)
         after 500 ->
             ?assert(false)
-        end
+        end,
+        true
     end,
     with_connection(Topics, Action).
 
@@ -237,7 +369,9 @@ t_publish_with_retain_qos_expiry(_) ->
                 ?assertEqual(Payload, Msg#message.payload)
         after 500 ->
             ?assert(false)
-        end
+        end,
+
+        true
     end,
     with_connection(Topics, Action),
 
@@ -269,7 +403,8 @@ t_subscribe(_) ->
 
         #coap_content{payload = PayloadRecv} = Notify,
 
-        ?assertEqual(Payload, PayloadRecv)
+        ?assertEqual(Payload, PayloadRecv),
+        true
     end,
 
     with_connection(Topics, Fun),
@@ -278,6 +413,46 @@ t_subscribe(_) ->
     timer:sleep(100),
     lists:foreach(
         fun(Topic) ->
+            ?assertEqual([], emqx:subscribers(Topic))
+        end,
+        Topics
+    ).
+
+t_subscribe_with_qos_opt(_) ->
+    Topics = [
+        {<<"abc">>, 0},
+        {<<"/abc">>, 1},
+        {<<"abc/d">>, 2}
+    ],
+    Fun = fun({Topic, Qos}, Channel, Token) ->
+        Payload = <<"123">>,
+        URI = pubsub_uri(binary_to_list(Topic), Token) ++ "&qos=" ++ integer_to_list(Qos),
+        Req = make_req(get, Payload, [{observe, 0}]),
+        {ok, content, _} = do_request(Channel, URI, Req),
+        ?LOGT("observer topic:~ts~n", [Topic]),
+
+        %% ensure subscribe succeed
+        timer:sleep(100),
+        [SubPid] = emqx:subscribers(Topic),
+        ?assert(is_pid(SubPid)),
+        ?assertEqual(Qos, maps:get(qos, emqx_broker:get_subopts(SubPid, Topic))),
+        %% publish a message
+        emqx:publish(emqx_message:make(Topic, Payload)),
+        {ok, content, Notify} = with_response(Channel),
+        ?LOGT("observer get Notif=~p", [Notify]),
+
+        #coap_content{payload = PayloadRecv} = Notify,
+
+        ?assertEqual(Payload, PayloadRecv),
+        true
+    end,
+
+    with_connection(Topics, Fun),
+
+    %% subscription removed if coap client disconnected
+    timer:sleep(100),
+    lists:foreach(
+        fun({Topic, _Qos}) ->
             ?assertEqual([], emqx:subscribers(Topic))
         end,
         Topics
@@ -306,7 +481,8 @@ t_un_subscribe(_) ->
         {ok, nocontent, _} = do_request(Channel, URI, UnReq),
         ?LOGT("un observer topic:~ts~n", [Topic]),
         timer:sleep(100),
-        ?assertEqual([], emqx:subscribers(Topic))
+        ?assertEqual([], emqx:subscribers(Topic)),
+        true
     end,
 
     with_connection(Topics, Fun).
@@ -335,7 +511,8 @@ t_observe_wildcard(_) ->
 
         #coap_content{payload = PayloadRecv} = Notify,
 
-        ?assertEqual(Payload, PayloadRecv)
+        ?assertEqual(Payload, PayloadRecv),
+        true
     end,
 
     with_connection(Fun).
@@ -364,11 +541,14 @@ t_clients_api(_) ->
             request(get, "/gateways/coap/clients/client1"),
         %% assert
         Client1 = Client2 = Client3 = Client4,
+        %% assert keepalive
+        ?assertEqual(15, maps:get(keepalive, Client4)),
         %% kickout
         {204, _} =
             request(delete, "/gateways/coap/clients/client1"),
         timer:sleep(200),
-        {200, #{data := []}} = request(get, "/gateways/coap/clients")
+        {200, #{data := []}} = request(get, "/gateways/coap/clients"),
+        false
     end,
     with_connection(Fun).
 
@@ -398,7 +578,8 @@ t_clients_subscription_api(_) ->
 
         {204, _} = request(delete, Path ++ "/tx"),
 
-        {200, []} = request(get, Path)
+        {200, []} = request(get, Path),
+        true
     end,
     with_connection(Fun).
 
@@ -416,7 +597,8 @@ t_clients_get_subscription_api(_) ->
 
         observe(Channel, Token, false),
 
-        {200, []} = request(get, Path)
+        {200, []} = request(get, Path),
+        true
     end,
     with_connection(Fun).
 
@@ -481,28 +663,68 @@ t_connectionless_pubsub(_) ->
 %%--------------------------------------------------------------------
 %% helpers
 
+send_heartbeat(Token) ->
+    send_heartbeat(Token, false).
+
+send_heartbeat(Token, ShortenParamName) ->
+    Prefix = ?MQTT_PREFIX ++ "/connection",
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "token" => Token
+    },
+    URI = compose_uri(Prefix, Queries, ShortenParamName),
+    ?LOGT("send heartbeat request:~ts~n", [URI]),
+    er_coap_client:request(put, URI).
+
 connection(Channel) ->
-    URI =
-        ?MQTT_PREFIX ++
-            "/connection?clientid=client1&username=admin&password=public",
+    connection(Channel, false).
+
+connection(Channel, ShortenParamName) ->
+    Prefix = ?MQTT_PREFIX ++ "/connection",
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "username" => <<"admin">>,
+        "password" => <<"public">>
+    },
+    URI = compose_uri(Prefix, Queries, ShortenParamName),
     Req = make_req(post),
     {ok, created, Data} = do_request(Channel, URI, Req),
     #coap_content{payload = BinToken} = Data,
     binary_to_list(BinToken).
 
 disconnection(Channel, Token) ->
-    %% delete
-    URI = ?MQTT_PREFIX ++ "/connection?clientid=client1&token=" ++ Token,
+    disconnection(Channel, Token, false).
+
+disconnection(Channel, Token, ShortenParamName) ->
+    Prefix = ?MQTT_PREFIX ++ "/connection",
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "token" => Token
+    },
+    URI = compose_uri(Prefix, Queries, ShortenParamName),
     Req = make_req(delete),
     {ok, deleted, _} = do_request(Channel, URI, Req).
 
-observe(Channel, Token, true) ->
-    URI = ?PS_PREFIX ++ "/coap/observe?clientid=client1&token=" ++ Token,
+observe(Channel, Token, Observe) ->
+    observe(Channel, Token, Observe, false).
+
+observe(Channel, Token, true, ShortenParamName) ->
+    Prefix = ?PS_PREFIX ++ "/coap/observe",
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "token" => Token
+    },
+    URI = compose_uri(Prefix, Queries, ShortenParamName),
     Req = make_req(get, <<>>, [{observe, 0}]),
     {ok, content, _Data} = do_request(Channel, URI, Req),
     ok;
-observe(Channel, Token, false) ->
-    URI = ?PS_PREFIX ++ "/coap/observe?clientid=client1&token=" ++ Token,
+observe(Channel, Token, false, ShortenParamName) ->
+    Prefix = ?PS_PREFIX ++ "/coap/observe",
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "token" => Token
+    },
+    URI = compose_uri(Prefix, Queries, ShortenParamName),
     Req = make_req(get, <<>>, [{observe, 1}]),
     {ok, nocontent, _Data} = do_request(Channel, URI, Req),
     ok.
@@ -510,8 +732,16 @@ observe(Channel, Token, false) ->
 pubsub_uri(Topic) when is_list(Topic) ->
     ?PS_PREFIX ++ "/" ++ Topic.
 
-pubsub_uri(Topic, Token) when is_list(Topic), is_list(Token) ->
-    ?PS_PREFIX ++ "/" ++ Topic ++ "?clientid=client1&token=" ++ Token.
+pubsub_uri(Topic, Token) ->
+    pubsub_uri(Topic, Token, false).
+
+pubsub_uri(Topic, Token, ShortenParamName) when is_list(Topic), is_list(Token) ->
+    Prefix = ?PS_PREFIX ++ "/" ++ Topic,
+    Queries = #{
+        "clientid" => <<"client1">>,
+        "token" => Token
+    },
+    compose_uri(Prefix, Queries, ShortenParamName).
 
 make_req(Method) ->
     make_req(Method, <<>>).
@@ -563,8 +793,7 @@ with_connection(Action) ->
     Fun = fun(Channel) ->
         Token = connection(Channel),
         timer:sleep(100),
-        Action(Channel, Token),
-        disconnection(Channel, Token),
+        _ = Action(Channel, Token) andalso disconnection(Channel, Token),
         timer:sleep(100)
     end,
     do(Fun).
@@ -591,3 +820,28 @@ get_field(type, #coap_message{type = Type}) ->
     Type;
 get_field(method, #coap_message{method = Method}) ->
     Method.
+
+compose_uri(URI, Queries, ShortenParamName) ->
+    Queries1 = shorten_param_name(ShortenParamName, Queries),
+    case maps:size(Queries1) of
+        0 ->
+            URI;
+        _ ->
+            URI ++ "?" ++ uri_string:compose_query(maps:to_list(Queries1))
+    end.
+
+shorten_param_name(false, Queries) ->
+    Queries;
+shorten_param_name(true, Queries) ->
+    lists:foldl(
+        fun({Short, Long}, Acc) ->
+            case maps:take(Long, Acc) of
+                error ->
+                    Acc;
+                {Value, Acc1} ->
+                    maps:put(Short, Value, Acc1)
+            end
+        end,
+        Queries,
+        emqx_coap_message:query_params_mapping_table()
+    ).

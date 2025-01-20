@@ -1,31 +1,39 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_cassandra_connector).
 
 -behaviour(emqx_resource).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include("emqx_bridge_cassandra.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
 
 %% schema
--export([roots/0, fields/1]).
+-export([roots/0, fields/1, desc/1, namespace/0]).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channel_status/3,
+    on_get_channels/1,
     on_query/3,
     on_query_async/4,
     on_batch_query/3,
     on_batch_query_async/4,
-    on_get_status/2
+    on_get_status/2,
+    on_format_query_result/1
 ]).
 
 %% callbacks of ecpool
@@ -37,18 +45,12 @@
 %% callbacks for query executing
 -export([query/4, prepared_query/4, batch_query/3]).
 
--export([do_get_status/1]).
-
--type prepares() :: #{atom() => binary()}.
--type params_tokens() :: #{atom() => list()}.
+-export([do_get_status/1, get_reconnect_callback_signature/1]).
 
 -type state() ::
     #{
         pool_name := binary(),
-        prepare_cql := prepares(),
-        params_tokens := params_tokens(),
-        %% returned by ecql:prepare/2
-        prepare_statement := binary()
+        channels := #{}
     }.
 
 -define(DEFAULT_SERVER_OPTION, #{default_port => ?CASSANDRA_DEFAULT_PORT}).
@@ -56,13 +58,17 @@
 %%--------------------------------------------------------------------
 %% schema
 
+namespace() -> cassandra.
+
 roots() ->
     [{config, #{type => hoconsc:ref(?MODULE, config)}}].
 
 fields(config) ->
     cassandra_db_fields() ++
         emqx_connector_schema_lib:ssl_fields() ++
-        emqx_connector_schema_lib:prepare_statement_fields().
+        emqx_connector_schema_lib:prepare_statement_fields();
+fields("connector") ->
+    cassandra_db_fields() ++ emqx_connector_schema_lib:ssl_fields().
 
 cassandra_db_fields() ->
     [
@@ -70,7 +76,7 @@ cassandra_db_fields() ->
         {keyspace, fun keyspace/1},
         {pool_size, fun emqx_connector_schema_lib:pool_size/1},
         {username, fun emqx_connector_schema_lib:username/1},
-        {password, fun emqx_connector_schema_lib:password/1},
+        {password, emqx_connector_schema_lib:password_field()},
         {auto_reconnect, fun emqx_connector_schema_lib:auto_reconnect/1}
     ].
 
@@ -83,18 +89,23 @@ keyspace(desc) -> ?DESC("keyspace");
 keyspace(required) -> true;
 keyspace(_) -> undefined.
 
+desc(config) ->
+    ?DESC("config");
+desc("connector") ->
+    ?DESC("connector").
+
 %%--------------------------------------------------------------------
 %% callbacks for emqx_resource
+resource_type() -> cassandra.
 
 callback_mode() -> async_if_possible.
 
--spec on_start(binary(), hoconsc:config()) -> {ok, state()} | {error, _}.
+-spec on_start(binary(), hocon:config()) -> {ok, state()} | {error, _}.
 on_start(
     InstId,
     #{
         servers := Servers0,
         keyspace := Keyspace,
-        username := Username,
         pool_size := PoolSize,
         ssl := SSL
     } = Config
@@ -112,14 +123,14 @@ on_start(
             emqx_schema:parse_servers(Servers0, ?DEFAULT_SERVER_OPTION)
         ),
 
-    Options = [
-        {nodes, Servers},
-        {username, Username},
-        {password, emqx_secret:wrap(maps:get(password, Config, ""))},
-        {keyspace, Keyspace},
-        {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
-        {pool_size, PoolSize}
-    ],
+    Options =
+        maps:to_list(maps:with([username, password], Config)) ++
+            [
+                {nodes, Servers},
+                {keyspace, Keyspace},
+                {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
+                {pool_size, PoolSize}
+            ],
 
     SslOpts =
         case maps:get(enable, SSL) of
@@ -131,10 +142,9 @@ on_start(
             false ->
                 []
         end,
-    State = parse_prepare_cql(Config),
     case emqx_resource_pool:start(InstId, ?MODULE, Options ++ SslOpts) of
         ok ->
-            {ok, init_prepare(State#{pool_name => InstId, prepare_statement => #{}})};
+            {ok, #{pool_name => InstId, channels => #{}}};
         {error, Reason} ->
             ?tp(
                 cassandra_connector_start_failed,
@@ -150,23 +160,49 @@ on_stop(InstId, _State) ->
     }),
     emqx_resource_pool:stop(InstId).
 
+on_add_channel(_InstId, #{channels := Channs} = OldState, ChannId, ChannConf0) ->
+    #{parameters := #{cql := CQL}} = ChannConf0,
+    {PrepareCQL, ParamsTokens} = emqx_placeholder:preproc_sql(CQL, '?'),
+    ParsedCql = #{
+        prepare_key => make_prepare_key(ChannId),
+        prepare_cql => PrepareCQL,
+        params_tokens => ParamsTokens
+    },
+    NewChanns = Channs#{ChannId => #{parsed_cql => ParsedCql, prepare_result => not_prepared}},
+    {ok, OldState#{channels => NewChanns}}.
+
+on_remove_channel(_InstanceId, #{channels := Channels} = State, ChannId) ->
+    NewState = State#{channels => maps:remove(ChannId, Channels)},
+    {ok, NewState}.
+
+on_get_channel_status(InstanceId, ChannId, #{channels := Channels, pool_name := PoolName} = State) ->
+    case on_get_status(InstanceId, State) of
+        connected ->
+            #{parsed_cql := ParsedCql} = maps:get(ChannId, Channels),
+            case prepare_cql_to_cassandra(ParsedCql, PoolName) of
+                {ok, _} -> connected;
+                {error, Reason} -> {connecting, Reason}
+            end;
+        _ ->
+            connecting
+    end.
+
+on_get_channels(InstanceId) ->
+    emqx_bridge_v2:get_channels_for_connector(InstanceId).
+
 -type request() ::
     % emqx_bridge.erl
-    {send_message, Params :: map()}
+    {ChannId :: binary(), Params :: map()}
     % common query
-    | {query, SQL :: binary()}
-    | {query, SQL :: binary(), Params :: map()}.
+    | {query, CQL :: binary()}
+    | {query, CQL :: binary(), Params :: map()}.
 
 -spec on_query(
     emqx_resource:resource_id(),
     request(),
     state()
 ) -> ok | {ok, ecql:cql_result()} | {error, {recoverable_error | unrecoverable_error, term()}}.
-on_query(
-    InstId,
-    Request,
-    State
-) ->
+on_query(InstId, Request, State) ->
     do_single_query(InstId, Request, sync, State).
 
 -spec on_query_async(
@@ -175,21 +211,11 @@ on_query(
     {function(), list()},
     state()
 ) -> ok | {error, {recoverable_error | unrecoverable_error, term()}}.
-on_query_async(
-    InstId,
-    Request,
-    Callback,
-    State
-) ->
+on_query_async(InstId, Request, Callback, State) ->
     do_single_query(InstId, Request, {async, Callback}, State).
 
-do_single_query(
-    InstId,
-    Request,
-    Async,
-    #{pool_name := PoolName} = State
-) ->
-    {Type, PreparedKeyOrSQL, Params} = parse_request_to_cql(Request),
+do_single_query(InstId, Request, Async, #{pool_name := PoolName} = State) ->
+    {Type, PreparedKeyOrCQL, Params} = parse_request_to_cql(Request),
     ?tp(
         debug,
         cassandra_connector_received_cql_query,
@@ -197,12 +223,17 @@ do_single_query(
             connector => InstId,
             type => Type,
             params => Params,
-            prepared_key_or_cql => PreparedKeyOrSQL,
+            prepared_key_or_cql => PreparedKeyOrCQL,
             state => State
         }
     ),
-    {PreparedKeyOrSQL1, Data} = proc_cql_params(Type, PreparedKeyOrSQL, Params, State),
-    Res = exec_cql_query(InstId, PoolName, Type, Async, PreparedKeyOrSQL1, Data),
+    {PreparedKeyOrCQL1, Data} = proc_cql_params(Type, PreparedKeyOrCQL, Params, State),
+    emqx_trace:rendered_action_template(PreparedKeyOrCQL, #{
+        type => Type,
+        key_or_cql => PreparedKeyOrCQL1,
+        data => Data
+    }),
+    Res = exec_cql_query(InstId, PoolName, Type, Async, PreparedKeyOrCQL1, Data),
     handle_result(Res).
 
 -spec on_batch_query(
@@ -210,11 +241,7 @@ do_single_query(
     [request()],
     state()
 ) -> ok | {error, {recoverable_error | unrecoverable_error, term()}}.
-on_batch_query(
-    InstId,
-    Requests,
-    State
-) ->
+on_batch_query(InstId, Requests, State) ->
     do_batch_query(InstId, Requests, sync, State).
 
 -spec on_batch_query_async(
@@ -223,25 +250,15 @@ on_batch_query(
     {function(), list()},
     state()
 ) -> ok | {error, {recoverable_error | unrecoverable_error, term()}}.
-on_batch_query_async(
-    InstId,
-    Requests,
-    Callback,
-    State
-) ->
+on_batch_query_async(InstId, Requests, Callback, State) ->
     do_batch_query(InstId, Requests, {async, Callback}, State).
 
-do_batch_query(
-    InstId,
-    Requests,
-    Async,
-    #{pool_name := PoolName} = State
-) ->
+do_batch_query(InstId, Requests, Async, #{pool_name := PoolName} = State) ->
     CQLs =
         lists:map(
             fun(Request) ->
-                {Type, PreparedKeyOrSQL, Params} = parse_request_to_cql(Request),
-                proc_cql_params(Type, PreparedKeyOrSQL, Params, State)
+                {Type, PreparedKeyOrCQL, Params} = parse_request_to_cql(Request),
+                proc_cql_params(Type, PreparedKeyOrCQL, Params, State)
             end,
             Requests
         ),
@@ -254,29 +271,52 @@ do_batch_query(
             state => State
         }
     ),
+    ChannelID =
+        case Requests of
+            [{CID, _} | _] -> CID;
+            _ -> none
+        end,
+    emqx_trace:rendered_action_template(ChannelID, #{
+        cqls => #emqx_trace_format_func_data{data = CQLs, function = fun trace_format_cql_tuples/1}
+    }),
     Res = exec_cql_batch_query(InstId, PoolName, Async, CQLs),
     handle_result(Res).
 
-parse_request_to_cql({send_message, Params}) ->
-    {prepared_query, _Key = send_message, Params};
-parse_request_to_cql({query, SQL}) ->
-    parse_request_to_cql({query, SQL, #{}});
-parse_request_to_cql({query, SQL, Params}) ->
-    {query, SQL, Params}.
+trace_format_cql_tuples(Tuples) ->
+    [CQL || {_, CQL} <- Tuples].
 
-proc_cql_params(
-    prepared_query,
-    PreparedKey0,
-    Params,
-    #{prepare_statement := Prepares, params_tokens := ParamsTokens}
-) ->
-    %% assert
-    _PreparedKey = maps:get(PreparedKey0, Prepares),
-    Tokens = maps:get(PreparedKey0, ParamsTokens),
-    {PreparedKey0, assign_type_for_params(emqx_placeholder:proc_sql(Tokens, Params))};
-proc_cql_params(query, SQL, Params, _State) ->
-    {SQL1, Tokens} = emqx_placeholder:preproc_sql(SQL, '?'),
-    {SQL1, assign_type_for_params(emqx_placeholder:proc_sql(Tokens, Params))}.
+parse_request_to_cql({query, CQL}) ->
+    {query, CQL, #{}};
+parse_request_to_cql({query, CQL, Params}) ->
+    {query, CQL, Params};
+parse_request_to_cql({ChannId, Params}) ->
+    {prepared_query, ChannId, Params}.
+
+proc_cql_params(prepared_query, ChannId, Params, #{channels := Channs}) ->
+    #{
+        parsed_cql := #{
+            prepare_key := PrepareKey,
+            params_tokens := ParamsTokens
+        }
+    } = maps:get(ChannId, Channs),
+    {PrepareKey, assign_type_for_params(proc_sql(ParamsTokens, Params))};
+proc_cql_params(query, CQL, Params, _State) ->
+    {CQL1, Tokens} = emqx_placeholder:preproc_sql(CQL, '?'),
+    {CQL1, assign_type_for_params(proc_sql(Tokens, Params))}.
+
+proc_sql(Tokens, Params) ->
+    VarTrans = fun
+        (null) -> null;
+        (X) -> emqx_placeholder:sql_data(X)
+    end,
+    emqx_placeholder:proc_tmpl(
+        Tokens,
+        Params,
+        #{
+            return => rawlist,
+            var_trans => VarTrans
+        }
+    ).
 
 exec_cql_query(InstId, PoolName, Type, Async, PreparedKey, Data) when
     Type == query; Type == prepared_query
@@ -315,37 +355,14 @@ exec_cql_batch_query(InstId, PoolName, Async, CQLs) ->
 exec(PoolName, Query) ->
     ecpool:pick_and_do(PoolName, Query, no_handover).
 
-on_get_status(_InstId, #{pool_name := PoolName} = State) ->
+on_get_status(_InstId, #{pool_name := PoolName}) ->
     case emqx_resource_pool:health_check_workers(PoolName, fun ?MODULE:do_get_status/1) of
-        true ->
-            case do_check_prepares(State) of
-                ok ->
-                    connected;
-                {ok, NState} ->
-                    %% return new state with prepared statements
-                    {connected, NState};
-                false ->
-                    %% do not log error, it is logged in prepare_cql_to_conn
-                    connecting
-            end;
-        false ->
-            connecting
+        true -> ?status_connected;
+        false -> ?status_connecting
     end.
 
 do_get_status(Conn) ->
-    ok == element(1, ecql:query(Conn, "SELECT count(1) AS T FROM system.local")).
-
-do_check_prepares(#{prepare_cql := Prepares}) when is_map(Prepares) ->
-    ok;
-do_check_prepares(State = #{pool_name := PoolName, prepare_cql := {error, Prepares}}) ->
-    %% retry to prepare
-    case prepare_cql(Prepares, PoolName) of
-        {ok, Sts} ->
-            %% remove the error
-            {ok, State#{prepare_cql => Prepares, prepare_statement := Sts}};
-        _Error ->
-            false
-    end.
+    ok == element(1, ecql:query(Conn, "SELECT cluster_name FROM system.local")).
 
 %%--------------------------------------------------------------------
 %% callbacks query
@@ -388,94 +405,63 @@ conn_opts(Opts) ->
 conn_opts([], Acc) ->
     Acc;
 conn_opts([{password, Password} | Opts], Acc) ->
+    %% TODO: teach `ecql` to accept 0-arity closures as passwords.
     conn_opts(Opts, [{password, emqx_secret:unwrap(Password)} | Acc]);
 conn_opts([Opt | Opts], Acc) ->
     conn_opts(Opts, [Opt | Acc]).
 
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([#{prepare_key := PrepareKey}]) ->
+    PrepareKey.
+
 %%--------------------------------------------------------------------
 %% prepare
-
-%% XXX: hardcode
-%% note: the `cql` param is passed by emqx_bridge_cassandra
-parse_prepare_cql(#{cql := SQL}) ->
-    parse_prepare_cql([{send_message, SQL}], #{}, #{});
-parse_prepare_cql(_) ->
-    #{prepare_cql => #{}, params_tokens => #{}}.
-
-parse_prepare_cql([{Key, H} | T], Prepares, Tokens) ->
-    {PrepareSQL, ParamsTokens} = emqx_placeholder:preproc_sql(H, '?'),
-    parse_prepare_cql(
-        T, Prepares#{Key => PrepareSQL}, Tokens#{Key => ParamsTokens}
-    );
-parse_prepare_cql([], Prepares, Tokens) ->
-    #{
-        prepare_cql => Prepares,
-        params_tokens => Tokens
-    }.
-
-init_prepare(State = #{prepare_cql := Prepares, pool_name := PoolName}) ->
-    case maps:size(Prepares) of
-        0 ->
-            State;
-        _ ->
-            case prepare_cql(Prepares, PoolName) of
-                {ok, Sts} ->
-                    State#{prepare_statement := Sts};
-                Error ->
-                    ?tp(
-                        error,
-                        cassandra_prepare_cql_failed,
-                        #{prepares => Prepares, reason => Error}
-                    ),
-                    %% mark the prepare_cql as failed
-                    State#{prepare_cql => {error, Prepares}}
-            end
-    end.
-
-prepare_cql(Prepares, PoolName) when is_map(Prepares) ->
-    prepare_cql(maps:to_list(Prepares), PoolName);
-prepare_cql(Prepares, PoolName) ->
-    case do_prepare_cql(Prepares, PoolName) of
-        {ok, _Sts} = Ok ->
+prepare_cql_to_cassandra(ParsedCql, PoolName) ->
+    case prepare_cql_to_cassandra(ecpool:workers(PoolName), ParsedCql, #{}) of
+        {ok, Statement} ->
             %% prepare for reconnect
-            ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_cql_to_conn, [Prepares]}),
-            Ok;
+            ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_cql_to_conn, [ParsedCql]}),
+            {ok, Statement};
         Error ->
+            ?tp(
+                error,
+                cassandra_prepare_cql_failed,
+                #{parsed_cql => ParsedCql, reason => Error}
+            ),
             Error
     end.
 
-do_prepare_cql(Prepares, PoolName) ->
-    do_prepare_cql(ecpool:workers(PoolName), Prepares, #{}).
-
-do_prepare_cql([{_Name, Worker} | T], Prepares, _LastSts) ->
+prepare_cql_to_cassandra([{_Name, Worker} | T], ParsedCql, _LastSts) ->
     {ok, Conn} = ecpool_worker:client(Worker),
-    case prepare_cql_to_conn(Conn, Prepares) of
-        {ok, Sts} ->
-            do_prepare_cql(T, Prepares, Sts);
+    case prepare_cql_to_conn(Conn, ParsedCql) of
+        {ok, Statement} ->
+            prepare_cql_to_cassandra(T, ParsedCql, Statement);
         Error ->
             Error
     end;
-do_prepare_cql([], _Prepares, LastSts) ->
+prepare_cql_to_cassandra([], _ParsedCql, LastSts) ->
     {ok, LastSts}.
 
-prepare_cql_to_conn(Conn, Prepares) ->
-    prepare_cql_to_conn(Conn, Prepares, #{}).
-
-prepare_cql_to_conn(Conn, [], Statements) when is_pid(Conn) -> {ok, Statements};
-prepare_cql_to_conn(Conn, [{Key, SQL} | PrepareList], Statements) when is_pid(Conn) ->
-    ?SLOG(info, #{msg => "cassandra_prepare_cql", name => Key, prepare_cql => SQL}),
-    case ecql:prepare(Conn, Key, SQL) of
+prepare_cql_to_conn(Conn, #{prepare_key := PrepareKey, prepare_cql := PrepareCQL}) when
+    is_pid(Conn)
+->
+    ?SLOG(info, #{
+        msg => "cassandra_prepare_cql", prepare_key => PrepareKey, prepare_cql => PrepareCQL
+    }),
+    case ecql:prepare(Conn, PrepareKey, PrepareCQL) of
         {ok, Statement} ->
-            prepare_cql_to_conn(Conn, PrepareList, Statements#{Key => Statement});
-        {error, Error} = Other ->
+            {ok, Statement};
+        {error, Reason} = Error ->
             ?SLOG(error, #{
                 msg => "cassandra_prepare_cql_failed",
                 worker_pid => Conn,
-                name => Key,
-                prepare_cql => SQL,
-                error => Error
+                name => PrepareKey,
+                prepare_cql => PrepareCQL,
+                reason => Reason
             }),
-            Other
+            Error
     end.
 
 handle_result({error, disconnected}) ->
@@ -486,6 +472,11 @@ handle_result({error, Error}) ->
     {error, {unrecoverable_error, Error}};
 handle_result(Res) ->
     Res.
+
+on_format_query_result({ok, Result}) ->
+    #{result => ok, info => Result};
+on_format_query_result(Result) ->
+    Result.
 
 %%--------------------------------------------------------------------
 %% utils
@@ -513,3 +504,6 @@ maybe_assign_type(V) when is_integer(V) ->
 maybe_assign_type(V) when is_float(V) -> {double, V};
 maybe_assign_type(V) ->
     V.
+
+make_prepare_key(ChannId) ->
+    ChannId.

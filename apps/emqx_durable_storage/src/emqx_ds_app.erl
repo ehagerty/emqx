@@ -1,36 +1,22 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
 %%--------------------------------------------------------------------
 
 -module(emqx_ds_app).
 
--dialyzer({nowarn_function, storage/0}).
-
 -export([start/2]).
 
--include("emqx_ds_int.hrl").
-
 start(_Type, _Args) ->
-    init_mnesia(),
     emqx_ds_sup:start_link().
-
-init_mnesia() ->
-    %% FIXME: This is a temporary workaround to avoid crashes when starting on Windows
-    ok = mria:create_table(
-        ?SESSION_TAB,
-        [
-            {rlog_shard, ?DS_SHARD},
-            {type, set},
-            {storage, storage()},
-            {record_name, session},
-            {attributes, record_info(fields, session)}
-        ]
-    ).
-
-storage() ->
-    case mria:rocksdb_backend_available() of
-        true ->
-            rocksdb_copies;
-        _ ->
-            disc_copies
-    end.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,18 +14,45 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
+%% @doc Common Test Helper / Running tests in a cluster
+%%
+%% This module allows setting up and tearing down clusters of EMQX nodes with
+%% the purpose of running integration tests in a distributed environment, but
+%% with the same isolation measures that `emqx_cth_suite` provides.
+%%
+%% Additionally to what `emqx_cth_suite` does with respect to isolation, each
+%% node in the cluster is started with a separate, unique working directory.
+%%
+%% What should be started on each node is defined by the same appspecs that are
+%% used by `emqx_cth_suite` to start applications on the CT node. However, there
+%% are additional set of defaults applied to appspecs to make sure that the
+%% cluster is started in a consistent, interconnected state, with no conflicts
+%% between applications.
+%%
+%% Most of the time, you just need to:
+%% 1. Describe the cluster with one or more _nodespecs_.
+%% 2. Call `emqx_cth_cluster:start/2` before the testrun (e.g. in `init_per_suite/1`
+%%    or `init_per_group/2`), providing unique work dir (e.g.
+%%    `emqx_cth_suite:work_dir/1`). Save the result in a context.
+%% 3. Call `emqx_cth_cluster:stop/1` after the testrun concludes (e.g.
+%%    in `end_per_suite/1` or `end_per_group/2`) with the result from step 2.
 -module(emqx_cth_cluster).
 
--export([start/2]).
--export([stop/1]).
+-export([start/1, start/2, restart/1]).
+-export([stop/1, stop_node/1]).
+
+-export([start_bare_nodes/1, start_bare_nodes/2]).
 
 -export([share_load_module/2]).
+-export([node_name/1, mk_nodespecs/2]).
+-export([start_apps/2]).
 
 -define(APPS_CLUSTERING, [gen_rpc, mria, ekka]).
 
 -define(TIMEOUT_NODE_START_MS, 15000).
 -define(TIMEOUT_APPS_START_MS, 30000).
 -define(TIMEOUT_NODE_STOP_S, 15).
+-define(TIMEOUT_CLUSTER_WAIT_MS, timer:seconds(10)).
 
 %%
 
@@ -65,11 +92,7 @@
     %% Working directory
     %% If this directory is not empty, starting up the node applications will fail
     %% Default: "${ClusterOpts.work_dir}/${nodename}"
-    work_dir => file:name(),
-
-    % Tooling to manage nodes
-    % Default: `ct_slave`.
-    driver => ct_slave | slave
+    work_dir => file:name()
 }}.
 
 -spec start([nodespec()], ClusterOpts) ->
@@ -83,17 +106,75 @@ when
     }.
 start(Nodes, ClusterOpts) ->
     NodeSpecs = mk_nodespecs(Nodes, ClusterOpts),
-    ct:pal("Starting cluster: ~p", [NodeSpecs]),
+    start(NodeSpecs).
+
+start(NodeSpecs) ->
+    emqx_common_test_helpers:clear_screen(),
+    perform(start, NodeSpecs).
+
+perform(Act, NodeSpecs) ->
+    ct:pal("~ping nodes: ~p", [Act, NodeSpecs]),
     % 1. Start bare nodes with only basic applications running
-    _ = emqx_utils:pmap(fun start_node_init/1, NodeSpecs, ?TIMEOUT_NODE_START_MS),
+    ok = start_nodes_init(NodeSpecs, ?TIMEOUT_NODE_START_MS),
     % 2. Start applications needed to enable clustering
     % Generally, this causes some applications to restart, but we deliberately don't
     % start them yet.
-    _ = lists:foreach(fun run_node_phase_cluster/1, NodeSpecs),
+    case Act of
+        start ->
+            ShouldAppearInRunningNodes = [run_node_phase_cluster(Act, NS) || NS <- NodeSpecs],
+            WaitClustered = lists:member(true, ShouldAppearInRunningNodes);
+        restart ->
+            Timeout = ?TIMEOUT_APPS_START_MS,
+            _ = emqx_utils:pmap(fun(NS) -> run_node_phase_cluster(Act, NS) end, NodeSpecs, Timeout),
+            WaitClustered = false
+    end,
     % 3. Start applications after cluster is formed
     % Cluster-joins are complete, so they shouldn't restart in the background anymore.
     _ = emqx_utils:pmap(fun run_node_phase_apps/1, NodeSpecs, ?TIMEOUT_APPS_START_MS),
-    [Node || #{name := Node} <- NodeSpecs].
+    Nodes = [Node || #{name := Node} <- NodeSpecs],
+    %% 4. Wait for the nodes to cluster
+    _Ok = WaitClustered andalso wait_clustered(Nodes, ?TIMEOUT_CLUSTER_WAIT_MS),
+    Nodes.
+
+%% Wait until all nodes see all nodes as mria running nodes
+wait_clustered(Nodes, Timeout) ->
+    Check = fun(Node) ->
+        Running = erpc:call(Node, mria, running_nodes, []),
+        case Nodes -- Running of
+            [] ->
+                true;
+            NotRunning ->
+                {false, NotRunning}
+        end
+    end,
+    wait_clustered(Nodes, Check, deadline(Timeout)).
+
+wait_clustered([], _Check, _Deadline) ->
+    ok;
+wait_clustered([Node | Nodes] = All, Check, Deadline) ->
+    IsOverdue = is_overdue(Deadline),
+    case Check(Node) of
+        true ->
+            wait_clustered(Nodes, Check, Deadline);
+        {false, NodesNotRunnging} when IsOverdue ->
+            error(
+                {timeout, #{
+                    checking_from_node => Node,
+                    nodes_not_running => NodesNotRunnging
+                }}
+            );
+        {false, _Nodes} ->
+            timer:sleep(100),
+            wait_clustered(All, Check, Deadline)
+    end.
+
+restart(NodeSpecs = [_ | _]) ->
+    Nodes = [maps:get(name, Spec) || Spec <- NodeSpecs],
+    ct:pal("Stopping peer nodes: ~p", [Nodes]),
+    ok = stop(Nodes),
+    perform(restart, NodeSpecs);
+restart(NodeSpec = #{}) ->
+    restart([NodeSpec]).
 
 mk_nodespecs(Nodes, ClusterOpts) ->
     NodeSpecs = lists:zipwith(
@@ -128,8 +209,7 @@ mk_init_nodespec(N, Name, NodeOpts, ClusterOpts) ->
         role => core,
         apps => [],
         base_port => BasePort,
-        work_dir => filename:join([WorkDir, Node]),
-        driver => ct_slave
+        work_dir => filename:join([WorkDir, Node])
     },
     maps:merge(Defaults, NodeOpts).
 
@@ -237,6 +317,8 @@ default_appspec(emqx_conf, Spec, _NodeSpecs) ->
             listeners => allocate_listener_ports([tcp, ssl, ws, wss], Spec)
         }
     };
+default_appspec(emqx, Spec, _NodeSpecs) ->
+    #{config => #{listeners => allocate_listener_ports([tcp, ssl, ws, wss], Spec)}};
 default_appspec(_App, _, _) ->
     #{}.
 
@@ -254,56 +336,118 @@ allocate_listener_port(Type, #{base_port := BasePort}) ->
 allocate_listener_ports(Types, Spec) ->
     lists:foldl(fun maps:merge/2, #{}, [allocate_listener_port(Type, Spec) || Type <- Types]).
 
-start_node_init(Spec = #{name := Node}) ->
-    Node = start_bare_node(Node, Spec),
-    pong = net_adm:ping(Node),
-    % Preserve node spec right on the remote node
-    ok = set_node_opts(Node, Spec),
-    % Make it possible to call `ct:pal` and friends (if running under rebar3)
+start_nodes_init(Specs, Timeout) ->
+    Names = lists:map(fun(#{name := Name}) -> Name end, Specs),
+    _Nodes = start_bare_nodes(Names, Timeout),
+    lists:foreach(fun node_init/1, Specs).
+
+start_bare_nodes(Names) ->
+    start_bare_nodes(Names, ?TIMEOUT_NODE_START_MS).
+
+start_bare_nodes(Names, Timeout) ->
+    Args = erl_flags(),
+    Envs = [],
+    Waits = lists:map(
+        fun(Name) ->
+            WaitTag = {boot_complete, Name},
+            WaitBoot = {self(), WaitTag},
+            {ok, _} = emqx_cth_peer:start(Name, Args, Envs, WaitBoot),
+            WaitTag
+        end,
+        Names
+    ),
+    Deadline = deadline(Timeout),
+    Nodes = wait_boot_complete(Waits, Deadline),
+    lists:foreach(fun(Node) -> pong = net_adm:ping(Node) end, Nodes),
+    Nodes.
+
+deadline(Timeout) ->
+    erlang:monotonic_time() + erlang:convert_time_unit(Timeout, millisecond, native).
+
+is_overdue(Deadline) ->
+    erlang:monotonic_time() > Deadline.
+
+wait_boot_complete([], _) ->
+    [];
+wait_boot_complete(Waits, Deadline) ->
+    case is_overdue(Deadline) of
+        true ->
+            error({timeout, Waits});
+        false ->
+            ok
+    end,
+    receive
+        {{boot_complete, _Name} = Wait, {started, Node, _Pid}} ->
+            ct:pal("~p", [Wait]),
+            [Node | wait_boot_complete(Waits -- [Wait], Deadline)];
+        {{boot_complete, _Name}, Otherwise} ->
+            error({unexpected, Otherwise})
+    after 100 ->
+        wait_boot_complete(Waits, Deadline)
+    end.
+
+node_init(#{name := Node, work_dir := WorkDir}) ->
+    %% Create exclusive current directory for the node.  Some configurations, like plugin
+    %% installation directory, are the same for the whole cluster, and nodes on the same
+    %% machine will step on each other's toes...
+    ok = filelib:ensure_path(WorkDir),
+    ok = erpc:call(Node, file, set_cwd, [WorkDir]),
+    %% Make it possible to call `ct:pal` and friends (if running under rebar3)
     _ = share_load_module(Node, cthr),
-    % Enable snabbkaffe trace forwarding
+    %% Enable snabbkaffe trace forwarding
     ok = snabbkaffe:forward_trace(Node),
+    when_cover_enabled(fun() ->
+        case cover:start([Node]) of
+            {ok, _} ->
+                ok;
+            {error, {already_started, _}} ->
+                ok
+        end
+    end),
     ok.
 
-run_node_phase_cluster(Spec = #{name := Node}) ->
+%% Returns 'true' if this node should appear in running nodes list.
+run_node_phase_cluster(Act, Spec = #{name := Node}) ->
     ok = load_apps(Node, Spec),
-    ok = start_apps_clustering(Node, Spec),
-    ok = maybe_join_cluster(Node, Spec),
-    ok.
+    ok = start_apps_clustering(Act, Node, Spec),
+    maybe_join_cluster(Act, Node, Spec).
 
 run_node_phase_apps(Spec = #{name := Node}) ->
     ok = start_apps(Node, Spec),
     ok.
 
-set_node_opts(Node, Spec) ->
-    erpc:call(Node, persistent_term, put, [{?MODULE, opts}, Spec]).
-
-get_node_opts(Node) ->
-    erpc:call(Node, persistent_term, get, [{?MODULE, opts}]).
-
 load_apps(Node, #{apps := Apps}) ->
     erpc:call(Node, emqx_cth_suite, load_apps, [Apps]).
 
-start_apps_clustering(Node, #{apps := Apps} = Spec) ->
-    SuiteOpts = maps:with([work_dir], Spec),
+start_apps_clustering(Act, Node, #{apps := Apps} = Spec) ->
+    SuiteOpts = (suite_opts(Spec))#{boot_type => Act},
     AppsClustering = [lists:keyfind(App, 1, Apps) || App <- ?APPS_CLUSTERING],
     _Started = erpc:call(Node, emqx_cth_suite, start, [AppsClustering, SuiteOpts]),
     ok.
 
 start_apps(Node, #{apps := Apps} = Spec) ->
-    SuiteOpts = maps:with([work_dir], Spec),
+    SuiteOpts = suite_opts(Spec),
     AppsRest = [AppSpec || AppSpec = {App, _} <- Apps, not lists:member(App, ?APPS_CLUSTERING)],
     _Started = erpc:call(Node, emqx_cth_suite, start_apps, [AppsRest, SuiteOpts]),
     ok.
 
-maybe_join_cluster(_Node, #{role := replicant}) ->
-    ok;
-maybe_join_cluster(Node, Spec) ->
+suite_opts(#{work_dir := WorkDir}) ->
+    #{work_dir => WorkDir}.
+
+%% Returns 'true' if this node should appear in the cluster.
+maybe_join_cluster(restart, _Node, #{}) ->
+    %% when restart, the node should already be in the cluster
+    %% hence no need to (re)join
+    true;
+maybe_join_cluster(_Act, _Node, #{role := replicant}) ->
+    true;
+maybe_join_cluster(start, Node, Spec) ->
     case get_cluster_seeds(Spec) of
         [JoinTo | _] ->
-            ok = join_cluster(Node, JoinTo);
+            ok = join_cluster(Node, JoinTo),
+            true;
         [] ->
-            ok
+            false
     end.
 
 join_cluster(Node, JoinTo) ->
@@ -324,23 +468,8 @@ stop(Nodes) ->
 
 stop_node(Name) ->
     Node = node_name(Name),
-    try get_node_opts(Node) of
-        Opts ->
-            stop_node(Name, Opts)
-    catch
-        error:{erpc, _} ->
-            ok
-    end.
-
-stop_node(Node, #{driver := ct_slave}) ->
-    case ct_slave:stop(Node, [{stop_timeout, ?TIMEOUT_NODE_STOP_S}]) of
-        {ok, _} ->
-            ok;
-        {error, Reason, _} when Reason == not_connected; Reason == not_started ->
-            ok
-    end;
-stop_node(Node, #{driver := slave}) ->
-    slave:stop(Node).
+    when_cover_enabled(fun() -> ok = cover:flush([Node]) end),
+    ok = emqx_cth_peer:stop(Node).
 
 %% Ports
 
@@ -363,29 +492,12 @@ listener_port(BasePort, wss) ->
 
 %%
 
-start_bare_node(Name, #{driver := ct_slave}) ->
-    {ok, Node} = ct_slave:start(
-        node_name(Name),
-        [
-            {kill_if_fail, true},
-            {monitor_master, true},
-            {init_timeout, 20_000},
-            {startup_timeout, 20_000},
-            {erl_flags, erl_flags()},
-            {env, []}
-        ]
-    ),
-    Node;
-start_bare_node(Name, #{driver := slave}) ->
-    {ok, Node} = slave:start_link(host(), Name, ebin_path()),
-    Node.
-
 erl_flags() ->
-    %% One core and redirecting logs to master
-    "+S 1:1 -master " ++ atom_to_list(node()) ++ " " ++ ebin_path().
+    %% One core
+    ["+S", "1:1"] ++ ebin_path().
 
 ebin_path() ->
-    string:join(["-pa" | lists:filter(fun is_lib/1, code:get_path())], " ").
+    ["-pa" | lists:filter(fun is_lib/1, code:get_path())].
 
 is_lib(Path) ->
     string:prefix(Path, code:lib_dir()) =:= nomatch andalso
@@ -400,6 +512,7 @@ share_load_module(Node, Module) ->
             error
     end.
 
+-spec node_name(atom()) -> node().
 node_name(Name) ->
     case string:tokens(atom_to_list(Name), "@") of
         [_Name, _Host] ->
@@ -417,3 +530,20 @@ host() ->
 
 format(Format, Args) ->
     unicode:characters_to_binary(io_lib:format(Format, Args)).
+
+is_cover_enabled() ->
+    case os:getenv("ENABLE_COVER_COMPILE") of
+        "1" -> true;
+        "true" -> true;
+        _ -> false
+    end.
+
+when_cover_enabled(Fun) ->
+    %% We need to check if cover is enabled to avoid crashes when attempting to start it
+    %% on the peer.
+    case is_cover_enabled() of
+        true ->
+            Fun();
+        false ->
+            ok
+    end.

@@ -1,11 +1,12 @@
 {application, emqx_mysql, [
     {description, "EMQX MySQL Database Connector"},
-    {vsn, "0.1.1"},
+    {vsn, "0.2.3"},
     {registered, []},
     {applications, [
         kernel,
         stdlib,
-        mysql
+        mysql,
+        emqx_resource
     ]},
     {env, []},
     {modules, []},

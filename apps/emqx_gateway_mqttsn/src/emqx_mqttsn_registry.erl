@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@
     lookup_topic/2,
     lookup_topic_id/2
 ]).
+
+-export_type([registry/0]).
 
 -define(PKEY(Id), {mqttsn, predef_topics, Id}).
 

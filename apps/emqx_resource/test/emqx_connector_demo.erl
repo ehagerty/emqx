@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,11 +18,13 @@
 
 -include_lib("typerefl/include/types.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 
 -behaviour(emqx_resource).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -30,7 +32,12 @@
     on_query_async/4,
     on_batch_query/3,
     on_batch_query_async/4,
-    on_get_status/2
+    on_get_status/2,
+
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3
 ]).
 
 -export([counter_loop/0, set_callback_mode/1]).
@@ -39,6 +46,7 @@
 -export([roots/0]).
 
 -define(CM_KEY, {?MODULE, callback_mode}).
+-define(PT_CHAN_KEY(CONN_RES_ID), {?MODULE, chans, CONN_RES_ID}).
 
 roots() ->
     [
@@ -55,6 +63,8 @@ register(required) -> true;
 register(default) -> false;
 register(_) -> undefined.
 
+resource_type() -> demo.
+
 callback_mode() ->
     persistent_term:get(?CM_KEY).
 
@@ -64,18 +74,39 @@ set_callback_mode(Mode) ->
 on_start(_InstId, #{create_error := true}) ->
     ?tp(connector_demo_start_error, #{}),
     error("some error");
+on_start(InstId, #{create_error := {delay, Delay, Agent}} = State0) ->
+    ?tp(connector_demo_start_delay, #{}),
+    State = maps:remove(create_error, State0),
+    case emqx_utils_agent:get_and_update(Agent, fun(St) -> {St, called} end) of
+        not_called ->
+            emqx_resource:allocate_resource(InstId, i_should_be_deallocated, yep),
+            timer:sleep(Delay),
+            on_start(InstId, State);
+        called ->
+            on_start(InstId, State)
+    end;
 on_start(InstId, #{name := Name} = Opts) ->
     Register = maps:get(register, Opts, false),
     StopError = maps:get(stop_error, Opts, false),
     {ok, Opts#{
         id => InstId,
         stop_error => StopError,
+        channels => #{},
         pid => spawn_counter_process(Name, Register)
     }}.
 
+on_stop(_InstId, undefined) ->
+    ?tp(connector_demo_free_resources_without_state, #{}),
+    ok;
 on_stop(_InstId, #{stop_error := true}) ->
     {error, stop_error};
-on_stop(_InstId, #{pid := Pid}) ->
+on_stop(InstId, #{stop_error := {ask, HowToStop}} = State) ->
+    case HowToStop() of
+        continue ->
+            on_stop(InstId, maps:remove(stop_error, State))
+    end;
+on_stop(InstId, #{pid := Pid}) ->
+    persistent_term:erase(?PT_CHAN_KEY(InstId)),
     stop_counter_process(Pid).
 
 on_query(_InstId, get_state, State) ->
@@ -135,6 +166,15 @@ on_query(_InstId, get_counter, #{pid := Pid}) ->
     after 1000 ->
         {error, timeout}
     end;
+on_query(_InstId, {individual_reply, IsSuccess}, #{pid := Pid}) ->
+    ReqRef = make_ref(),
+    From = {self(), ReqRef},
+    Pid ! {From, {individual_reply, IsSuccess}},
+    receive
+        {ReqRef, Res} -> Res
+    after 1000 ->
+        {error, timeout}
+    end;
 on_query(_InstId, {sleep_before_reply, For}, #{pid := Pid}) ->
     ?tp(connector_demo_sleep, #{mode => sync, for => For}),
     ReqRef = make_ref(),
@@ -169,6 +209,9 @@ on_query_async(_InstId, block_now, ReplyFun, #{pid := Pid}) ->
 on_query_async(_InstId, {big_payload, Payload}, ReplyFun, #{pid := Pid}) ->
     Pid ! {big_payload, Payload, ReplyFun},
     {ok, Pid};
+on_query_async(_InstId, {individual_reply, IsSuccess}, ReplyFun, #{pid := Pid}) ->
+    Pid ! {individual_reply, IsSuccess, ReplyFun},
+    {ok, Pid};
 on_query_async(_InstId, {sleep_before_reply, For}, ReplyFun, #{pid := Pid}) ->
     ?tp(connector_demo_sleep, #{mode => async, for => For}),
     Pid ! {{sleep_before_reply, For}, ReplyFun},
@@ -184,6 +227,8 @@ on_batch_query(InstId, BatchReq, State) ->
             batch_get_counter(sync, InstId, State);
         {big_payload, _Payload} ->
             batch_big_payload(sync, InstId, BatchReq, State);
+        {individual_reply, _IsSuccess} ->
+            batch_individual_reply(sync, InstId, BatchReq, State);
         {random_reply, Num} ->
             %% async batch retried
             make_random_reply(Num)
@@ -200,6 +245,8 @@ on_batch_query_async(InstId, BatchReq, ReplyFunAndArgs, #{pid := Pid} = State) -
             on_query_async(InstId, block_now, ReplyFunAndArgs, State);
         {big_payload, _Payload} ->
             batch_big_payload({async, ReplyFunAndArgs}, InstId, BatchReq, State);
+        {individual_reply, _IsSuccess} ->
+            batch_individual_reply({async, ReplyFunAndArgs}, InstId, BatchReq, State);
         {random_reply, Num} ->
             %% only take the first Num in the batch should be random enough
             Pid ! {{random_reply, Num}, ReplyFunAndArgs},
@@ -243,17 +290,88 @@ batch_big_payload({async, ReplyFunAndArgs}, InstId, Batch, State = #{pid := Pid}
     ),
     {ok, Pid}.
 
+batch_individual_reply(sync, InstId, Batch, State) ->
+    lists:map(
+        fun(Req = {individual_reply, _}) -> on_query(InstId, Req, State) end,
+        Batch
+    );
+batch_individual_reply({async, ReplyFunAndArgs}, InstId, Batch, State) ->
+    Pid = spawn(fun() ->
+        Results = lists:map(
+            fun(Req = {individual_reply, _}) -> on_query(InstId, Req, State) end,
+            Batch
+        ),
+        apply_reply(ReplyFunAndArgs, Results)
+    end),
+    {ok, Pid}.
+
 on_get_status(_InstId, #{health_check_error := true}) ->
     ?tp(connector_demo_health_check_error, #{}),
-    disconnected;
-on_get_status(_InstId, State = #{health_check_error := {msg, Message}}) ->
+    ?status_disconnected;
+on_get_status(_InstId, _State = #{health_check_error := {msg, Message}}) ->
     ?tp(connector_demo_health_check_error, #{}),
-    {disconnected, State, Message};
+    {?status_disconnected, Message};
+on_get_status(_InstId, #{pid := Pid, health_check_error := {delay, Delay}}) ->
+    ?tp(connector_demo_health_check_delay, #{}),
+    timer:sleep(Delay),
+    case is_process_alive(Pid) of
+        true -> ?status_connected;
+        false -> ?status_disconnected
+    end;
+on_get_status(ConnResId, #{health_check_agent := Agent}) ->
+    case get_agent_health_check_action(Agent, resource_health_check) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            Pid ! {waiting_health_check_result, Alias, resource, ConnResId},
+            receive
+                {Alias, Result} ->
+                    Result
+            end;
+        Result ->
+            Result
+    end;
 on_get_status(_InstId, #{pid := Pid}) ->
     timer:sleep(300),
     case is_process_alive(Pid) of
-        true -> connected;
-        false -> disconnected
+        true -> ?status_connected;
+        false -> ?status_disconnected
+    end.
+
+on_add_channel(ConnResId, ConnSt0, ChanId, ChanCfg) ->
+    ConnSt = emqx_utils_maps:deep_put([channels, ChanId], ConnSt0, ChanCfg),
+    do_add_channel(ConnResId, ChanId, ChanCfg),
+    {ok, ConnSt}.
+
+on_remove_channel(ConnResId, ConnSt0, ChanId) ->
+    ConnSt = emqx_utils_maps:deep_remove([channels, ChanId], ConnSt0),
+    do_remove_channel(ConnResId, ChanId),
+    {ok, ConnSt}.
+
+on_get_channels(ConnResId) ->
+    persistent_term:get(?PT_CHAN_KEY(ConnResId), []).
+
+on_get_channel_status(ConnResId, ChanId, #{health_check_agent := Agent}) ->
+    case get_agent_health_check_action(Agent, channel_health_check) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            Pid ! {waiting_health_check_result, Alias, channel, ConnResId, ChanId},
+            receive
+                {Alias, Result} ->
+                    Result
+            end;
+        Result ->
+            Result
+    end;
+on_get_channel_status(_ConnResId, ChanId, #{channels := Chans}) ->
+    case Chans of
+        #{ChanId := #{health_check_delay := Delay}} ->
+            ?tp(connector_demo_channel_health_check_delay, #{}),
+            timer:sleep(Delay),
+            ?status_connected;
+        #{ChanId := _ChanCfg} ->
+            ?status_connected;
+        #{} ->
+            ?status_disconnected
     end.
 
 spawn_counter_process(Name, Register) ->
@@ -338,6 +456,22 @@ counter_loop(
             {{FromPid, ReqRef}, get} ->
                 FromPid ! {ReqRef, Num},
                 State;
+            {{FromPid, ReqRef}, {individual_reply, IsSuccess}} ->
+                Res =
+                    case IsSuccess of
+                        true -> ok;
+                        false -> {error, {unrecoverable_error, bad_request}}
+                    end,
+                FromPid ! {ReqRef, Res},
+                State;
+            {individual_reply, IsSuccess, ReplyFun} ->
+                Res =
+                    case IsSuccess of
+                        true -> ok;
+                        false -> {error, {unrecoverable_error, bad_request}}
+                    end,
+                apply_reply(ReplyFun, Res),
+                State;
             {{random_reply, RandNum}, ReplyFun} ->
                 %% usually a behaving  connector should reply once and only once for
                 %% each (batch) request
@@ -400,3 +534,23 @@ make_random_reply(N) ->
         3 ->
             {error, {unrecoverable_error, N}}
     end.
+
+do_add_channel(ConnResId, ChanId, ChanCfg) ->
+    Chans = persistent_term:get(?PT_CHAN_KEY(ConnResId), []),
+    persistent_term:put(?PT_CHAN_KEY(ConnResId), [{ChanId, ChanCfg} | Chans]).
+
+do_remove_channel(ConnResId, ChanId) ->
+    Chans = persistent_term:get(?PT_CHAN_KEY(ConnResId), []),
+    persistent_term:put(?PT_CHAN_KEY(ConnResId), proplists:delete(ChanId, Chans)).
+
+get_agent_health_check_action(Agent, Key) ->
+    emqx_utils_agent:get_and_update(Agent, fun(Old) ->
+        case Old of
+            #{Key := [Action]} ->
+                {Action, Old};
+            #{Key := [Action | Actions]} ->
+                {Action, Old#{Key := Actions}};
+            #{Key := Action} when not is_list(Action) ->
+                {Action, Old}
+        end
+    end).

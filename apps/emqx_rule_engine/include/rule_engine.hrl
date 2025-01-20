@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 
 -define(KV_TAB, '@rule_engine_db').
 
--type maybe(T) :: T | undefined.
+-type option(T) :: T | undefined.
 
 -type rule_id() :: binary().
 -type rule_name() :: binary().
@@ -42,7 +42,9 @@
         func := builtin_action_func() | atom(),
         args => action_fun_args()
     }
-    | bridge_channel_id().
+    | bridge_channel_id()
+    | {bridge_v2, emqx_bridge_v2:bridge_v2_type(), emqx_bridge_v2:bridge_v2_name()}
+    | {bridge, emqx_utils_maps:config_key(), emqx_utils_maps:config_key(), bridge_channel_id()}.
 
 -type rule() ::
     #{
@@ -109,6 +111,7 @@
 
 %% Tables
 -define(RULE_TAB, emqx_rule_engine).
+-define(RULE_TOPIC_INDEX, emqx_rule_engine_topic_index).
 
 %% Allowed sql function provider modules
 -define(DEFAULT_SQL_FUNC_PROVIDER, emqx_rule_funcs).
@@ -125,3 +128,4 @@
 
 -define(KEY_PATH, [rule_engine, rules]).
 -define(RULE_PATH(RULE), [rule_engine, rules, RULE]).
+-define(TAG, "RULE").

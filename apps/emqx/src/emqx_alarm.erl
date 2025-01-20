@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,12 +21,9 @@
 -include("emqx.hrl").
 -include("logger.hrl").
 
-%% Mnesia bootstrap
--export([mnesia/1]).
-
--boot_mnesia({mnesia, [boot]}).
-
+-export([create_tables/0]).
 -export([start_link/0]).
+
 %% API
 -export([
     activate/1,
@@ -86,7 +83,7 @@
 %% Mnesia bootstrap
 %%--------------------------------------------------------------------
 
-mnesia(boot) ->
+create_tables() ->
     ok = mria:create_table(
         ?ACTIVATED_ALARM,
         [
@@ -106,7 +103,8 @@ mnesia(boot) ->
             {record_name, deactivated_alarm},
             {attributes, record_info(fields, deactivated_alarm)}
         ]
-    ).
+    ),
+    [?ACTIVATED_ALARM, ?DEACTIVATED_ALARM].
 
 %%--------------------------------------------------------------------
 %% API
@@ -213,7 +211,7 @@ format(Node, #deactivated_alarm{
 
 to_rfc3339(Timestamp) ->
     %% rfc3339 accuracy to millisecond
-    list_to_binary(calendar:system_time_to_rfc3339(Timestamp div 1000, [{unit, millisecond}])).
+    emqx_utils_calendar:epoch_to_rfc3339(Timestamp div 1000).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks

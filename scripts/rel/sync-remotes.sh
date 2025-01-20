@@ -5,7 +5,7 @@ set -euo pipefail
 # ensure dir
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
-BASE_BRANCHES=( 'release-51' 'master' )
+BASE_BRANCHES=( 'release-58' 'release-57' 'release-56' 'release-55' 'master' )
 
 usage() {
     cat <<EOF
@@ -18,8 +18,11 @@ options:
     It tries to merge (by default with --ff-only option)
     upstreams branches for the current working branch.
     The uppstream branch of the current branch are as below:
-    * release-51: []        # no upstream for 5.0 opensource edition
-    * master: [release-51]  # sync release-51 to master
+    * release-55: []        # no upstream for 5.5 opensource edition
+    * release-56: []        # no upstream for 5.6 opensource edition
+    * release-57: []        # no upstream for 5.7 opensource edition
+    * release-58: []        # no upstream for 5.8 opensource edition
+    * master: [release-5x]  # sync release-5x to master
 
   -b|--base:
     The base branch of current working branch if currently is not
@@ -151,11 +154,20 @@ remote_refs() {
 upstream_branches() {
     local base="$1"
     case "$base" in
-        release-51)
+        release-55)
+            remote_ref "$base"
+            ;;
+        release-56)
+            remote_ref "$base"
+            ;;
+        release-57)
+            remote_ref "$base"
+            ;;
+        release-58)
             remote_ref "$base"
             ;;
         master)
-            remote_refs "$base" 'release-51'
+            remote_refs "$base" 'release-55' 'release-56' 'release-57' 'release-58'
             ;;
     esac
 }

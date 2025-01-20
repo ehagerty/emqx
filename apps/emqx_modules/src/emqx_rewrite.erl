@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -91,7 +91,10 @@ register_hook(Rules) ->
         [] ->
             ok;
         _ ->
-            ?SLOG(error, #{rewrite_rule_re_complie_failed => ErrRules}),
+            ?SLOG(error, #{
+                msg => "rewrite_rule_re_compile_failed",
+                error_rules => ErrRules
+            }),
             {error, ErrRules}
     end.
 
@@ -155,6 +158,8 @@ match_and_rewrite(Topic, [{Filter, MP, Dest} | Rules], Binds) ->
         false -> match_and_rewrite(Topic, Rules, Binds)
     end.
 
+rewrite(SharedRecord = #share{topic = Topic}, MP, Dest, Binds) ->
+    SharedRecord#share{topic = rewrite(Topic, MP, Dest, Binds)};
 rewrite(Topic, MP, Dest, Binds) ->
     case re:run(Topic, MP, [{capture, all_but_first, list}]) of
         {match, Captured} ->

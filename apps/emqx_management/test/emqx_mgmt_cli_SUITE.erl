@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,16 +19,72 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 all() ->
-    emqx_common_test_helpers:all(?MODULE).
+    All = emqx_common_test_helpers:all(?MODULE),
+    case emqx_cth_suite:skip_if_oss() of
+        false ->
+            All;
+        _ ->
+            All -- [t_autocluster_leave]
+    end.
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_management]),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    ok = emqx_mgmt_cli:load(),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(t_autocluster_leave = TC, Config) ->
+    [Core1, Core2, Repl1, Repl2] =
+        Nodes = [
+            t_autocluster_leave_core1,
+            t_autocluster_leave_core2,
+            t_autocluster_leave_replicant1,
+            t_autocluster_leave_replicant2
+        ],
+
+    NodeNames = [emqx_cth_cluster:node_name(N) || N <- Nodes],
+    AppSpec = [
+        emqx,
+        {emqx_conf, #{
+            config => #{
+                cluster => #{
+                    discovery_strategy => static,
+                    static => #{seeds => NodeNames}
+                }
+            }
+        }},
+        emqx_management
+    ],
+    Cluster = emqx_cth_cluster:start(
+        [
+            {Core1, #{role => core, apps => AppSpec}},
+            {Core2, #{role => core, apps => AppSpec}},
+            {Repl1, #{role => replicant, apps => AppSpec}},
+            {Repl2, #{role => replicant, apps => AppSpec}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
+    ),
+    [{cluster, Cluster} | Config];
+init_per_testcase(_TC, Config) ->
     Config.
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_management, emqx_conf]).
+end_per_testcase(_TC, Config) ->
+    case ?config(cluster, Config) of
+        undefined -> ok;
+        Cluster -> emqx_cth_cluster:stop(Cluster)
+    end.
 
 t_status(_Config) ->
     emqx_ctl:run_command([]),
@@ -45,11 +101,57 @@ t_broker(_Config) ->
     ok.
 
 t_cluster(_Config) ->
+    SelfNode = node(),
+    FakeNode = 'fake@127.0.0.1',
+    MFA = {?MODULE, format, [""]},
+    meck:new(mria_mnesia, [non_strict, passthrough, no_link]),
+    meck:expect(mria_mnesia, running_nodes, 0, [SelfNode, FakeNode]),
+    {atomic, {ok, TnxId, _}} =
+        mria:transaction(
+            emqx_cluster_rpc_shard,
+            fun emqx_cluster_rpc:init_mfa/2,
+            [SelfNode, MFA]
+        ),
+    emqx_cluster_rpc:maybe_init_tnx_id(FakeNode, TnxId),
+    ?assertMatch(
+        {atomic, [
+            #{
+                node := SelfNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            },
+            #{
+                node := FakeNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            }
+        ]},
+        emqx_cluster_rpc:status()
+    ),
     %% cluster join <Node>        # Join the cluster
     %% cluster leave              # Leave the cluster
     %% cluster force-leave <Node> # Force the node leave from cluster
     %% cluster status             # Cluster status
     emqx_ctl:run_command(["cluster", "status"]),
+
+    emqx_ctl:run_command(["cluster", "force-leave", atom_to_list(FakeNode)]),
+    ?assertMatch(
+        {atomic, [
+            #{
+                node := SelfNode,
+                mfa := MFA,
+                created_at := _,
+                tnx_id := TnxId,
+                initiator := SelfNode
+            }
+        ]},
+        emqx_cluster_rpc:status()
+    ),
+    meck:unload(mria_mnesia),
     ok.
 
 t_clients(_Config) ->
@@ -183,9 +285,25 @@ t_listeners(_Config) ->
 
 t_authz(_Config) ->
     %% authz cache-clean all         # Clears authorization cache on all nodes
-    emqx_ctl:run_command(["authz", "cache-clean", "all"]),
-    %% authz cache-clean node <Node> # Clears authorization cache on given node
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", "all"])),
+    ClientId = "authz_clean_test",
+    ClientIdBin = list_to_binary(ClientId),
     %% authz cache-clean <ClientId>  # Clears authorization cache for given client
+    ?assertMatch({error, not_found}, emqx_ctl:run_command(["authz", "cache-clean", ClientId])),
+    {ok, C} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(C),
+    {ok, _, _} = emqtt:subscribe(C, <<"topic/1">>, 1),
+    [Pid] = emqx_cm:lookup_channels(ClientIdBin),
+    ?assertMatch([_], gen_server:call(Pid, list_authz_cache)),
+
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", ClientId])),
+    ?assertMatch([], gen_server:call(Pid, list_authz_cache)),
+    %% authz cache-clean node <Node> # Clears authorization cache on given node
+    {ok, _, _} = emqtt:subscribe(C, <<"topic/2">>, 1),
+    ?assertMatch([_], gen_server:call(Pid, list_authz_cache)),
+    ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", "node", atom_to_list(node())])),
+    ?assertMatch([], gen_server:call(Pid, list_authz_cache)),
+    ok = emqtt:disconnect(C),
     ok.
 
 t_olp(_Config) ->
@@ -200,3 +318,54 @@ t_admin(_Config) ->
     %% admins passwd <Username> <Password>            # Reset dashboard user password
     %% admins del <Username>                          # Delete dashboard user
     ok.
+
+t_autocluster_leave(Config) ->
+    [Core1, Core2, Repl1, Repl2] = Cluster = ?config(cluster, Config),
+    %% Mria membership updates are async, makes sense to wait a little
+    timer:sleep(300),
+    ClusterView = [lists:sort(rpc:call(N, emqx, running_nodes, [])) || N <- Cluster],
+    [View1, View2, View3, View4] = ClusterView,
+    ?assertEqual(lists:sort(Cluster), View1),
+    ?assertEqual(View1, View2),
+    ?assertEqual(View1, View3),
+    ?assertEqual(View1, View4),
+
+    rpc:call(Core2, emqx_mgmt_cli, cluster, [["leave"]]),
+    timer:sleep(1000),
+    %% Replicant nodes can discover Core2 which is now split from [Core1, Core2],
+    %% but they are  expected to ignore Core2,
+    %% since mria_lb must filter out core nodes that disabled discovery.
+    ?assertMatch([Core2], rpc:call(Core2, emqx, running_nodes, [])),
+    ?assertEqual(undefined, rpc:call(Core1, erlang, whereis, [ekka_autocluster])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Core1, emqx, running_nodes, [])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Repl1, emqx, running_nodes, [])),
+    ?assertEqual(lists:sort([Core1, Repl1, Repl2]), rpc:call(Repl2, emqx, running_nodes, [])),
+
+    rpc:call(Repl1, emqx_mgmt_cli, cluster, [["leave"]]),
+    timer:sleep(1000),
+    ?assertEqual(lists:sort([Core1, Repl2]), rpc:call(Core1, emqx, running_nodes, [])),
+
+    ct:pal("enabling discovery for core2"),
+    rpc:call(Core2, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
+    ct:pal("enabling discovery for repl1"),
+    rpc:call(Repl1, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
+    %% nodes will join and restart asyncly, may need more time to re-cluster
+    ct:pal("waiting recovery"),
+    ?assertEqual(
+        ok,
+        emqx_common_test_helpers:wait_for(
+            ?FUNCTION_NAME,
+            ?LINE,
+            fun() ->
+                [lists:sort(rpc:call(N, emqx, running_nodes, [])) || N <- Cluster] =:= ClusterView
+            end,
+            10_000
+        )
+    ).
+
+t_exclusive(_Config) ->
+    emqx_ctl:run_command(["exclusive", "list"]),
+    emqx_ctl:run_command(["exclusive", "delete", "t/1"]),
+    ok.
+
+format(Str, Opts) -> io:format("str:~s: Opts:~p", [Str, Opts]).

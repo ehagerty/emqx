@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_pulsar_tests).
@@ -10,7 +10,11 @@
 %% Test cases
 %%===========================================================================
 
+atoms() ->
+    [my_producer].
+
 pulsar_producer_validations_test() ->
+    Name = hd(atoms()),
     Conf0 = pulsar_producer_hocon(),
     Conf1 =
         Conf0 ++
@@ -24,7 +28,7 @@ pulsar_producer_validations_test() ->
             <<"strategy">> := <<"key_dispatch">>,
             <<"message">> := #{<<"key">> := <<>>}
         },
-        emqx_utils_maps:deep_get([<<"bridges">>, <<"pulsar_producer">>, <<"my_producer">>], Conf)
+        emqx_utils_maps:deep_get([<<"bridges">>, <<"pulsar_producer">>, atom_to_binary(Name)], Conf)
     ),
     ?assertThrow(
         {_, [
@@ -35,8 +39,6 @@ pulsar_producer_validations_test() ->
         ]},
         check(Conf)
     ),
-    %% ensure atoms exist
-    _ = [my_producer],
     ?assertThrow(
         {_, [
             #{
@@ -71,7 +73,7 @@ check_atom_key(Conf) when is_map(Conf) ->
 
 %% erlfmt-ignore
 pulsar_producer_hocon() ->
-"""
+"
 bridges.pulsar_producer.my_producer {
   enable = true
   servers = \"localhost:6650\"
@@ -88,4 +90,4 @@ bridges.pulsar_producer.my_producer {
     server_name_indication = \"auto\"
   }
 }
-""".
+".

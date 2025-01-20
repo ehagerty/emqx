@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -177,6 +177,7 @@ compat(connack, 16#9D) -> ?CONNACK_SERVER;
 compat(connack, 16#9F) -> ?CONNACK_SERVER;
 compat(suback, Code) when Code =< ?QOS_2 -> Code;
 compat(suback, Code) when Code >= 16#80 -> 16#80;
+%% TODO: 16#80(qos0) 16#81(qos1) 16#82(qos2) for mqtt-v3.1.1
 compat(unsuback, _Code) -> undefined;
 compat(_Other, _Code) -> undefined.
 
@@ -190,4 +191,5 @@ connack_error(server_unavailable) -> ?RC_SERVER_UNAVAILABLE;
 connack_error(server_busy) -> ?RC_SERVER_BUSY;
 connack_error(banned) -> ?RC_BANNED;
 connack_error(bad_authentication_method) -> ?RC_BAD_AUTHENTICATION_METHOD;
+connack_error(quota_exceeded) -> ?RC_QUOTA_EXCEEDED;
 connack_error(_) -> ?RC_UNSPECIFIED_ERROR.

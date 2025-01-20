@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_node_rebalance_sup).
@@ -15,6 +15,7 @@ start_link() ->
 
 init([]) ->
     Childs = [
+        child_spec(emqx_node_rebalance_purge, []),
         child_spec(emqx_node_rebalance_evacuation, []),
         child_spec(emqx_node_rebalance_agent, []),
         child_spec(emqx_node_rebalance, [])

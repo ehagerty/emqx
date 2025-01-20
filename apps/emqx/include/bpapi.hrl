@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,9 +14,4 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
--ifndef(EMQX_BPAPI_HRL).
--define(EMQX_BPAPI_HRL, true).
-
--compile({parse_transform, emqx_bpapi_trans}).
-
--endif.
+-include_lib("emqx_utils/include/bpapi.hrl").

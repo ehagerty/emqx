@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,10 +40,23 @@ cmd(["bin_leak"]) ->
         recon:bin_leak(100)
     );
 cmd(["load", Mod]) ->
-    Module = list_to_existing_atom(Mod),
-    Nodes = nodes(),
-    Res = remote_load(Nodes, Module),
-    emqx_ctl:print("Loaded ~p module on ~p: ~p~n", [Module, Nodes, Res]);
+    case nodes() of
+        [] ->
+            emqx_ctl:print("No other nodes in the cluster~n");
+        Nodes ->
+            case emqx_utils:safe_to_existing_atom(Mod) of
+                {ok, Module} ->
+                    case code:get_object_code(Module) of
+                        error ->
+                            emqx_ctl:print("Module(~s)'s object code not found~n", [Mod]);
+                        _ ->
+                            Res = recon:remote_load(Nodes, Module),
+                            emqx_ctl:print("Loaded ~p module on ~p: ~p~n", [Module, Nodes, Res])
+                    end;
+                {error, Reason} ->
+                    emqx_ctl:print("Module(~s) not found: ~p~n", [Mod, Reason])
+            end
+    end;
 cmd(_) ->
     emqx_ctl:usage([
         {"observer status", "Start observer in the current console"},
@@ -51,12 +64,5 @@ cmd(_) ->
             "Force all processes to perform garbage collection "
             "and prints the top-100 processes that freed the "
             "biggest amount of binaries, potentially highlighting leaks."},
-        {"observer load Mod", "Ensure a module is loaded in all EMQX nodes in the cluster"}
+        {"observer load Mod", "Enhanced module synchronization across all cluster nodes"}
     ]).
-
-%% recon:remote_load/1 has a bug, when nodes() returns [], it is
-%% taken by recon as a node name.
-%% before OTP 23, the call returns a 'badrpc' tuple
-%% after OTP 23, it crashes with 'badarg' error
-remote_load([], _Module) -> ok;
-remote_load(Nodes, Module) -> recon:remote_load(Nodes, Module).

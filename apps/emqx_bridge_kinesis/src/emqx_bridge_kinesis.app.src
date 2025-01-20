@@ -1,13 +1,14 @@
 {application, emqx_bridge_kinesis, [
     {description, "EMQX Enterprise Amazon Kinesis Bridge"},
-    {vsn, "0.1.0"},
+    {vsn, "0.2.4"},
     {registered, []},
     {applications, [
         kernel,
         stdlib,
         erlcloud
     ]},
-    {env, []},
+    {env, [{emqx_action_info_modules, [emqx_bridge_kinesis_action_info]}]},
+    {env, [{emqx_connector_info_modules, [emqx_bridge_kinesis_connector_info]}]},
     {modules, []},
     {links, []}
 ]}.

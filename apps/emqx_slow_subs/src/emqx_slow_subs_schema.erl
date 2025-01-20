@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ roots() ->
 
 fields("slow_subs") ->
     [
+        %% {enable, sc(boolean(), false, enable, ?IMPORTANCE_NO_DOC)},
         {enable, sc(boolean(), false, enable)},
         {threshold,
             sc(
@@ -66,3 +67,6 @@ desc(_) ->
 %%--------------------------------------------------------------------
 sc(Type, Default, Desc) ->
     ?HOCON(Type, #{default => Default, desc => ?DESC(Desc)}).
+
+%% sc(Type, Default, Desc, Importance) ->
+%%     ?HOCON(Type, #{default => Default, desc => ?DESC(Desc), importance => Importance}).

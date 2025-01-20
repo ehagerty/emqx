@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 -export([
     introduced_in/0,
+    deprecated_since/0,
 
     lookup_client/2,
     kickout_client/2,
@@ -39,6 +40,9 @@
 introduced_in() ->
     "5.0.0".
 
+deprecated_since() ->
+    "5.7.0".
+
 -spec kickout_client(node(), emqx_types:clientid()) -> ok | {badrpc, _}.
 kickout_client(Node, ClientId) ->
     rpc:call(Node, emqx_cm, kick_session, [ClientId]).
@@ -48,11 +52,13 @@ kickout_client(Node, ClientId) ->
 lookup_client(Node, Key) ->
     rpc:call(Node, emqx_cm, lookup_client, [Key]).
 
--spec get_chan_stats(emqx_types:clientid(), emqx_cm:chan_pid()) -> emqx_types:stats() | {badrpc, _}.
+-spec get_chan_stats(emqx_types:clientid(), emqx_cm:chan_pid()) ->
+    emqx_types:stats() | undefined | {badrpc, _}.
 get_chan_stats(ClientId, ChanPid) ->
     rpc:call(node(ChanPid), emqx_cm, do_get_chan_stats, [ClientId, ChanPid], ?T_GET_INFO * 2).
 
--spec get_chan_info(emqx_types:clientid(), emqx_cm:chan_pid()) -> emqx_types:infos() | {badrpc, _}.
+-spec get_chan_info(emqx_types:clientid(), emqx_cm:chan_pid()) ->
+    emqx_types:infos() | undefined | {badrpc, _}.
 get_chan_info(ClientId, ChanPid) ->
     rpc:call(node(ChanPid), emqx_cm, do_get_chan_info, [ClientId, ChanPid], ?T_GET_INFO * 2).
 
@@ -63,15 +69,17 @@ get_chann_conn_mod(ClientId, ChanPid) ->
 
 -spec takeover_session(emqx_types:clientid(), emqx_cm:chan_pid()) ->
     none
-    | {expired | persistent, emqx_session:session()}
     | {living, _ConnMod :: atom(), emqx_cm:chan_pid(), emqx_session:session()}
+    %% NOTE: v5.3.0
+    | {living, _ConnMod :: atom(), emqx_session:session()}
+    | {expired | persistent, emqx_session:session()}
     | {badrpc, _}.
 takeover_session(ClientId, ChanPid) ->
     rpc:call(node(ChanPid), emqx_cm, takeover_session, [ClientId, ChanPid], ?T_TAKEOVER * 2).
 
 -spec takeover_finish(module(), emqx_cm:chan_pid()) ->
-    {ok, emqx_type:takeover_data()}
-    | {ok, list(emqx_type:deliver()), emqx_type:takeover_data()}
+    {ok, emqx_types:takeover_data()}
+    | {ok, list(emqx_types:deliver())}
     | {error, term()}
     | {badrpc, _}.
 takeover_finish(ConnMod, ChanPid) ->

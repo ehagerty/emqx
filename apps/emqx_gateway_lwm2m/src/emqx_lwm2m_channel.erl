@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 %%--------------------------------------------------------------------
 
 -module(emqx_lwm2m_channel).
+-behaviour(emqx_gateway_channel).
 
 -include("emqx_lwm2m.hrl").
 -include_lib("emqx/include/emqx.hrl").
@@ -36,6 +37,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     terminate/2
@@ -118,7 +120,7 @@ stats(#channel{session = Session}) ->
 
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     #{ctx := Ctx} = Config
@@ -138,6 +140,7 @@ init(
             listener => ListenerId,
             protocol => lwm2m,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             username => undefined,
             clientid => undefined,
@@ -177,6 +180,9 @@ handle_in(Msg, Channle) ->
     NChannel = update_life_timer(Channle),
     call_session(handle_coap_in, Msg, NChannel).
 
+handle_frame_error(Error, Channel) ->
+    {shutdown, Error, Channel}.
+
 %%--------------------------------------------------------------------
 %% Handle Delivers from broker to client
 %%--------------------------------------------------------------------
@@ -201,6 +207,8 @@ handle_timeout(_, {transport, _} = Msg, Channel) ->
     call_session(timeout, Msg, Channel);
 handle_timeout(_, disconnect, Channel) ->
     {shutdown, normal, Channel};
+handle_timeout(_, connection_expire, Channel) ->
+    {shutdown, expired, Channel};
 handle_timeout(_, _, Channel) ->
     {ok, Channel}.
 
@@ -264,7 +272,7 @@ handle_call(
     ok = emqx_broker:unsubscribe(MountedTopic),
     _ = run_hooks(
         Ctx,
-        'session.unsubscribe',
+        'session.unsubscribed',
         [ClientInfo, MountedTopic, #{}]
     ),
     %% modify session state
@@ -331,7 +339,7 @@ terminate(Reason, #channel{
     session = Session
 }) ->
     MountedTopic = emqx_lwm2m_session:on_close(Session),
-    _ = run_hooks(Ctx, 'session.unsubscribe', [ClientInfo, MountedTopic, #{}]),
+    _ = run_hooks(Ctx, 'session.unsubscribed', [ClientInfo, MountedTopic, #{}]),
     run_hooks(Ctx, 'session.terminated', [ClientInfo, Reason, Session]).
 
 %%--------------------------------------------------------------------
@@ -352,10 +360,18 @@ ensure_connected(
 
     NConnInfo = ConnInfo#{connected_at => erlang:system_time(millisecond)},
     ok = run_hooks(Ctx, 'client.connected', [ClientInfo, NConnInfo]),
-    Channel#channel{
+    schedule_connection_expire(Channel#channel{
         conninfo = NConnInfo,
         conn_state = connected
-    }.
+    }).
+
+schedule_connection_expire(Channel = #channel{ctx = Ctx, clientinfo = ClientInfo}) ->
+    case emqx_gateway_ctx:connection_expire_interval(Ctx, ClientInfo) of
+        undefined ->
+            Channel;
+        Interval ->
+            make_timer(connection_expire, Interval, connection_expire, Channel)
+    end.
 
 %%--------------------------------------------------------------------
 %% Ensure disconnected

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% MQTT Channel
@@ -7,7 +7,6 @@
 
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_channel.hrl").
--include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/types.hrl").
 
@@ -33,7 +32,8 @@
 
 -type opts() :: #{
     conninfo := emqx_types:conninfo(),
-    clientinfo := emqx_types:clientinfo()
+    clientinfo := emqx_types:clientinfo(),
+    will_message => emqx_maybe:t(emqx_types:message())
 }.
 
 %%--------------------------------------------------------------------
@@ -82,11 +82,12 @@ stop(Pid) ->
 %% gen_server API
 %%--------------------------------------------------------------------
 
-init([#{conninfo := OldConnInfo, clientinfo := #{clientid := ClientId} = OldClientInfo}]) ->
+init([#{conninfo := OldConnInfo, clientinfo := #{clientid := ClientId} = OldClientInfo} = Opts]) ->
     process_flag(trap_exit, true),
     ClientInfo = clientinfo(OldClientInfo),
     ConnInfo = conninfo(OldConnInfo),
-    case open_session(ConnInfo, ClientInfo) of
+    MaybeWillMsg = maps:get(will_message, Opts, undefined),
+    case open_session(ConnInfo, ClientInfo, MaybeWillMsg) of
         {ok, Channel0} ->
             case set_expiry_timer(Channel0) of
                 {ok, Channel1} ->
@@ -122,7 +123,9 @@ handle_call(
         pendings := Pendings
     } = Channel
 ) ->
-    ok = emqx_session:takeover(Session),
+    % NOTE
+    % This is essentially part of `emqx_session_mem` logic, thus call it directly.
+    ok = emqx_session_mem:takeover(Session),
     %% TODO: Should not drain deliver here (side effect)
     Delivers = emqx_utils:drain_deliver(),
     AllPendings = lists:append(Delivers, Pendings),
@@ -196,8 +199,11 @@ handle_deliver(
         clientinfo := ClientInfo
     } = Channel
 ) ->
+    % NOTE
+    % This is essentially part of `emqx_session_mem` logic, thus call it directly.
     Delivers1 = emqx_channel:maybe_nack(Delivers),
-    NSession = emqx_session:enqueue(ClientInfo, Delivers1, Session),
+    Messages = emqx_session:enrich_delivers(ClientInfo, Delivers1, Session),
+    NSession = emqx_session_mem:enqueue(ClientInfo, Messages, Session),
     Channel#{session := NSession}.
 
 cancel_expiry_timer(#{expiry_timer := TRef}) when is_reference(TRef) ->
@@ -217,9 +223,9 @@ set_expiry_timer(#{conninfo := ConnInfo} = Channel) ->
             {error, should_be_expired}
     end.
 
-open_session(ConnInfo, #{clientid := ClientId} = ClientInfo) ->
+open_session(ConnInfo, #{clientid := ClientId} = ClientInfo, MaybeWillMsg) ->
     Channel = channel(ConnInfo, ClientInfo),
-    case emqx_cm:open_session(_CleanSession = false, ClientInfo, ConnInfo) of
+    case emqx_cm:open_session(_CleanSession = false, ClientInfo, ConnInfo, MaybeWillMsg) of
         {ok, #{present := false}} ->
             ?SLOG(
                 info,
@@ -230,7 +236,7 @@ open_session(ConnInfo, #{clientid := ClientId} = ClientInfo) ->
                 }
             ),
             {error, no_session};
-        {ok, #{session := Session, present := true, pendings := Pendings0}} ->
+        {ok, #{session := Session, present := true, replay := Pendings}} ->
             ?SLOG(
                 info,
                 #{
@@ -239,12 +245,15 @@ open_session(ConnInfo, #{clientid := ClientId} = ClientInfo) ->
                     node => node()
                 }
             ),
-            Pendings1 = lists:usort(lists:append(Pendings0, emqx_utils:drain_deliver())),
-            NSession = emqx_session:enqueue(
-                ClientInfo,
-                emqx_channel:maybe_nack(Pendings1),
-                Session
-            ),
+            % NOTE
+            % Here we aggregate and deduplicate remote and local pending deliveries,
+            % throwing away any local deliveries that are part of some shared
+            % subscription. Remote deliviries pertaining to shared subscriptions should
+            % already have been thrown away by `emqx_channel:handle_deliver/2`.
+            % See also: `emqx_channel:maybe_resume_session/1`, `emqx_session_mem:replay/3`.
+            DeliversLocal = emqx_channel:maybe_nack(emqx_utils:drain_deliver()),
+            PendingsAll = emqx_session_mem:dedup(ClientInfo, Pendings, DeliversLocal, Session),
+            NSession = emqx_session_mem:enqueue(ClientInfo, PendingsAll, Session),
             NChannel = Channel#{session => NSession},
             ok = emqx_cm:insert_channel_info(ClientId, info(NChannel), stats(NChannel)),
             ?SLOG(
@@ -299,6 +308,7 @@ clientinfo(OldClientInfo) ->
             zone,
             protocol,
             peerhost,
+            peername,
             sockport,
             clientid,
             username,

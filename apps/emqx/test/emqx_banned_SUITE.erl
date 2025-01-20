@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,19 +26,15 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([]),
-    ok = ekka:start(),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ekka:stop(),
-    mria:stop(),
-    mria_mnesia:delete_schema(),
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
 
 t_add_delete(_) ->
     Banned = #banned{
-        who = {clientid, <<"TestClient">>},
+        who = emqx_banned:who(clientid, <<"TestClient">>),
         by = <<"banned suite">>,
         reason = <<"test">>,
         at = erlang:system_time(second),
@@ -51,54 +47,99 @@ t_add_delete(_) ->
         emqx_banned:create(Banned#banned{until = erlang:system_time(second) + 100}),
     ?assertEqual(1, emqx_banned:info(size)),
 
-    ok = emqx_banned:delete({clientid, <<"TestClient">>}),
+    ok = emqx_banned:delete(emqx_banned:who(clientid, <<"TestClient">>)),
     ?assertEqual(0, emqx_banned:info(size)).
 
 t_check(_) ->
-    {ok, _} = emqx_banned:create(#banned{who = {clientid, <<"BannedClient">>}}),
-    {ok, _} = emqx_banned:create(#banned{who = {username, <<"BannedUser">>}}),
-    {ok, _} = emqx_banned:create(#banned{who = {peerhost, {192, 168, 0, 1}}}),
-    ?assertEqual(3, emqx_banned:info(size)),
-    ClientInfo1 = #{
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(clientid, <<"BannedClient">>)}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(username, <<"BannedUser">>)}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(peerhost, {192, 168, 0, 1})}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(peerhost, <<"192.168.0.2">>)}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(clientid_re, <<"BannedClientRE.*">>)}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(username_re, <<"BannedUserRE.*">>)}),
+    {ok, _} = emqx_banned:create(#banned{who = emqx_banned:who(peerhost_net, <<"192.168.3.0/24">>)}),
+
+    ?assertEqual(7, emqx_banned:info(size)),
+    ClientInfoBannedClientId = #{
         clientid => <<"BannedClient">>,
         username => <<"user">>,
         peerhost => {127, 0, 0, 1}
     },
-    ClientInfo2 = #{
+    ClientInfoBannedUsername = #{
         clientid => <<"client">>,
         username => <<"BannedUser">>,
         peerhost => {127, 0, 0, 1}
     },
-    ClientInfo3 = #{
+    ClientInfoBannedAddr1 = #{
         clientid => <<"client">>,
         username => <<"user">>,
         peerhost => {192, 168, 0, 1}
     },
-    ClientInfo4 = #{
+    ClientInfoBannedAddr2 = #{
+        clientid => <<"client">>,
+        username => <<"user">>,
+        peerhost => {192, 168, 0, 2}
+    },
+    ClientInfoBannedClientIdRE = #{
+        clientid => <<"BannedClientRE1">>,
+        username => <<"user">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    ClientInfoBannedUsernameRE = #{
+        clientid => <<"client">>,
+        username => <<"BannedUserRE1">>,
+        peerhost => {127, 0, 0, 1}
+    },
+    ClientInfoBannedAddrNet = #{
+        clientid => <<"client">>,
+        username => <<"user">>,
+        peerhost => {192, 168, 3, 1}
+    },
+    ClientInfoValidFull = #{
         clientid => <<"client">>,
         username => <<"user">>,
         peerhost => {127, 0, 0, 1}
     },
-    ClientInfo5 = #{},
-    ClientInfo6 = #{clientid => <<"client1">>},
-    ?assert(emqx_banned:check(ClientInfo1)),
-    ?assert(emqx_banned:check(ClientInfo2)),
-    ?assert(emqx_banned:check(ClientInfo3)),
-    ?assertNot(emqx_banned:check(ClientInfo4)),
-    ?assertNot(emqx_banned:check(ClientInfo5)),
-    ?assertNot(emqx_banned:check(ClientInfo6)),
-    ok = emqx_banned:delete({clientid, <<"BannedClient">>}),
-    ok = emqx_banned:delete({username, <<"BannedUser">>}),
-    ok = emqx_banned:delete({peerhost, {192, 168, 0, 1}}),
-    ?assertNot(emqx_banned:check(ClientInfo1)),
-    ?assertNot(emqx_banned:check(ClientInfo2)),
-    ?assertNot(emqx_banned:check(ClientInfo3)),
-    ?assertNot(emqx_banned:check(ClientInfo4)),
+    ClientInfoValidEmpty = #{},
+    ClientInfoValidOnlyClientId = #{clientid => <<"client1">>},
+    ?assert(emqx_banned:check(ClientInfoBannedClientId)),
+    ?assert(emqx_banned:check(ClientInfoBannedUsername)),
+    ?assert(emqx_banned:check(ClientInfoBannedAddr1)),
+    ?assert(emqx_banned:check(ClientInfoBannedAddr2)),
+    ?assert(emqx_banned:check(ClientInfoBannedClientIdRE)),
+    ?assert(emqx_banned:check(ClientInfoBannedUsernameRE)),
+    ?assert(emqx_banned:check(ClientInfoBannedAddrNet)),
+    ?assertNot(emqx_banned:check(ClientInfoValidFull)),
+    ?assertNot(emqx_banned:check(ClientInfoValidEmpty)),
+    ?assertNot(emqx_banned:check(ClientInfoValidOnlyClientId)),
+
+    ?assert(emqx_banned:check_clientid(<<"BannedClient">>)),
+    ?assert(emqx_banned:check_clientid(<<"BannedClientRE">>)),
+
+    ok = emqx_banned:delete(emqx_banned:who(clientid, <<"BannedClient">>)),
+    ok = emqx_banned:delete(emqx_banned:who(username, <<"BannedUser">>)),
+    ok = emqx_banned:delete(emqx_banned:who(peerhost, {192, 168, 0, 1})),
+    ok = emqx_banned:delete(emqx_banned:who(peerhost, <<"192.168.0.2">>)),
+    ok = emqx_banned:delete(emqx_banned:who(clientid_re, <<"BannedClientRE.*">>)),
+    ok = emqx_banned:delete(emqx_banned:who(username_re, <<"BannedUserRE.*">>)),
+    ok = emqx_banned:delete(emqx_banned:who(peerhost_net, <<"192.168.3.0/24">>)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedClientId)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedUsername)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedAddr1)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedAddr2)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedClientIdRE)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedUsernameRE)),
+    ?assertNot(emqx_banned:check(ClientInfoBannedAddrNet)),
+    ?assertNot(emqx_banned:check(ClientInfoValidFull)),
+
+    ?assertNot(emqx_banned:check_clientid(<<"BannedClient">>)),
+    ?assertNot(emqx_banned:check_clientid(<<"BannedClientRE">>)),
+
     ?assertEqual(0, emqx_banned:info(size)).
 
 t_unused(_) ->
-    Who1 = {clientid, <<"BannedClient1">>},
-    Who2 = {clientid, <<"BannedClient2">>},
+    Who1 = emqx_banned:who(clientid, <<"BannedClient1">>),
+    Who2 = emqx_banned:who(clientid, <<"BannedClient2">>),
 
     ?assertMatch(
         {ok, _},
@@ -127,7 +168,7 @@ t_kick(_) ->
     snabbkaffe:start_trace(),
 
     Now = erlang:system_time(second),
-    Who = {clientid, ClientId},
+    Who = emqx_banned:who(clientid, ClientId),
 
     emqx_banned:create(#{
         who => Who,
@@ -198,7 +239,7 @@ t_session_taken(_) ->
     Publish(),
 
     Now = erlang:system_time(second),
-    Who = {clientid, ClientId2},
+    Who = emqx_banned:who(clientid, ClientId2),
     emqx_banned:create(#{
         who => Who,
         by => <<"test">>,
@@ -212,6 +253,58 @@ t_session_taken(_) ->
     emqx_banned:delete(Who),
     {ok, #{}, [0]} = emqtt:unsubscribe(C3, Topic),
     ok = emqtt:disconnect(C3).
+
+t_full_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"full.csv">>))),
+    FullDatas = lists:sort([
+        {banned, {username, <<"u1">>}, <<"boot">>, <<"reason 2">>, 1635170027, 1761400427},
+        {banned, {clientid, <<"c1">>}, <<"boot">>, <<"reason 1">>, 1635170027, 1761400427}
+    ]),
+    ?assertMatch(FullDatas, lists:sort(get_banned_list())),
+
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"full2.csv">>))),
+    ?assertMatch(FullDatas, lists:sort(get_banned_list())),
+    ok.
+
+t_optional_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"optional.csv">>))),
+    Keys = lists:sort([{username, <<"u1">>}, {clientid, <<"c1">>}]),
+    ?assertMatch(Keys, lists:sort([element(2, Data) || Data <- get_banned_list()])),
+    ok.
+
+t_omitted_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"omitted.csv">>))),
+    Keys = lists:sort([{username, <<"u1">>}, {clientid, <<"c1">>}]),
+    ?assertMatch(Keys, lists:sort([element(2, Data) || Data <- get_banned_list()])),
+    ok.
+
+t_error_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(
+        {error, enoent}, emqx_banned:init_from_csv(mk_bootstrap_file(<<"not_exists.csv">>))
+    ),
+    ?assertEqual(
+        ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"error.csv">>))
+    ),
+    Keys = [{clientid, <<"c1">>}],
+    ?assertMatch(Keys, [element(2, Data) || Data <- get_banned_list()]),
+    ok.
+
+t_until_expiry(_) ->
+    Who = #{<<"as">> => clientid, <<"who">> => <<"t_until_expiry">>},
+
+    {ok, Banned} = emqx_banned:parse(Who),
+    {ok, _} = emqx_banned:create(Banned),
+
+    [Data] = emqx_banned:look_up(Who),
+    ?assertEqual(Banned, Data),
+    ?assertMatch(#{until := infinity}, emqx_banned:format(Data)),
+
+    emqx_banned:clear(),
+    ok.
 
 receive_messages(Count) ->
     receive_messages(Count, []).
@@ -228,3 +321,17 @@ receive_messages(Count, Msgs) ->
     after 1200 ->
         Msgs
     end.
+
+mk_bootstrap_file(File) ->
+    Dir = code:lib_dir(emqx),
+    filename:join([Dir, "test", "data", "banned", File]).
+
+get_banned_list() ->
+    Tabs = emqx_banned:tables(),
+    lists:foldl(
+        fun(Tab, Acc) ->
+            Acc ++ ets:tab2list(Tab)
+        end,
+        [],
+        Tabs
+    ).

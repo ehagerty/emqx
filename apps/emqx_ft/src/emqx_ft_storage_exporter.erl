@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@
 %% Internal API
 -export([exporter/1]).
 
--export_type([export/0]).
+-export_type([export/0, exporter_conf/0]).
 
 -type storage() :: emqx_ft_storage_fs:storage() | undefined.
 -type transfer() :: emqx_ft:transfer().
@@ -195,7 +195,7 @@ verify_checksum(Ctx, {Algo, Digest} = Checksum) ->
         Digest ->
             {ok, Checksum};
         Mismatch ->
-            {error, {checksum, Algo, binary:encode_hex(Mismatch)}}
+            {error, {checksum_mismatch, Algo, binary:encode_hex(Mismatch)}}
     end;
 verify_checksum(Ctx, undefined) ->
     Digest = crypto:hash_final(Ctx),

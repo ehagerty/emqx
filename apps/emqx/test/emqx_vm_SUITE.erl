@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,7 +21,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-all() -> emqx_common_test_helpers:all(?MODULE).
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
 
 t_load(_Config) ->
     lists:foreach(
@@ -97,7 +98,7 @@ t_get_process_limit(_Config) ->
     emqx_vm:get_process_limit().
 
 t_cpu_util(_Config) ->
-    _Cpu = emqx_vm:cpu_util().
+    ?assertMatch(Val when is_number(Val), emqx_vm:cpu_util()).
 
 easy_server() ->
     {ok, LSock} = gen_tcp:listen(5678, [binary, {packet, 0}, {active, false}]),

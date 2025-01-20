@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,21 +19,27 @@
 -behaviour(supervisor).
 
 -export([start_link/0]).
-
 -export([init/1]).
 
 start_link() ->
+    _ = mria:wait_for_tables(emqx_alarm:create_tables()),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Childs = [
-        child_spec(emqx_sys),
-        child_spec(emqx_alarm),
-        child_spec(emqx_sys_mon),
-        child_spec(emqx_os_mon),
-        child_spec(emqx_vm_mon)
-    ],
-    {ok, {{one_for_one, 10, 100}, Childs}}.
+    OsMon =
+        case emqx_os_mon:is_os_check_supported() of
+            true -> [child_spec(emqx_os_mon), child_spec(emqx_cpu_sup_worker)];
+            false -> []
+        end,
+    Children =
+        [
+            child_spec(emqx_sys),
+            child_spec(emqx_alarm),
+            child_spec(emqx_sys_mon),
+            child_spec(emqx_vm_mon),
+            child_spec(emqx_broker_mon)
+        ] ++ OsMon,
+    {ok, {{one_for_one, 10, 100}, Children}}.
 
 %%--------------------------------------------------------------------
 %% Internal functions

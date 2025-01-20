@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -76,6 +76,17 @@ t_values(_) ->
     ?assertEqual([1, 2], emqx_inflight:values(Inflight)),
     ?assertEqual([{a, 1}, {b, 2}], emqx_inflight:to_list(Inflight)).
 
+t_fold(_) ->
+    Inflight = maps:fold(
+        fun emqx_inflight:insert/3,
+        emqx_inflight:new(),
+        #{a => 1, b => 2, c => 42}
+    ),
+    ?assertEqual(
+        emqx_inflight:fold(fun(_, V, S) -> S + V end, 0, Inflight),
+        lists:foldl(fun({_, V}, S) -> S + V end, 0, emqx_inflight:to_list(Inflight))
+    ).
+
 t_is_full(_) ->
     Inflight = emqx_inflight:insert(k, v, emqx_inflight:new()),
     ?assertNot(emqx_inflight:is_full(Inflight)),
@@ -105,5 +116,13 @@ t_window(_) ->
     ),
     ?assertEqual([a, b], emqx_inflight:window(Inflight)).
 
-% t_to_list(_) ->
-%     error('TODO').
+t_to_list(_) ->
+    Inflight = lists:foldl(
+        fun(Seq, InflightAcc) ->
+            emqx_inflight:insert(Seq, integer_to_binary(Seq), InflightAcc)
+        end,
+        emqx_inflight:new(100),
+        [1, 6, 2, 3, 10, 7, 9, 8, 4, 5]
+    ),
+    ExpList = [{Seq, integer_to_binary(Seq)} || Seq <- lists:seq(1, 10)],
+    ?assertEqual(ExpList, emqx_inflight:to_list(Inflight)).

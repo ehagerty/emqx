@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@
     ]
 ).
 
-%% minirest/dashbaord_swagger behaviour callbacks
+%% minirest/dashboard_swagger behaviour callbacks
 -export([
     api_spec/0,
     paths/0,
@@ -42,7 +42,8 @@
 
 -export([
     roots/0,
-    fields/1
+    fields/1,
+    namespace/0
 ]).
 
 %% http handlers
@@ -197,6 +198,10 @@ subscriptions(get, #{
         case emqx_gateway_http:list_client_subscriptions(GwName, ClientId) of
             {error, not_found} ->
                 return_http_error(404, "client process not found");
+            {error, ignored} ->
+                return_http_error(
+                    400, "get subscriptions failed: unsupported"
+                );
             {error, Reason} ->
                 return_http_error(400, Reason);
             {ok, Subs} ->
@@ -222,7 +227,13 @@ subscriptions(post, #{
                     )
                 of
                     {error, not_found} ->
-                        return_http_error(404, "client process not found");
+                        return_http_error(
+                            404, "client process not found"
+                        );
+                    {error, ignored} ->
+                        return_http_error(
+                            400, "subscribe failed: unsupported"
+                        );
                     {error, Reason} ->
                         return_http_error(400, Reason);
                     {ok, {NTopic, NSubOpts}} ->
@@ -241,8 +252,14 @@ subscriptions(delete, #{
     with_gateway(Name0, fun(GwName, _) ->
         case lookup_topic(GwName, ClientId, Topic) of
             {ok, _} ->
-                _ = emqx_gateway_http:client_unsubscribe(GwName, ClientId, Topic),
-                {204};
+                case emqx_gateway_http:client_unsubscribe(GwName, ClientId, Topic) of
+                    {error, ignored} ->
+                        return_http_error(
+                            400, "unsubscribe failed: unsupported"
+                        );
+                    _ ->
+                        {204}
+                end;
             {error, not_found} ->
                 return_http_error(404, "Resource not found")
         end
@@ -397,13 +414,13 @@ format_channel_info(WhichNode, {_, Infos, Stats} = R) ->
         {ip_address, {peername, ConnInfo, fun peer_to_binary_addr/1}},
         {port, {peername, ConnInfo, fun peer_to_port/1}},
         {is_bridge, ClientInfo, false},
-        {connected_at, {connected_at, ConnInfo, fun emqx_gateway_utils:unix_ts_to_rfc3339/1}},
-        {disconnected_at, {disconnected_at, ConnInfo, fun emqx_gateway_utils:unix_ts_to_rfc3339/1}},
+        {connected_at, {connected_at, ConnInfo, fun emqx_utils_calendar:epoch_to_rfc3339/1}},
+        {disconnected_at, {disconnected_at, ConnInfo, fun emqx_utils_calendar:epoch_to_rfc3339/1}},
         {connected, {conn_state, Infos, fun conn_state_to_connected/1}},
-        {keepalive, ClientInfo, 0},
+        {keepalive, ConnInfo, 0},
         {clean_start, ConnInfo, true},
         {expiry_interval, ConnInfo, 0},
-        {created_at, {created_at, SessInfo, fun emqx_gateway_utils:unix_ts_to_rfc3339/1}},
+        {created_at, {created_at, SessInfo, fun emqx_utils_calendar:epoch_to_rfc3339/1}},
         {subscriptions_cnt, Stats, 0},
         {subscriptions_max, Stats, infinity},
         {inflight_cnt, Stats, 0},
@@ -640,28 +657,28 @@ params_client_searching_in_qs() ->
             )},
         {gte_created_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 M#{
                     desc => ?DESC(param_gte_created_at)
                 }
             )},
         {lte_created_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 M#{
                     desc => ?DESC(param_lte_created_at)
                 }
             )},
         {gte_connected_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 M#{
                     desc => ?DESC(param_gte_connected_at)
                 }
             )},
         {lte_connected_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 M#{
                     desc => ?DESC(param_lte_connected_at)
                 }
@@ -700,7 +717,7 @@ params_gateway_name_in_path() ->
     [
         {name,
             mk(
-                binary(),
+                hoconsc:enum(emqx_gateway_schema:gateway_names()),
                 #{
                     in => path,
                     desc => ?DESC(emqx_gateway_api, gateway_name)
@@ -758,6 +775,8 @@ schema_client() ->
         ]),
         examples_client()
     ).
+
+namespace() -> undefined.
 
 roots() ->
     [
@@ -888,12 +907,12 @@ common_client_props() ->
             )},
         {connected_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 #{desc => ?DESC(connected_at)}
             )},
         {disconnected_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 #{
                     desc => ?DESC(disconnected_at)
                 }
@@ -931,7 +950,7 @@ common_client_props() ->
             )},
         {created_at,
             mk(
-                emqx_datetime:epoch_millisecond(),
+                emqx_utils_calendar:epoch_millisecond(),
                 #{desc => ?DESC(created_at)}
             )},
         {subscriptions_cnt,

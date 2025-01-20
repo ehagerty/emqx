@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@
     make_future/1,
     available/1
 ]).
--export_type([local_limiter/0]).
+-export_type([local_limiter/0, limiter/0, retry_context/1]).
 
 %% a token bucket limiter which may or not contains a reference to another limiter,
 %% and can be used in a client alone
@@ -139,7 +139,7 @@ make_local_limiter(Cfg, Bucket) ->
         tokens => emqx_limiter_server:get_initial_val(Cfg),
         lasttime => ?NOW,
         bucket => Bucket,
-        capacity => emqx_limiter_schema:calc_capacity(Cfg)
+        capacity => emqx_limiter_utils:calc_capacity(Cfg)
     }.
 
 %%@doc create a limiter server's reference

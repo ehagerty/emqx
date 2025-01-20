@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ parse_serialize(Packet, Opts) when is_map(Opts) ->
     Ver = maps:get(version, Opts, ?MQTT_PROTO_V4),
     Bin = iolist_to_binary(emqx_frame:serialize(Packet, Ver)),
     ParseState = emqx_frame:initial_parse_state(Opts),
-    {ok, NPacket, <<>>, _} = emqx_frame:parse(Bin, ParseState),
+    {NPacket, <<>>, _} = emqx_frame:parse(Bin, ParseState),
     NPacket.
 
 %%--------------------------------------------------------------------

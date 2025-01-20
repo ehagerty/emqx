@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,12 +40,19 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:load_config(emqx_modules_schema, ?BASE_CONF),
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_modules]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            {emqx_modules, #{config => ?BASE_CONF}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_) ->
-    emqx_common_test_helpers:stop_apps([emqx_modules, emqx_conf]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(t_load_case, Config) ->
     Config;
@@ -164,15 +171,15 @@ t_cluster(_) ->
 
     ?assertMatch(
         {ok, _},
-        emqx_delayed_proto_v1:get_delayed_message(node(), Id)
+        emqx_delayed_proto_v2:get_delayed_message(node(), Id)
     ),
 
     %% The 'local' and the 'fake-remote' values should be the same,
     %% however there is a race condition, so we are just assert that they are both 'ok' tuples
     ?assertMatch({ok, _}, emqx_delayed:get_delayed_message(Id)),
-    ?assertMatch({ok, _}, emqx_delayed_proto_v1:get_delayed_message(node(), Id)),
+    ?assertMatch({ok, _}, emqx_delayed_proto_v2:get_delayed_message(node(), Id)),
 
-    ok = emqx_delayed_proto_v1:delete_delayed_message(node(), Id),
+    ok = emqx_delayed_proto_v2:delete_delayed_message(node(), Id),
 
     ?assertMatch(
         {error, _},
@@ -215,11 +222,21 @@ t_banned_delayed(_) ->
     emqx:update_config([delayed, max_delayed_messages], 10000),
     ClientId1 = <<"bc1">>,
     ClientId2 = <<"bc2">>,
+    ClientId3 = <<"bc3">>,
 
     Now = erlang:system_time(second),
-    Who = {clientid, ClientId2},
+
+    Who = emqx_banned:who(clientid, ClientId2),
     emqx_banned:create(#{
         who => Who,
+        by => <<"test">>,
+        reason => <<"test">>,
+        at => Now,
+        until => Now + 120
+    }),
+    WhoRE = emqx_banned:who(clientid_re, <<"c3">>),
+    emqx_banned:create(#{
+        who => WhoRE,
         by => <<"test">>,
         reason => <<"test">>,
         at => Now,
@@ -230,7 +247,7 @@ t_banned_delayed(_) ->
     {ok, SubRef} =
         snabbkaffe:subscribe(
             ?match_event(#{?snk_kind := ignore_delayed_message_publish}),
-            _NEvents = 2,
+            _NEvents = 4,
             _Timeout = 10000,
             0
         ),
@@ -240,15 +257,16 @@ t_banned_delayed(_) ->
             Msg = emqx_message:make(ClientId, <<"$delayed/1/bc">>, <<"payload">>),
             emqx_delayed:on_message_publish(Msg)
         end,
-        [ClientId1, ClientId1, ClientId1, ClientId2, ClientId2]
+        [ClientId1, ClientId1, ClientId1, ClientId2, ClientId2, ClientId3, ClientId3]
     ),
 
     {ok, Trace} = snabbkaffe:receive_events(SubRef),
     snabbkaffe:stop(),
     emqx_banned:delete(Who),
+    emqx_banned:delete(WhoRE),
     mnesia:clear_table(emqx_delayed),
 
-    ?assertEqual(2, length(?of_kind(ignore_delayed_message_publish, Trace))).
+    ?assertEqual(4, length(?of_kind(ignore_delayed_message_publish, Trace))).
 
 subscribe_proc() ->
     Self = self(),

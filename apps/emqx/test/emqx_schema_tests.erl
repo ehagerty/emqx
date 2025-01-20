@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -905,28 +905,71 @@ timeout_types_test_() ->
             {ok, 4294967},
             typerefl:from_string(emqx_schema:timeout_duration_s(), <<"4294967000ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967295 ms)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967295 ms)"},
             typerefl:from_string(emqx_schema:timeout_duration(), <<"4294967296ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967295 ms)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967295 ms)"},
             typerefl:from_string(emqx_schema:timeout_duration_ms(), <<"4294967296ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967 s)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967 s)"},
             typerefl:from_string(emqx_schema:timeout_duration_s(), <<"4294967001ms">>)
         )
+    ].
+
+unicode_template_test() ->
+    Sc = #{
+        roots => [root],
+        fields => #{root => [{template, #{type => emqx_schema:template()}}]}
+    },
+    HoconText = <<"root = {template = \"中文\"}"/utf8>>,
+    {ok, Hocon} = hocon:binary(HoconText),
+    ?assertEqual(
+        #{<<"root">> => #{<<"template">> => <<"中文"/utf8>>}},
+        hocon_tconf:check_plain(Sc, Hocon)
+    ).
+
+max_packet_size_test_() ->
+    Sc = emqx_schema,
+    Check = fun(Input) ->
+        {ok, Hocon} = hocon:binary(Input),
+        hocon_tconf:check_plain(Sc, Hocon, #{}, [mqtt])
+    end,
+    [
+        {"one byte less than 256MB", fun() ->
+            ?assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 268435455}},
+                Check(<<"mqtt.max_packet_size = 256MB">>)
+            )
+        end},
+        {"default value", fun() ->
+            ?assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 1048576}},
+                Check(<<"mqtt.max_packet_size = null">>)
+            )
+        end},
+        {"1KB is 1024 bytes", fun() ->
+            ?assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 1024}},
+                Check(<<"mqtt.max_packet_size = 1KB">>)
+            )
+        end},
+        {"257MB is not allowed", fun() ->
+            ?assertThrow(
+                {emqx_schema, [
+                    #{reason := #{cause := max_mqtt_packet_size_too_large, maximum := 268435455}}
+                ]},
+                Check(<<"mqtt.max_packet_size = 257MB">>)
+            )
+        end},
+        {"0 is not allowed", fun() ->
+            ?assertThrow(
+                {emqx_schema, [
+                    #{reason := #{cause := max_mqtt_packet_size_too_small, minimum := 1}}
+                ]},
+                Check(<<"mqtt.max_packet_size = 0">>)
+            )
+        end}
     ].

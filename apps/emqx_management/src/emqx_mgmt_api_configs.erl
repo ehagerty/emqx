@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -29,26 +29,38 @@
     configs/3,
     get_full_config/0,
     global_zone_configs/3,
-    limiter/3
+    limiter/3,
+    get_raw_config/1
 ]).
+-export([request_config/3]).
 
 -define(PREFIX, "/configs/").
 -define(PREFIX_RESET, "/configs_reset/").
--define(ERR_MSG(MSG), list_to_binary(io_lib:format("~p", [MSG]))).
+-define(ERR_MSG(MSG), list_to_binary(io_lib:format("~0p", [MSG]))).
 -define(OPTS, #{rawconf_with_defaults => true, override_to => cluster}).
 -define(TAGS, ["Configs"]).
+
+-if(?EMQX_RELEASE_EDITION == ee).
+-define(ROOT_KEYS_EE, [
+    <<"file_transfer">>
+]).
+-else.
+-define(ROOT_KEYS_EE, []).
+-endif.
 
 -define(ROOT_KEYS, [
     <<"dashboard">>,
     <<"alarm">>,
     <<"sys_topics">>,
     <<"sysmon">>,
-    <<"log">>
+    <<"log">>,
+    <<"broker">>
+    | ?ROOT_KEYS_EE
 ]).
 
 %% erlfmt-ignore
 -define(SYSMON_EXAMPLE,
-    <<"""
+    <<"
     sysmon {
       os {
         cpu_check_interval = 60s
@@ -69,7 +81,7 @@
         process_low_watermark = 60%
         }
     }
-    """>>
+    ">>
 ).
 
 api_spec() ->
@@ -135,7 +147,9 @@ schema("/configs") ->
                     hoconsc:mk(
                         hoconsc:enum([replace, merge]),
                         #{in => query, default => merge, required => false}
-                    )}
+                    )},
+                {ignore_readonly,
+                    hoconsc:mk(boolean(), #{in => query, default => false, required => false})}
             ],
             'requestBody' => #{
                 content =>
@@ -258,7 +272,7 @@ schema(Path) ->
             'requestBody' => Schema,
             responses => #{
                 200 => Schema,
-                400 => emqx_dashboard_swagger:error_codes(['UPDATE_FAILED']),
+                400 => emqx_dashboard_swagger:error_codes(['UPDATE_FAILED', 'INVALID_CONFIG']),
                 403 => emqx_dashboard_swagger:error_codes(['UPDATE_FAILED'])
             }
         }
@@ -278,14 +292,20 @@ fields(Field) ->
 
 %%%==============================================================================================
 %% HTTP API Callbacks
-config(get, _Params, Req) ->
-    [Path] = conf_path(Req),
-    {200, get_raw_config(Path)};
-config(put, #{body := NewConf}, Req) ->
+config(Method, Data, Req) ->
     Path = conf_path(Req),
-    case emqx_conf:update(Path, NewConf, ?OPTS) of
+    request_config(Path, Method, Data).
+
+request_config([ConfigRoot | Path], get, _Params) ->
+    [] =/= Path andalso throw("deep config get is not supported"),
+    {200, get_raw_config(ConfigRoot)};
+request_config(Path, put, #{body := NewConf}) ->
+    OldConf = emqx:get_raw_config(Path, #{}),
+    UpdateConf = emqx_utils:deobfuscate(NewConf, OldConf),
+    case emqx_conf:update(Path, UpdateConf, ?OPTS) of
         {ok, #{raw_config := RawConf}} ->
-            {200, RawConf};
+            [ConfigRoot] = Path,
+            {200, obfuscate_raw_config(ConfigRoot, RawConf)};
         {error, Reason} ->
             {400, #{code => 'UPDATE_FAILED', message => ?ERR_MSG(Reason)}}
     end.
@@ -294,34 +314,34 @@ global_zone_configs(get, _Params, _Req) ->
     {200, get_zones()};
 global_zone_configs(put, #{body := Body}, _Req) ->
     PrevZones = get_zones(),
-    Res =
+    {Res, Error} =
         maps:fold(
-            fun(Path, Value, Acc) ->
+            fun(Path, Value, {Acc, Error}) ->
                 PrevValue = maps:get(Path, PrevZones),
                 case Value =/= PrevValue of
                     true ->
                         case emqx_conf:update([Path], Value, ?OPTS) of
                             {ok, #{raw_config := RawConf}} ->
-                                Acc#{Path => RawConf};
+                                {Acc#{Path => RawConf}, Error};
                             {error, Reason} ->
                                 ?SLOG(error, #{
-                                    msg => "update global zone failed",
+                                    msg => "update_global_zone_failed",
                                     reason => Reason,
                                     path => Path,
                                     value => Value
                                 }),
-                                Acc
+                                {Acc, Error#{Path => Reason}}
                         end;
                     false ->
-                        Acc#{Path => Value}
+                        {Acc#{Path => Value}, Error}
                 end
             end,
-            #{},
+            {#{}, #{}},
             Body
         ),
     case maps:size(Res) =:= maps:size(Body) of
         true -> {200, Res};
-        false -> {400, #{code => 'UPDATE_FAILED'}}
+        false -> {400, #{code => 'UPDATE_FAILED', message => ?ERR_MSG(Error)}}
     end.
 
 config_reset(post, _Params, Req) ->
@@ -343,10 +363,19 @@ configs(get, #{query_string := QueryStr, headers := Headers}, _Req) ->
         {ok, <<"text/plain">>} -> get_configs_v2(QueryStr);
         {error, _} = Error -> {400, #{code => 'INVALID_ACCEPT', message => ?ERR_MSG(Error)}}
     end;
-configs(put, #{body := Conf, query_string := #{<<"mode">> := Mode}}, _Req) ->
-    case emqx_conf_cli:load_config(Conf, Mode) of
-        ok -> {200};
-        {error, Msg} -> {400, #{<<"content-type">> => <<"text/plain">>}, Msg}
+configs(put, #{body := Conf, query_string := #{<<"mode">> := Mode} = QS}, _Req) ->
+    IgnoreReadonly = maps:get(<<"ignore_readonly">>, QS, false),
+    case
+        emqx_conf_cli:load_config(Conf, #{
+            mode => Mode, log => none, ignore_readonly => IgnoreReadonly
+        })
+    of
+        ok ->
+            {200};
+        %% bad hocon format
+        {error, Errors} ->
+            Msg = emqx_logger_jsonfmt:best_effort_json_obj(#{errors => Errors}),
+            {400, #{<<"content-type">> => <<"text/plain">>}, Msg}
     end.
 
 find_suitable_accept(Headers, Preferences) when is_list(Preferences), length(Preferences) > 0 ->
@@ -382,7 +411,7 @@ get_configs_v1(QueryStr) ->
     Node = maps:get(<<"node">>, QueryStr, node()),
     case
         lists:member(Node, emqx:running_nodes()) andalso
-            emqx_management_proto_v4:get_full_config(Node)
+            emqx_management_proto_v5:get_full_config(Node)
     of
         false ->
             Message = list_to_binary(io_lib:format("Bad node ~p, reason not found", [Node])),
@@ -399,9 +428,9 @@ get_configs_v2(QueryStr) ->
     Conf =
         case maps:find(<<"key">>, QueryStr) of
             error ->
-                emqx_conf_proto_v3:get_hocon_config(Node);
+                emqx_conf_proto_v4:get_hocon_config(Node);
             {ok, Key} ->
-                emqx_conf_proto_v3:get_hocon_config(Node, atom_to_binary(Key))
+                emqx_conf_proto_v4:get_hocon_config(Node, atom_to_binary(Key))
         end,
     {
         200,
@@ -439,9 +468,12 @@ get_full_config() ->
     ).
 
 get_raw_config(Path) ->
+    obfuscate_raw_config(Path, emqx:get_raw_config([Path])).
+
+obfuscate_raw_config(Path, Raw) ->
     #{Path := Conf} =
         emqx_config:fill_defaults(
-            #{Path => emqx:get_raw_config([Path])},
+            #{Path => Raw},
             #{obfuscate_sensitive_values => true}
         ),
     Conf.
@@ -474,7 +506,7 @@ conf_path(Req) ->
     string:lexemes(Path, "/ ").
 
 global_zone_roots() ->
-    lists:map(fun({K, _}) -> list_to_binary(K) end, global_zone_schema()).
+    lists:map(fun({K, _}) -> atom_to_binary(K) end, global_zone_schema()).
 
 global_zone_schema() ->
     emqx_zone_schema:global_zone_with_default().

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,18 +26,15 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
     OldSch = erlang:system_flag(schedulers_online, 1),
-    [{old_sch, OldSch} | Config].
+    [{apps, Apps}, {old_sch, OldSch} | Config].
 
 end_per_suite(Config) ->
     erlang:system_flag(schedulers_online, ?config(old_sch, Config)),
-    emqx_common_test_helpers:stop_apps([]).
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(_, Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
     emqx_olp:enable(),
     case wait_for(fun() -> lc_sup:whereis_runq_flagman() end, 10) of
         true -> ok;

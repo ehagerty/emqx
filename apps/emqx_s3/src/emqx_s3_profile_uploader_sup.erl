@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3_profile_uploader_sup).
@@ -15,7 +15,7 @@
     start_link/1,
     child_spec/1,
     id/1,
-    start_uploader/2
+    start_uploader/3
 ]).
 
 -export([init/1]).
@@ -24,7 +24,7 @@
 
 -type id() :: {?MODULE, emqx_s3:profile_id()}.
 
--spec start_link(emqx_s3:profile_id()) -> supervisor:start_ret().
+-spec start_link(emqx_s3:profile_id()) -> emqx_types:startlink_ret().
 start_link(ProfileId) ->
     supervisor:start_link(?VIA_GPROC(id(ProfileId)), ?MODULE, [ProfileId]).
 
@@ -43,10 +43,10 @@ child_spec(ProfileId) ->
 id(ProfileId) ->
     {?MODULE, ProfileId}.
 
--spec start_uploader(emqx_s3:profile_id(), emqx_s3_uploader:opts()) ->
-    supervisor:start_ret() | {error, profile_not_found}.
-start_uploader(ProfileId, Opts) ->
-    try supervisor:start_child(?VIA_GPROC(id(ProfileId)), [Opts]) of
+-spec start_uploader(emqx_s3:profile_id(), emqx_s3_client:key(), emqx_s3_client:upload_options()) ->
+    emqx_types:startlink_ret() | {error, profile_not_found}.
+start_uploader(ProfileId, Key, UploadOpts) ->
+    try supervisor:start_child(?VIA_GPROC(id(ProfileId)), [Key, UploadOpts]) of
         Result -> Result
     catch
         exit:{noproc, _} -> {error, profile_not_found}

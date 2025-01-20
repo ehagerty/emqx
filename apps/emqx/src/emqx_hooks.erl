@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -66,8 +66,9 @@
 %%   - Callbacks with greater priority values will be run before
 %%     the ones with lower priority values. e.g. A Callback with
 %%     priority = 2 precedes the callback with priority = 1.
-%%   - The execution order is the adding order of callbacks if they have
-%%     equal priority values.
+%%   - If the priorities of the hooks are equal then their execution
+%%     order is determined by the lexicographic of hook function
+%%     names.
 
 -type hookpoint() :: atom() | binary().
 -type action() :: {module(), atom(), [term()] | undefined}.
@@ -75,18 +76,13 @@
 
 -record(callback, {
     action :: action(),
-    filter :: maybe(filter()),
+    filter :: option(filter()),
     priority :: integer()
 }).
 
 -type callback() :: #callback{}.
 
--record(hook, {
-    name :: hookpoint(),
-    callbacks :: list(#callback{})
-}).
-
--define(TAB, ?MODULE).
+-define(PTERM, ?MODULE).
 -define(SERVER, ?MODULE).
 
 -spec start_link() -> startlink_ret().
@@ -131,6 +127,7 @@ add(HookPoint, Action, Priority, Filter) when is_integer(Priority) ->
     do_add(HookPoint, #callback{action = Action, filter = Filter, priority = Priority}).
 
 do_add(HookPoint, Callback) ->
+    ok = emqx_hookpoints:verify_hookpoint(HookPoint),
     gen_server:call(?SERVER, {add, HookPoint, Callback}, infinity).
 
 %% @doc `put/3,4` updates the existing hook, add it if not exists.
@@ -143,6 +140,7 @@ put(HookPoint, Action, Priority, Filter) when is_integer(Priority) ->
     do_put(HookPoint, #callback{action = Action, filter = Filter, priority = Priority}).
 
 do_put(HookPoint, Callback) ->
+    ok = emqx_hookpoints:verify_hookpoint(HookPoint),
     case do_add(HookPoint, Callback) of
         ok -> ok;
         {error, already_exists} -> gen_server:call(?SERVER, {put, HookPoint, Callback}, infinity)
@@ -156,11 +154,13 @@ del(HookPoint, Action) ->
 %% @doc Run hooks.
 -spec run(hookpoint(), list(Arg :: term())) -> ok.
 run(HookPoint, Args) ->
+    ok = emqx_hookpoints:verify_hookpoint(HookPoint),
     do_run(lookup(HookPoint), Args).
 
 %% @doc Run hooks with Accumulator.
 -spec run_fold(hookpoint(), list(Arg :: term()), Acc :: term()) -> Acc :: term().
 run_fold(HookPoint, Args, Acc) ->
+    ok = emqx_hookpoints:verify_hookpoint(HookPoint),
     do_run_fold(lookup(HookPoint), Args, Acc).
 
 do_run([#callback{action = Action, filter = Filter} | Callbacks], Args) ->
@@ -202,11 +202,13 @@ safe_execute({M, F, A}, Args) ->
     catch
         Error:Reason:Stacktrace ->
             ?SLOG(error, #{
-                msg => "failed_to_execute",
+                msg => "hook_callback_exception",
                 exception => Error,
                 reason => Reason,
                 stacktrace => Stacktrace,
-                failed_call => {M, F, Args ++ A}
+                callback_module => M,
+                callback_function => F,
+                callback_args => emqx_utils_redact:redact(Args ++ A)
             })
     end.
 
@@ -217,19 +219,16 @@ execute({M, F, A}, Args) ->
 %% @doc Lookup callbacks.
 -spec lookup(hookpoint()) -> [callback()].
 lookup(HookPoint) ->
-    case ets:lookup(?TAB, HookPoint) of
-        [#hook{callbacks = Callbacks}] ->
-            Callbacks;
-        [] ->
-            []
-    end.
+    persistent_term:get({?PTERM, HookPoint}, []).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
 init([]) ->
-    ok = emqx_utils_ets:new(?TAB, [{keypos, #hook.name}, {read_concurrency, true}]),
+    _ = erlang:process_flag(trap_exit, true),
+    ok = emqx_hookpoints:register_hookpoints(),
+    ok = delete_all_hooks(),
     {ok, #{}}.
 
 handle_call({add, HookPoint, Callback = #callback{action = {M, F, _}}}, _From, State) ->
@@ -248,7 +247,7 @@ handle_call({add, HookPoint, Callback = #callback{action = {M, F, _}}}, _From, S
     {reply, Reply, State};
 handle_call({put, HookPoint, Callback = #callback{action = {M, F, _}}}, _From, State) ->
     Callbacks = del_callback({M, F}, lookup(HookPoint)),
-    Reply = update_hook(HookPoint, add_callback(Callback, Callbacks)),
+    Reply = insert_hook(HookPoint, add_callback(Callback, Callbacks)),
     {reply, Reply, State};
 handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", req => Req}),
@@ -257,7 +256,7 @@ handle_call(Req, _From, State) ->
 handle_cast({del, HookPoint, Action}, State) ->
     case del_callback(Action, lookup(HookPoint)) of
         [] ->
-            ets:delete(?TAB, HookPoint);
+            delete_hook(HookPoint);
         Callbacks ->
             insert_hook(HookPoint, Callbacks)
     end,
@@ -271,7 +270,7 @@ handle_info(Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    ok.
+    ok = delete_all_hooks().
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -281,32 +280,29 @@ code_change(_OldVsn, State, _Extra) ->
 %%------------------------------------------------------------------------------
 
 insert_hook(HookPoint, Callbacks) ->
-    ets:insert(?TAB, #hook{name = HookPoint, callbacks = Callbacks}),
-    ok.
-update_hook(HookPoint, Callbacks) ->
-    Ms = ets:fun2ms(fun({hook, K, _V}) when K =:= HookPoint -> {hook, K, Callbacks} end),
-    ets:select_replace(emqx_hooks, Ms),
-    ok.
+    persistent_term:put({?PTERM, HookPoint}, Callbacks).
 
-add_callback(C, Callbacks) ->
-    add_callback(C, Callbacks, []).
+delete_hook(HookPoint) ->
+    persistent_term:erase({?PTERM, HookPoint}).
 
-add_callback(C, [], Acc) ->
-    lists:reverse([C | Acc]);
-add_callback(C1 = #callback{priority = P1}, [C2 = #callback{priority = P2} | More], Acc) when
-    P1 < P2
-->
-    add_callback(C1, More, [C2 | Acc]);
+delete_all_hooks() ->
+    maps:foreach(
+        fun(HookPoint, _) -> delete_hook(HookPoint) end,
+        emqx_hookpoints:registered_hookpoints()
+    ).
+
 add_callback(
     C1 = #callback{priority = P1, action = MFA1},
-    [C2 = #callback{priority = P2, action = MFA2} | More],
-    Acc
-) when
-    P1 =:= P2 andalso MFA1 >= MFA2
-->
-    add_callback(C1, More, [C2 | Acc]);
-add_callback(C1, More, Acc) ->
-    lists:append(lists:reverse(Acc), [C1 | More]).
+    [C2 = #callback{priority = P2, action = MFA2} | More] = Cs
+) ->
+    case (P1 < P2) orelse (P1 =:= P2 andalso MFA1 >= MFA2) of
+        true ->
+            [C2 | add_callback(C1, More)];
+        false ->
+            [C1 | Cs]
+    end;
+add_callback(C1, []) ->
+    [C1].
 
 del_callback(Action, Callbacks) ->
     del_callback(Action, Callbacks, []).

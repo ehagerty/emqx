@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 %% MQTT/WS|WSS Connection
 -module(emqx_ws_connection).
 
--include("emqx.hrl").
 -include("emqx_cm.hrl").
 -include("emqx_mqtt.hrl").
 -include("logger.hrl").
@@ -31,6 +30,7 @@
 %% API
 -export([
     info/1,
+    info/2,
     stats/1
 ]).
 
@@ -76,15 +76,14 @@
     %% Channel
     channel :: emqx_channel:channel(),
     %% GC State
-    gc_state :: maybe(emqx_gc:gc_state()),
+    gc_state :: option(emqx_gc:gc_state()),
     %% Postponed Packets|Cmds|Events
+    %% Order is reversed: most recent entry is the first element.
     postponed :: list(emqx_types:packet() | ws_cmd() | tuple()),
     %% Stats Timer
-    stats_timer :: disabled | maybe(reference()),
-    %% Idle Timeout
-    idle_timeout :: timeout(),
+    stats_timer :: paused | disabled | option(reference()),
     %% Idle Timer
-    idle_timer :: maybe(reference()),
+    idle_timer :: option(reference()),
     %% Zone name
     zone :: atom(),
     %% Listener Type and Name
@@ -94,10 +93,13 @@
     limiter :: container(),
 
     %% cache operation when overload
-    limiter_cache :: queue:queue(cache()),
+    limiter_buffer :: queue:queue(cache()),
 
     %% limiter timers
-    limiter_timer :: undefined | reference()
+    limiter_timer :: undefined | reference(),
+
+    %% Extra field for future hot-upgrade support
+    extra = []
 }).
 
 -record(retry, {
@@ -117,7 +119,6 @@
 
 -type ws_cmd() :: {active, boolean()} | close.
 
--define(ACTIVE_N, 100).
 -define(INFO_KEYS, [socktype, peername, sockname, sockstate]).
 -define(SOCK_STATS, [recv_oct, recv_cnt, send_oct, send_cnt]).
 
@@ -125,12 +126,13 @@
 -define(LIMITER_BYTES_IN, bytes).
 -define(LIMITER_MESSAGE_IN, messages).
 
--dialyzer({no_match, [info/2]}).
--dialyzer({nowarn_function, [websocket_init/1]}).
+-define(LOG(Level, Data), ?SLOG(Level, ?MAPPEND(Data, #{tag => "MQTT"}))).
 
 %%--------------------------------------------------------------------
 %% Info, Stats
 %%--------------------------------------------------------------------
+
+-type info() :: atom() | {channel, _Info}.
 
 -spec info(pid() | state()) -> emqx_types:infos().
 info(WsPid) when is_pid(WsPid) ->
@@ -142,6 +144,9 @@ info(State = #state{channel = Channel}) ->
     ),
     ChanInfo#{sockinfo => SockInfo}.
 
+-spec info
+    (info(), state()) -> _Value;
+    (info(), state()) -> [{atom(), _Value}].
 info(Keys, State) when is_list(Keys) ->
     [{Key, info(Key, State)} || Key <- Keys];
 info(socktype, _State) ->
@@ -162,10 +167,10 @@ info(postponed, #state{postponed = Postponed}) ->
     Postponed;
 info(stats_timer, #state{stats_timer = TRef}) ->
     TRef;
-info(idle_timeout, #state{idle_timeout = Timeout}) ->
-    Timeout;
 info(idle_timer, #state{idle_timer = TRef}) ->
-    TRef.
+    TRef;
+info({channel, Info}, #state{channel = Channel}) ->
+    emqx_channel:info(Info, Channel).
 
 -spec stats(pid() | state()) -> emqx_types:stats().
 stats(WsPid) when is_pid(WsPid) ->
@@ -205,7 +210,8 @@ init(Req, #{listener := {Type, Listener}} = Opts) ->
         compress => get_ws_opts(Type, Listener, compress),
         deflate_opts => get_ws_opts(Type, Listener, deflate_opts),
         max_frame_size => get_ws_opts(Type, Listener, max_frame_size),
-        idle_timeout => get_ws_opts(Type, Listener, idle_timeout)
+        idle_timeout => get_ws_opts(Type, Listener, idle_timeout),
+        validate_utf8 => get_ws_opts(Type, Listener, validate_utf8)
     },
     case check_origin_header(Req, Opts) of
         {error, Reason} ->
@@ -277,7 +283,7 @@ websocket_init([Req, Opts]) ->
     #{zone := Zone, limiter := LimiterCfg, listener := {Type, Listener} = ListenerCfg} = Opts,
     case check_max_connection(Type, Listener) of
         allow ->
-            {Peername, PeerCert} = get_peer_info(Type, Listener, Req, Opts),
+            {Peername, PeerCert, PeerSNI} = get_peer_info(Type, Listener, Req, Opts),
             Sockname = cowboy_req:sock(Req),
             WsCookie = get_ws_cookie(Req),
             ConnInfo = #{
@@ -285,6 +291,7 @@ websocket_init([Req, Opts]) ->
                 peername => Peername,
                 sockname => Sockname,
                 peercert => PeerCert,
+                peersni => PeerSNI,
                 ws_cookie => WsCookie,
                 conn_mod => ?MODULE
             },
@@ -299,14 +306,14 @@ websocket_init([Req, Opts]) ->
                 max_size => emqx_config:get_zone_conf(Zone, [mqtt, max_packet_size])
             },
             ParseState = emqx_frame:initial_parse_state(FrameOpts),
-            Serialize = emqx_frame:serialize_opts(),
+            Serialize = emqx_frame:initial_serialize_opts(FrameOpts),
             Channel = emqx_channel:init(ConnInfo, Opts),
             GcState = get_force_gc(Zone),
             StatsTimer = get_stats_enable(Zone),
             %% MQTT Idle Timeout
             IdleTimeout = emqx_channel:get_mqtt_conf(Zone, idle_timeout),
             IdleTimer = start_timer(IdleTimeout, idle_timeout),
-            tune_heap_size(Channel),
+            _ = tune_heap_size(Channel),
             emqx_logger:set_metadata_peername(esockd:format(Peername)),
             {ok,
                 #state{
@@ -321,12 +328,12 @@ websocket_init([Req, Opts]) ->
                     gc_state = GcState,
                     postponed = [],
                     stats_timer = StatsTimer,
-                    idle_timeout = IdleTimeout,
                     idle_timer = IdleTimer,
                     zone = Zone,
                     listener = {Type, Listener},
                     limiter_timer = undefined,
-                    limiter_cache = queue:new()
+                    limiter_buffer = queue:new(),
+                    extra = []
                 },
                 hibernate};
         {denny, Reason} ->
@@ -346,7 +353,7 @@ tune_heap_size(Channel) ->
 
 get_stats_enable(Zone) ->
     case emqx_config:get_zone_conf(Zone, [stats, enable]) of
-        true -> undefined;
+        true -> paused;
         false -> disabled
     end.
 
@@ -373,11 +380,12 @@ get_ws_cookie(Req) ->
     end.
 
 get_peer_info(Type, Listener, Req, Opts) ->
+    Host = maps:get(host, Req, undefined),
     case
         emqx_config:get_listener_conf(Type, Listener, [proxy_protocol]) andalso
             maps:get(proxy_header, Req)
     of
-        #{src_address := SrcAddr, src_port := SrcPort, ssl := SSL} ->
+        #{src_address := SrcAddr, src_port := SrcPort, ssl := SSL} = ProxyInfo ->
             SourceName = {SrcAddr, SrcPort},
             %% Notice: CN is only available in Proxy Protocol V2 additional info.
             %% `CN` is unsupported in Proxy Protocol V1
@@ -389,18 +397,20 @@ get_peer_info(Type, Listener, Req, Opts) ->
                     undefined -> undefined;
                     CN -> [{pp2_ssl_cn, CN}]
                 end,
-            {SourceName, SourceSSL};
-        #{src_address := SrcAddr, src_port := SrcPort} ->
+            PeerSNI = maps:get(authority, ProxyInfo, Host),
+            {SourceName, SourceSSL, PeerSNI};
+        #{src_address := SrcAddr, src_port := SrcPort} = ProxyInfo ->
+            PeerSNI = maps:get(authority, ProxyInfo, Host),
             SourceName = {SrcAddr, SrcPort},
-            {SourceName, nossl};
+            {SourceName, nossl, PeerSNI};
         _ ->
-            {get_peer(Req, Opts), cowboy_req:cert(Req)}
+            {get_peer(Req, Opts), cowboy_req:cert(Req), Host}
     end.
 
 websocket_handle({binary, Data}, State) when is_list(Data) ->
     websocket_handle({binary, iolist_to_binary(Data)}, State);
 websocket_handle({binary, Data}, State) ->
-    ?SLOG(debug, #{
+    ?LOG(debug, #{
         msg => "raw_bin_received",
         size => iolist_size(Data),
         bin => binary_to_list(binary:encode_hex(Data)),
@@ -427,16 +437,15 @@ websocket_handle({Frame, _}, State) when Frame =:= ping; Frame =:= pong ->
     return(State);
 websocket_handle({Frame, _}, State) ->
     %% TODO: should not close the ws connection
-    ?SLOG(error, #{msg => "unexpected_frame", frame => Frame}),
+    ?LOG(error, #{msg => "unexpected_frame", frame => Frame}),
     shutdown(unexpected_ws_frame, State).
+
 websocket_info({call, From, Req}, State) ->
     handle_call(From, Req, State);
 websocket_info({cast, rate_limit}, State) ->
-    Stats = #{
-        cnt => emqx_pd:reset_counter(incoming_pubs),
-        oct => emqx_pd:reset_counter(incoming_bytes)
-    },
-    return(postpone({check_gc, Stats}, State));
+    Cnt = emqx_pd:reset_counter(incoming_pubs),
+    Oct = emqx_pd:reset_counter(incoming_bytes),
+    return(postpone({check_gc, Cnt, Oct}, State));
 websocket_info({cast, Msg}, State) ->
     handle_info(Msg, State);
 websocket_info({incoming, Packet = ?CONNECT_PACKET(ConnPkt)}, State) ->
@@ -448,8 +457,8 @@ websocket_info({incoming, Packet}, State) ->
     handle_incoming(Packet, State);
 websocket_info({outgoing, Packets}, State) ->
     return(enqueue(Packets, State));
-websocket_info({check_gc, Stats}, State) ->
-    return(check_oom(run_gc(Stats, State)));
+websocket_info({check_gc, Cnt, Oct}, State) ->
+    return(check_oom(run_gc(Cnt, Oct, State)));
 websocket_info(
     Deliver = {deliver, _Topic, _Msg},
     State = #state{listener = {Type, Listener}}
@@ -462,13 +471,13 @@ websocket_info(
     State
 ) ->
     return(retry_limiter(State));
-websocket_info(check_cache, #state{limiter_cache = Cache} = State) ->
-    case queue:peek(Cache) of
+websocket_info(check_limiter_buffer, #state{limiter_buffer = Buffer} = State) ->
+    case queue:peek(Buffer) of
         empty ->
             return(enqueue({active, true}, State#state{sockstate = running}));
         {value, #cache{need = Needs, data = Data, next = Next}} ->
-            State2 = State#state{limiter_cache = queue:drop(Cache)},
-            return(check_limiter(Needs, Data, Next, [check_cache], State2))
+            State2 = State#state{limiter_buffer = queue:drop(Buffer)},
+            return(check_limiter(Needs, Data, Next, [check_limiter_buffer], State2))
     end;
 websocket_info({timeout, TRef, Msg}, State) when is_reference(TRef) ->
     handle_timeout(TRef, Msg, State);
@@ -527,16 +536,21 @@ handle_info({close, Reason}, State) ->
 handle_info({event, connected}, State = #state{channel = Channel}) ->
     ClientId = emqx_channel:info(clientid, Channel),
     emqx_cm:insert_channel_info(ClientId, info(State), stats(State)),
-    return(State);
+    NState = resume_stats_timer(State),
+    return(NState);
 handle_info({event, disconnected}, State = #state{channel = Channel}) ->
     ClientId = emqx_channel:info(clientid, Channel),
     emqx_cm:set_chan_info(ClientId, info(State)),
-    emqx_cm:connection_closed(ClientId),
     return(State);
 handle_info({event, _Other}, State = #state{channel = Channel}) ->
-    ClientId = emqx_channel:info(clientid, Channel),
-    emqx_cm:set_chan_info(ClientId, info(State)),
-    emqx_cm:set_chan_stats(ClientId, stats(State)),
+    case emqx_channel:info(clientid, Channel) of
+        %% ClientId is yet unknown (i.e. connect packet is not received yet)
+        undefined ->
+            ok;
+        ClientId ->
+            emqx_cm:set_chan_info(ClientId, info(State)),
+            emqx_cm:set_chan_stats(ClientId, stats(State))
+    end,
     return(State);
 handle_info(Info, State) ->
     with_channel(handle_info, [Info], State).
@@ -548,8 +562,7 @@ handle_info(Info, State) ->
 handle_timeout(TRef, idle_timeout, State = #state{idle_timer = TRef}) ->
     shutdown(idle_timeout, State);
 handle_timeout(TRef, keepalive, State) when is_reference(TRef) ->
-    RecvOct = emqx_pd:get_counter(recv_oct),
-    handle_timeout(TRef, {keepalive, RecvOct}, State);
+    with_channel(handle_timeout, [TRef, keepalive], State);
 handle_timeout(
     TRef,
     emit_stats,
@@ -593,17 +606,23 @@ check_limiter(
     Data,
     WhenOk,
     Msgs,
-    #state{limiter_timer = undefined, limiter = Limiter} = State
+    #state{channel = Channel, limiter_timer = undefined, limiter = Limiter} = State
 ) ->
     case emqx_limiter_container:check_list(Needs, Limiter) of
         {ok, Limiter2} ->
             WhenOk(Data, Msgs, State#state{limiter = Limiter2});
         {pause, Time, Limiter2} ->
-            ?SLOG(debug, #{
-                msg => "pause_time_due_to_rate_limit",
-                needs => Needs,
-                time_in_ms => Time
-            }),
+            ?SLOG_THROTTLE(
+                warning,
+                #{
+                    msg => socket_receive_paused_by_rate_limit,
+                    paused_ms => Time
+                },
+                #{
+                    tag => "RATE",
+                    clientid => emqx_channel:info(clientid, Channel)
+                }
+            ),
 
             Retry = #retry{
                 types = [Type || {_, Type} <- Needs],
@@ -631,13 +650,13 @@ check_limiter(
     Data,
     WhenOk,
     _Msgs,
-    #state{limiter_cache = Cache} = State
+    #state{limiter_buffer = Buffer} = State
 ) ->
     New = #cache{need = Needs, data = Data, next = WhenOk},
-    State#state{limiter_cache = queue:in(New, Cache)}.
+    State#state{limiter_buffer = queue:in(New, Buffer)}.
 
 -spec retry_limiter(state()) -> state().
-retry_limiter(#state{limiter = Limiter} = State) ->
+retry_limiter(#state{channel = Channel, limiter = Limiter} = State) ->
     #retry{types = Types, data = Data, next = Next} = emqx_limiter_container:get_retry_context(
         Limiter
     ),
@@ -645,18 +664,24 @@ retry_limiter(#state{limiter = Limiter} = State) ->
         {ok, Limiter2} ->
             Next(
                 Data,
-                [check_cache],
+                [check_limiter_buffer],
                 State#state{
                     limiter = Limiter2,
                     limiter_timer = undefined
                 }
             );
         {pause, Time, Limiter2} ->
-            ?SLOG(debug, #{
-                msg => "pause_time_due_to_rate_limit",
-                types => Types,
-                time_in_ms => Time
-            }),
+            ?SLOG_THROTTLE(
+                warning,
+                #{
+                    msg => socket_receive_paused_by_rate_limit,
+                    paused_ms => Time
+                },
+                #{
+                    tag => "RATE",
+                    clientid => emqx_channel:info(clientid, Channel)
+                }
+            ),
 
             TRef = start_timer(Time, limit_timeout),
 
@@ -672,8 +697,8 @@ when_msg_in(Packets, Msgs, State) ->
 %% Run GC, Check OOM
 %%--------------------------------------------------------------------
 
-run_gc(Stats, State = #state{gc_state = GcSt}) ->
-    case ?ENABLED(GcSt) andalso emqx_gc:run(Stats, GcSt) of
+run_gc(Cnt, Oct, State = #state{gc_state = GcSt}) ->
+    case ?ENABLED(GcSt) andalso emqx_gc:run(Cnt, Oct, GcSt) of
         false -> State;
         {_IsGC, GcSt1} -> State#state{gc_state = GcSt1}
     end.
@@ -704,20 +729,23 @@ parse_incoming(Data, Packets, State = #state{parse_state = ParseState}) ->
     try emqx_frame:parse(Data, ParseState) of
         {more, NParseState} ->
             {Packets, State#state{parse_state = NParseState}};
-        {ok, Packet, Rest, NParseState} ->
+        {Packet, Rest, NParseState} ->
             NState = State#state{parse_state = NParseState},
             parse_incoming(Rest, [{incoming, Packet} | Packets], NState)
     catch
         throw:{?FRAME_PARSE_ERROR, Reason} ->
-            ?SLOG(info, #{
+            ?LOG(info, #{
+                msg => "frame_parse_error",
                 reason => Reason,
                 at_state => emqx_frame:describe_state(ParseState),
                 input_bytes => Data
             }),
             FrameError = {frame_error, Reason},
-            {[{incoming, FrameError} | Packets], State};
+            NState = enrich_state(Reason, State),
+            {[{incoming, FrameError} | Packets], NState};
         error:Reason:Stacktrace ->
-            ?SLOG(error, #{
+            ?LOG(error, #{
+                msg => "frame_parse_failed",
                 at_state => emqx_frame:describe_state(ParseState),
                 input_bytes => Data,
                 exception => Reason,
@@ -786,11 +814,9 @@ handle_outgoing(
                 get_active_n(Type, Listener)
         of
             true ->
-                Stats = #{
-                    cnt => emqx_pd:reset_counter(outgoing_pubs),
-                    oct => emqx_pd:reset_counter(outgoing_bytes)
-                },
-                postpone({check_gc, Stats}, State);
+                CntPubs = emqx_pd:reset_counter(outgoing_pubs),
+                CntBytes = emqx_pd:reset_counter(outgoing_bytes),
+                postpone({check_gc, CntPubs, CntBytes}, State);
             false ->
                 State
         end,
@@ -807,10 +833,10 @@ serialize_and_inc_stats_fun(#state{serialize = Serialize}) ->
     fun(Packet) ->
         try emqx_frame:serialize_pkt(Packet, Serialize) of
             <<>> ->
-                ?SLOG(warning, #{
+                ?LOG(warning, #{
                     msg => "packet_discarded",
                     reason => "frame_too_large",
-                    packet => emqx_packet:format(Packet)
+                    packet => Packet
                 }),
                 ok = emqx_metrics:inc('delivery.dropped.too_large'),
                 ok = emqx_metrics:inc('delivery.dropped'),
@@ -823,13 +849,13 @@ serialize_and_inc_stats_fun(#state{serialize = Serialize}) ->
         catch
             %% Maybe Never happen.
             throw:{?FRAME_SERIALIZE_ERROR, Reason} ->
-                ?SLOG(info, #{
+                ?LOG(info, #{
                     reason => Reason,
                     input_packet => Packet
                 }),
                 erlang:error({?FRAME_SERIALIZE_ERROR, Reason});
             error:Reason:Stacktrace ->
-                ?SLOG(error, #{
+                ?LOG(error, #{
                     input_packet => Packet,
                     exception => Reason,
                     stacktrace => Stacktrace
@@ -929,12 +955,19 @@ cancel_idle_timer(State = #state{idle_timer = IdleTimer}) ->
 
 ensure_stats_timer(
     State = #state{
-        idle_timeout = Timeout,
+        zone = Zone,
         stats_timer = undefined
     }
 ) ->
+    Timeout = emqx_channel:get_mqtt_conf(Zone, idle_timeout),
     State#state{stats_timer = start_timer(Timeout, emit_stats)};
 ensure_stats_timer(State) ->
+    %% Either already active, disabled or paused.
+    State.
+
+resume_stats_timer(State = #state{stats_timer = paused}) ->
+    State#state{stats_timer = undefined};
+resume_stats_timer(State = #state{stats_timer = disabled}) ->
     State.
 
 -compile({inline, [postpone/2, enqueue/2, return/1, shutdown/2]}).
@@ -942,8 +975,6 @@ ensure_stats_timer(State) ->
 %%--------------------------------------------------------------------
 %% Postpone the packet, cmd or event
 
-postpone(Packet, State) when is_record(Packet, mqtt_packet) ->
-    enqueue(Packet, State);
 postpone(Event, State) when is_tuple(Event) ->
     enqueue(Event, State);
 postpone(More, State) when is_list(More) ->
@@ -979,9 +1010,19 @@ return(State = #state{postponed = Postponed}) ->
 
 classify([], Packets, Cmds, Events) ->
     {Packets, Cmds, Events};
-classify([Packet | More], Packets, Cmds, Events) when
-    is_record(Packet, mqtt_packet)
-->
+classify([{outgoing, Outgoing} | More], Packets, Cmds, Events) ->
+    case is_list(Outgoing) of
+        true ->
+            %% Outgoing is a list in least-to-most recent order (i.e. not reversed).
+            %% Prepending will keep the overall order correct.
+            NPackets = Outgoing ++ Packets;
+        false ->
+            NPackets = [Outgoing | Packets]
+    end,
+    classify(More, NPackets, Cmds, Events);
+classify([{connack, Packet} | More], Packets, Cmds, Events) ->
+    classify(More, [Packet | Packets], Cmds, Events);
+classify([Packet = #mqtt_packet{} | More], Packets, Cmds, Events) ->
     classify(More, [Packet | Packets], Cmds, Events);
 classify([Cmd = {active, _} | More], Packets, Cmds, Events) ->
     classify(More, Packets, [Cmd | Cmds], Events);
@@ -989,6 +1030,10 @@ classify([Cmd = {shutdown, _Reason} | More], Packets, Cmds, Events) ->
     classify(More, Packets, [Cmd | Cmds], Events);
 classify([Cmd = close | More], Packets, Cmds, Events) ->
     classify(More, Packets, [Cmd | Cmds], Events);
+%% cowboy_websocket's close reason must be an atom to avoid crashing the sender process.
+%% The cause reasons come from parse_frame_error.
+classify([{close, #{cause := Cause}} | More], Packets, Cmds, Events) when is_atom(Cause) ->
+    classify(More, Packets, [{close, Cause} | Cmds], Events);
 classify([Cmd = {close, _Reason} | More], Packets, Cmds, Events) ->
     classify(More, Packets, [Cmd | Cmds], Events);
 classify([Event | More], Packets, Cmds, Events) ->
@@ -1034,7 +1079,7 @@ check_max_connection(Type, Listener) ->
         infinity ->
             allow;
         Max ->
-            MatchSpec = [{{'_', emqx_ws_connection}, [], [true]}],
+            MatchSpec = [{#chan_conn{mod = emqx_ws_connection, _ = '_'}, [], [true]}],
             Curr = ets:select_count(?CHAN_CONN_TAB, MatchSpec),
             case Curr >= Max of
                 false ->
@@ -1049,6 +1094,13 @@ check_max_connection(Type, Listener) ->
                     {denny, Reason}
             end
     end.
+
+enrich_state(#{proto_ver := ProtoVer, parse_state := NParseState}, State) ->
+    Serialize = emqx_frame:serialize_opts(ProtoVer, ?MAX_PACKET_SIZE),
+    State#state{parse_state = NParseState, serialize = Serialize};
+enrich_state(_, State) ->
+    State.
+
 %%--------------------------------------------------------------------
 %% For CT tests
 %%--------------------------------------------------------------------

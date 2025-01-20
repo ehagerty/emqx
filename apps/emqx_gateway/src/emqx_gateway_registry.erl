@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 %% @doc The Registry Centre of Gateway
 -module(emqx_gateway_registry).
 
--include("include/emqx_gateway.hrl").
+-include("emqx_gateway.hrl").
 
 -behaviour(gen_server).
 
@@ -41,6 +41,8 @@
     terminate/2,
     code_change/3
 ]).
+
+-export_type([descriptor/0]).
 
 -record(state, {
     reged = #{} :: #{gateway_name() => descriptor()}

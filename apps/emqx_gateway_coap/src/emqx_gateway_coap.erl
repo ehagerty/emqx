@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx_gateway/include/emqx_gateway.hrl").
 
-%% define a gateway named stomp
+%% define a gateway named coap
 -gateway(#{
     name => coap,
     callback_module => ?MODULE,
@@ -58,10 +58,11 @@ on_gateway_load(
     Ctx
 ) ->
     Listeners = normalize_config(Config),
-    ModCfg = #{
+    ModCfg = maps:merge(connection_opts(Config), #{
         frame_mod => emqx_coap_frame,
         chann_mod => emqx_coap_channel
-    },
+    }),
+
     case
         start_listeners(
             Listeners, GwName, Ctx, ModCfg
@@ -105,3 +106,13 @@ on_gateway_unload(
 ) ->
     Listeners = normalize_config(Config),
     stop_listeners(GwName, Listeners).
+
+connection_opts(#{connection_required := false}) ->
+    #{};
+connection_opts(_) ->
+    #{
+        connection_mod => esockd_udp_proxy,
+        esockd_proxy_opts => #{
+            connection_mod => emqx_coap_proxy_conn
+        }
+    }.

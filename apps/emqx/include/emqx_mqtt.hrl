@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,18 +18,6 @@
 -define(EMQX_MQTT_HRL, true).
 
 -define(UINT_MAX, 16#FFFFFFFF).
-
-%%--------------------------------------------------------------------
-%% MQTT SockOpts
-%%--------------------------------------------------------------------
-
--define(MQTT_SOCKOPTS, [
-    binary,
-    {packet, raw},
-    {reuseaddr, true},
-    {backlog, 512},
-    {nodelay, true}
-]).
 
 %%--------------------------------------------------------------------
 %% MQTT Protocol Version and Names
@@ -54,6 +42,17 @@
 
 %% MQTT-3.1.1 and MQTT-5.0 [MQTT-4.7.3-3]
 -define(MAX_TOPIC_LEN, 65535).
+
+%%--------------------------------------------------------------------
+%% MQTT Share-Sub Internal
+%%--------------------------------------------------------------------
+
+-record(share, {group :: emqx_types:group(), topic :: emqx_types:topic()}).
+
+%% guards
+-define(IS_TOPIC(T),
+    (is_binary(T) orelse is_record(T, share))
+).
 
 %%--------------------------------------------------------------------
 %% MQTT QoS Levels
@@ -311,6 +310,15 @@ end).
 }).
 
 %%--------------------------------------------------------------------
+%% MQTT Implementation Internal
+%%--------------------------------------------------------------------
+
+%% Propagate extra data in MQTT Packets
+%% Use it in properties and should never be serialized
+%% See also emqx_frame:serialize_property/3
+-define(MQTT_INTERNAL_EXTRA, 'internal_extra').
+
+%%--------------------------------------------------------------------
 %% MQTT Control Packet
 %%--------------------------------------------------------------------
 
@@ -320,6 +328,9 @@ end).
         #mqtt_packet_connect{}
         | #mqtt_packet_connack{}
         | #mqtt_packet_publish{}
+        %% QoS=1: PUBACK,
+        %% QoS=2: PUBREC, PUBREL, PUBCOMP
+        %% all used #mqtt_packet_puback{}
         | #mqtt_packet_puback{}
         | #mqtt_packet_subscribe{}
         | #mqtt_packet_suback{}
@@ -349,6 +360,21 @@ end).
 %%--------------------------------------------------------------------
 %% MQTT Packet Match
 %%--------------------------------------------------------------------
+
+-define(PACKET(Type), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type}
+}).
+
+-define(PACKET(Type, Var), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type},
+    variable = Var
+}).
+
+-define(PACKET(Type, Var, Payload), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type},
+    variable = Var,
+    payload = Payload
+}).
 
 -define(CONNECT_PACKET(), #mqtt_packet{header = #mqtt_packet_header{type = ?CONNECT}}).
 
@@ -658,16 +684,10 @@ end).
     }
 }).
 
--define(PACKET(Type), #mqtt_packet{header = #mqtt_packet_header{type = Type}}).
-
 -define(SHARE, "$share").
--define(SHARE(Group, Topic), emqx_topic:join([<<?SHARE>>, Group, Topic])).
--define(IS_SHARE(Topic),
-    case Topic of
-        <<?SHARE, _/binary>> -> true;
-        _ -> false
-    end
-).
+-define(QUEUE, "$queue").
+
+-define(REDISPATCH_TO(GROUP, TOPIC), {GROUP, TOPIC}).
 
 -define(SHARE_EMPTY_FILTER, share_subscription_topic_cannot_be_empty).
 -define(SHARE_EMPTY_GROUP, share_subscription_group_name_cannot_be_empty).
@@ -676,7 +696,12 @@ end).
 
 -define(FRAME_PARSE_ERROR, frame_parse_error).
 -define(FRAME_SERIALIZE_ERROR, frame_serialize_error).
+
 -define(THROW_FRAME_ERROR(Reason), erlang:throw({?FRAME_PARSE_ERROR, Reason})).
 -define(THROW_SERIALIZE_ERROR(Reason), erlang:throw({?FRAME_SERIALIZE_ERROR, Reason})).
+
+-define(MAX_PAYLOAD_FORMAT_SIZE, 1024).
+-define(TRUNCATED_PAYLOAD_SIZE, 100).
+-define(MAX_PAYLOAD_FORMAT_LIMIT(Bin), (byte_size(Bin) =< ?MAX_PAYLOAD_FORMAT_SIZE)).
 
 -endif.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 %% HTTP API Auth
 -define(BAD_USERNAME_OR_PWD, 'BAD_USERNAME_OR_PWD').
 -define(BAD_API_KEY_OR_SECRET, 'BAD_API_KEY_OR_SECRET').
+-define(API_KEY_NOT_ALLOW, 'API_KEY_NOT_ALLOW').
+-define(API_KEY_NOT_ALLOW_MSG, <<"This API Key don't have permission to access this resource">>).
 
 %% Bad Request
 -define(BAD_REQUEST, 'BAD_REQUEST').
@@ -84,5 +86,6 @@
     {'SOURCE_ERROR', <<"Source error">>},
     {'UPDATE_FAILED', <<"Update failed">>},
     {'REST_FAILED', <<"Reset source or config failed">>},
-    {'CLIENT_NOT_RESPONSE', <<"Client not responding">>}
+    {'CLIENT_NOT_RESPONSE', <<"Client not responding">>},
+    {'UNSUPPORTED_MEDIA_TYPE', <<"Unsupported media type">>}
 ]).

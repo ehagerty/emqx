@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,8 +18,6 @@
 
 -compile(export_all).
 -compile(nowarn_export_all).
-
--define(APP, emqx).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -47,23 +45,23 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    load_conf(),
-    emqx_common_test_helpers:start_apps([?APP]),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    ok = load_conf(),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([?APP]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(_TestCase, Config) ->
-    emqx_config:erase(limiter),
-    load_conf(),
+    ok = emqx_config:erase(limiter),
+    ok = load_conf(),
     Config.
 
 end_per_testcase(_TestCase, Config) ->
     Config.
 
 load_conf() ->
-    ok = emqx_common_test_helpers:load_config(emqx_limiter_schema, ?BASE_CONF).
+    emqx_common_test_helpers:load_config(emqx_limiter_schema, ?BASE_CONF).
 
 init_config() ->
     emqx_config:init_load(emqx_limiter_schema, ?BASE_CONF).
@@ -433,7 +431,6 @@ t_limiter_manager(_) ->
     ignore = gen_server:call(emqx_limiter_manager, unexpected_call),
     ok = gen_server:cast(emqx_limiter_manager, unexpected_cast),
     erlang:send(erlang:whereis(emqx_limiter_manager), unexpected_info),
-    ok = emqx_limiter_manager:format_status(normal, ok),
     ok.
 
 t_limiter_app(_) ->
@@ -463,7 +460,6 @@ t_limiter_server(_) ->
     ignored = gen_server:call(Name, unexpected_call),
     ok = gen_server:cast(Name, unexpected_cast),
     erlang:send(erlang:whereis(Name), unexpected_info),
-    ok = emqx_limiter_server:format_status(normal, ok),
     ok.
 
 t_decimal(_) ->
@@ -589,11 +585,11 @@ t_extract_with_type(_) ->
         (Type, Cfg) ->
             IsOnly(Type, Cfg)
     end,
-    ?assertEqual(undefined, emqx_limiter_schema:extract_with_type(messages, undefined)),
+    ?assertEqual(undefined, emqx_limiter_utils:extract_with_type(messages, undefined)),
     ?assert(
         Checker(
             messages,
-            emqx_limiter_schema:extract_with_type(messages, #{
+            emqx_limiter_utils:extract_with_type(messages, #{
                 messages => #{rate => 1}, bytes => #{rate => 1}
             })
         )
@@ -601,7 +597,7 @@ t_extract_with_type(_) ->
     ?assert(
         Checker(
             messages,
-            emqx_limiter_schema:extract_with_type(messages, #{
+            emqx_limiter_utils:extract_with_type(messages, #{
                 messages => #{rate => 1},
                 bytes => #{rate => 1},
                 client => #{messages => #{rate => 2}}
@@ -611,7 +607,7 @@ t_extract_with_type(_) ->
     ?assert(
         Checker(
             messages,
-            emqx_limiter_schema:extract_with_type(messages, #{
+            emqx_limiter_utils:extract_with_type(messages, #{
                 client => #{messages => #{rate => 2}, bytes => #{rate => 1}}
             })
         )
@@ -622,7 +618,7 @@ t_add_bucket(_) ->
         #{buckets := Buckets} = sys:get_state(emqx_limiter_server:whereis(bytes)),
         ?assertEqual(Size, maps:size(Buckets), Buckets)
     end,
-    DefBucket = emqx_limiter_schema:default_bucket_config(),
+    DefBucket = emqx_limiter_utils:default_bucket_config(),
     ?assertEqual(ok, emqx_limiter_server:add_bucket(?FUNCTION_NAME, bytes, undefined)),
     Checker(0),
     ?assertEqual(ok, emqx_limiter_server:add_bucket(?FUNCTION_NAME, bytes, DefBucket)),
@@ -765,7 +761,7 @@ t_esockd_htb_consume(_) ->
 t_node_short_paths(_) ->
     CfgStr = <<"limiter {max_conn_rate = \"1000\", messages_rate = \"100\", bytes_rate = \"10\"}">>,
     ok = emqx_common_test_helpers:load_config(emqx_limiter_schema, CfgStr),
-    Accessor = fun emqx_limiter_schema:get_node_opts/1,
+    Accessor = fun emqx_limiter_utils:get_node_opts/1,
     ?assertMatch(#{rate := 100.0}, Accessor(connection)),
     ?assertMatch(#{rate := 10.0}, Accessor(messages)),
     ?assertMatch(#{rate := 1.0}, Accessor(bytes)),
@@ -776,7 +772,7 @@ t_compatibility_for_node_short_paths(_) ->
     CfgStr =
         <<"limiter {max_conn_rate = \"1000\", connection.rate = \"500\", bytes.rate = \"200\"}">>,
     ok = emqx_common_test_helpers:load_config(emqx_limiter_schema, CfgStr),
-    Accessor = fun emqx_limiter_schema:get_node_opts/1,
+    Accessor = fun emqx_limiter_utils:get_node_opts/1,
     ?assertMatch(#{rate := 100.0}, Accessor(connection)),
     ?assertMatch(#{rate := 20.0}, Accessor(bytes)).
 
@@ -796,7 +792,7 @@ t_listener_short_paths(_) ->
             },
             connection := #{rate := 100.0}
         },
-        emqx_limiter_schema:get_listener_opts(ListenerOpt)
+        emqx_limiter_utils:get_listener_opts(ListenerOpt)
     ).
 
 t_compatibility_for_listener_short_paths(_) ->
@@ -809,16 +805,16 @@ t_compatibility_for_listener_short_paths(_) ->
         #{
             connection := #{rate := 100.0}
         },
-        emqx_limiter_schema:get_listener_opts(ListenerOpt)
+        emqx_limiter_utils:get_listener_opts(ListenerOpt)
     ).
 
 t_no_limiter_for_listener(_) ->
     CfgStr = <<>>,
     ok = emqx_common_test_helpers:load_config(emqx_schema, CfgStr),
     ListenerOpt = emqx:get_config([listeners, tcp, default]),
-    ?assertEqual(
-        undefined,
-        emqx_limiter_schema:get_listener_opts(ListenerOpt)
+    ?assertMatch(
+        #{connection := #{rate := infinity}},
+        emqx_limiter_utils:get_listener_opts(ListenerOpt)
     ).
 
 %%--------------------------------------------------------------------
@@ -1135,5 +1131,5 @@ parse_schema(ConfigString) ->
     ).
 
 default_client_config() ->
-    Conf = emqx_limiter_schema:default_client_config(),
+    Conf = emqx_limiter_utils:default_client_config(),
     Conf#{divisible := false, max_retry_time := timer:seconds(10)}.

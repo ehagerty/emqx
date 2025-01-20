@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_enterprise).
 
@@ -13,7 +13,8 @@
     examples/1,
     resource_type/1,
     bridge_impl_module/1,
-    fields/1
+    fields/1,
+    namespace/0
 ]).
 
 api_schemas(Method) ->
@@ -23,8 +24,6 @@ api_schemas(Method) ->
         api_ref(emqx_bridge_gcp_pubsub, <<"gcp_pubsub">>, Method ++ "_producer"),
         api_ref(emqx_bridge_gcp_pubsub, <<"gcp_pubsub_consumer">>, Method ++ "_consumer"),
         api_ref(emqx_bridge_kafka, <<"kafka_consumer">>, Method ++ "_consumer"),
-        %% TODO: rename this to `kafka_producer' after alias support is added
-        %% to hocon; keeping this as just `kafka' for backwards compatibility.
         api_ref(emqx_bridge_kafka, <<"kafka">>, Method ++ "_producer"),
         api_ref(emqx_bridge_cassandra, <<"cassandra">>, Method),
         api_ref(emqx_bridge_mysql, <<"mysql">>, Method),
@@ -32,8 +31,7 @@ api_schemas(Method) ->
         api_ref(emqx_bridge_mongodb, <<"mongodb_rs">>, Method ++ "_rs"),
         api_ref(emqx_bridge_mongodb, <<"mongodb_sharded">>, Method ++ "_sharded"),
         api_ref(emqx_bridge_mongodb, <<"mongodb_single">>, Method ++ "_single"),
-        %% TODO: un-hide for e5.2.0...
-        %%api_ref(emqx_bridge_hstreamdb, <<"hstreamdb">>, Method),
+        api_ref(emqx_bridge_hstreamdb, <<"hstreamdb">>, Method),
         api_ref(emqx_bridge_influxdb, <<"influxdb_api_v1">>, Method ++ "_api_v1"),
         api_ref(emqx_bridge_influxdb, <<"influxdb_api_v2">>, Method ++ "_api_v2"),
         api_ref(emqx_bridge_redis, <<"redis_single">>, Method ++ "_single"),
@@ -85,6 +83,9 @@ schema_modules() ->
     ].
 
 examples(Method) ->
+    registered_examples(Method).
+
+registered_examples(Method) ->
     MergeFun =
         fun(Example, Examples) ->
             maps:merge(Examples, Example)
@@ -96,11 +97,10 @@ examples(Method) ->
         end,
     lists:foldl(Fun, #{}, schema_modules()).
 
+%% TODO: existing atom
 resource_type(Type) when is_binary(Type) -> resource_type(binary_to_atom(Type, utf8));
 resource_type(kafka_consumer) -> emqx_bridge_kafka_impl_consumer;
-%% TODO: rename this to `kafka_producer' after alias support is added
-%% to hocon; keeping this as just `kafka' for backwards compatibility.
-resource_type(kafka) -> emqx_bridge_kafka_impl_producer;
+resource_type(kafka_producer) -> emqx_bridge_kafka_impl_producer;
 resource_type(cassandra) -> emqx_bridge_cassandra_connector;
 resource_type(hstreamdb) -> emqx_bridge_hstreamdb_connector;
 resource_type(gcp_pubsub) -> emqx_bridge_gcp_pubsub_impl_producer;
@@ -114,18 +114,18 @@ resource_type(influxdb_api_v2) -> emqx_bridge_influxdb_connector;
 resource_type(redis_single) -> emqx_bridge_redis_connector;
 resource_type(redis_sentinel) -> emqx_bridge_redis_connector;
 resource_type(redis_cluster) -> emqx_bridge_redis_connector;
-resource_type(pgsql) -> emqx_connector_pgsql;
-resource_type(timescale) -> emqx_connector_pgsql;
-resource_type(matrix) -> emqx_connector_pgsql;
+resource_type(pgsql) -> emqx_postgresql;
+resource_type(timescale) -> emqx_postgresql;
+resource_type(matrix) -> emqx_postgresql;
 resource_type(tdengine) -> emqx_bridge_tdengine_connector;
 resource_type(clickhouse) -> emqx_bridge_clickhouse_connector;
 resource_type(dynamo) -> emqx_bridge_dynamo_connector;
 resource_type(rocketmq) -> emqx_bridge_rocketmq_connector;
 resource_type(sqlserver) -> emqx_bridge_sqlserver_connector;
 resource_type(opents) -> emqx_bridge_opents_connector;
-resource_type(pulsar_producer) -> emqx_bridge_pulsar_impl_producer;
+resource_type(pulsar_producer) -> emqx_bridge_pulsar_connector;
 resource_type(oracle) -> emqx_oracle;
-resource_type(iotdb) -> emqx_bridge_iotdb_impl;
+resource_type(iotdb) -> emqx_bridge_iotdb_connector;
 resource_type(rabbitmq) -> emqx_bridge_rabbitmq_connector;
 resource_type(kinesis_producer) -> emqx_bridge_kinesis_impl_producer;
 resource_type(greptimedb) -> emqx_bridge_greptimedb_connector;
@@ -140,6 +140,8 @@ bridge_impl_module(azure_event_hub_producer) ->
 bridge_impl_module(_BridgeType) ->
     undefined.
 
+namespace() -> undefined.
+
 fields(bridges) ->
     [
         {hstreamdb,
@@ -147,8 +149,7 @@ fields(bridges) ->
                 hoconsc:map(name, ref(emqx_bridge_hstreamdb, "config")),
                 #{
                     desc => <<"HStreamDB Bridge Config">>,
-                    required => false,
-                    importance => ?IMPORTANCE_HIDDEN
+                    required => false
                 }
             )},
         {mysql,
@@ -237,9 +238,6 @@ mongodb_structs() ->
 
 kafka_structs() ->
     [
-        %% TODO: rename this to `kafka_producer' after alias support
-        %% is added to hocon; keeping this as just `kafka' for
-        %% backwards compatibility.
         {kafka,
             mk(
                 hoconsc:map(name, ref(emqx_bridge_kafka, kafka_producer)),

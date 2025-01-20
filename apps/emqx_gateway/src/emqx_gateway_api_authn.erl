@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -327,7 +327,7 @@ params_gateway_name_in_path() ->
     [
         {name,
             mk(
-                binary(),
+                hoconsc:enum(emqx_gateway_schema:gateway_names()),
                 #{
                     in => path,
                     desc => ?DESC(emqx_gateway_api, gateway_name_in_qs),
@@ -381,6 +381,9 @@ params_fuzzy_in_qs() ->
 
 schema_authn() ->
     emqx_dashboard_swagger:schema_with_examples(
-        emqx_authn_schema:authenticator_type_without_scram(),
+        emqx_authn_schema:authenticator_type_without([
+            emqx_authn_scram_mnesia_schema,
+            emqx_authn_scram_restapi_schema
+        ]),
         emqx_authn_api:authenticator_examples()
     ).

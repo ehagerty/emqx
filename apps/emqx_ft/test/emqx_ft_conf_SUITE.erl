@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,18 +32,17 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(Case, Config) ->
-    WorkDir = filename:join(?config(priv_dir, Config), Case),
     Apps = emqx_cth_suite:start(
         [
             {emqx_conf, #{}},
             {emqx_ft, #{config => "file_transfer {}"}}
         ],
-        #{work_dir => WorkDir}
+        #{work_dir => emqx_cth_suite:work_dir(Case, Config)}
     ),
-    [{suite_apps, Apps} | Config].
+    [{apps, Apps} | Config].
 
 end_per_testcase(_Case, Config) ->
-    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok = emqx_cth_suite:stop(?config(apps, Config)),
     ok.
 
 %%--------------------------------------------------------------------
@@ -230,6 +229,10 @@ t_switch_exporter(_Config) ->
     ok = emqx_ft_test_helpers:upload_file(gen_clientid(), <<"f1">>, "f1", <<?MODULE_STRING>>).
 
 t_persist_ssl_certfiles(Config) ->
+    #{
+        cert := Cert,
+        key := Key
+    } = emqx_ft_test_helpers:generate_pki_files(Config),
     ?assertMatch(
         {ok, _},
         emqx_ft_conf:update(mk_storage(true))
@@ -239,7 +242,7 @@ t_persist_ssl_certfiles(Config) ->
         list_ssl_certfiles(Config)
     ),
     ?assertMatch(
-        {error, {pre_config_update, _, {bad_ssl_config, #{}}}},
+        {error, {pre_config_update, _, #{reason := <<"bad_ssl_config">>}}},
         emqx_ft_conf:update(
             mk_storage(true, #{
                 <<"s3">> => mk_s3_config(#{
@@ -260,8 +263,8 @@ t_persist_ssl_certfiles(Config) ->
                 <<"s3">> => mk_s3_config(#{
                     <<"transport_options">> => #{
                         <<"ssl">> => #{
-                            <<"certfile">> => emqx_ft_test_helpers:pem_privkey(),
-                            <<"keyfile">> => emqx_ft_test_helpers:pem_privkey()
+                            <<"certfile">> => Cert,
+                            <<"keyfile">> => Key
                         }
                     }
                 })
@@ -294,15 +297,19 @@ t_persist_ssl_certfiles(Config) ->
         emqx_ft_conf:update(mk_storage(true))
     ).
 
-t_import(_Config) ->
+t_import(Config) ->
+    #{
+        cert := Cert,
+        key := Key
+    } = emqx_ft_test_helpers:generate_pki_files(Config),
     {ok, _} =
         emqx_ft_conf:update(
             mk_storage(true, #{
                 <<"s3">> => mk_s3_config(#{
                     <<"transport_options">> => #{
                         <<"ssl">> => #{
-                            <<"certfile">> => emqx_ft_test_helpers:pem_privkey(),
-                            <<"keyfile">> => emqx_ft_test_helpers:pem_privkey()
+                            <<"certfile">> => Cert,
+                            <<"keyfile">> => Key
                         }
                     }
                 })
@@ -350,7 +357,7 @@ mk_s3_config(S3Config) ->
     maps:merge(BaseS3Config, S3Config).
 
 gen_clientid() ->
-    emqx_base62:encode(emqx_guid:gen()).
+    emqx_utils:rand_id(16).
 
 list_ssl_certfiles(_Config) ->
     CertDir = emqx:mutable_certs_dir(),

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -42,6 +42,10 @@
     warning/2,
     usage/1,
     usage/2
+]).
+
+-export([
+    eval_erl/1
 ]).
 
 %% Exports mainly for test cases
@@ -116,31 +120,52 @@ run_command([Cmd | Args]) ->
 run_command(help, []) ->
     help();
 run_command(Cmd, Args) when is_atom(Cmd) ->
-    case lookup_command(Cmd) of
-        [{Mod, Fun}] ->
-            try
-                _ = apply(Mod, Fun, [Args]),
-                ok
-            catch
-                _:Reason:Stacktrace ->
-                    ?LOG_ERROR(#{
-                        msg => "ctl_command_crashed",
-                        stacktrace => Stacktrace,
-                        reason => Reason
-                    }),
-                    {error, Reason}
-            end;
-        Error ->
-            help(),
-            Error
-    end.
+    Start = erlang:monotonic_time(),
+    Result =
+        case lookup_command(Cmd) of
+            {ok, {Mod, Fun}} ->
+                try
+                    apply(Mod, Fun, [Args])
+                catch
+                    _:Reason:Stacktrace ->
+                        ?LOG_ERROR(#{
+                            msg => "ctl_command_crashed",
+                            stacktrace => Stacktrace,
+                            reason => Reason,
+                            module => Mod,
+                            function => Fun
+                        }),
+                        {error, Reason}
+                end;
+            {error, Reason} ->
+                help(),
+                {error, Reason}
+        end,
+    Duration = erlang:convert_time_unit(erlang:monotonic_time() - Start, native, millisecond),
 
--spec lookup_command(cmd()) -> [{module(), atom()}].
+    audit_log(
+        audit_level(Result, Duration),
+        cli,
+        #{duration_ms => Duration, cmd => Cmd, args => Args, node => node()}
+    ),
+    Result.
+
+-spec lookup_command(cmd()) -> {module(), atom()} | {error, any()}.
+lookup_command(eval_erl) ->
+    %% So far 'emqx ctl eval_erl Expr' is a undocumented hidden command.
+    %% For backward compatibility,
+    %% the documented command 'emqx eval Expr' has the expression parsed
+    %% in the remsh node (nodetool).
+    %%
+    %% 'eval_erl' is added for two purposes
+    %% 1. 'emqx eval Expr' can be audited
+    %% 2. 'emqx ctl eval_erl Expr' simplifies the scripting part
+    {ok, {?MODULE, eval_erl}};
 lookup_command(Cmd) when is_atom(Cmd) ->
     case is_initialized() of
         true ->
             case ets:match(?CMD_TAB, {{'_', Cmd}, '$1', '_'}) of
-                [El] -> El;
+                [[{M, F}]] -> {ok, {M, F}};
                 [] -> {error, cmd_not_found}
             end;
         false ->
@@ -251,7 +276,7 @@ handle_call({register_command, Cmd, MF, Opts}, _From, State = #state{seq = Seq})
             ets:insert(?CMD_TAB, {{Seq, Cmd}, MF, Opts}),
             {reply, ok, next_seq(State)};
         [[OriginSeq] | _] ->
-            ?LOG_WARNING(#{msg => "CMD_overridden", cmd => Cmd, mf => MF}),
+            ?LOG_INFO(#{msg => "CMD_overridden", cmd => Cmd, mf => MF}),
             true = ets:insert(?CMD_TAB, {{OriginSeq, Cmd}, MF, Opts}),
             {reply, ok, State}
     end;
@@ -305,3 +330,78 @@ safe_to_existing_atom(Str) ->
 
 is_initialized() ->
     ets:info(?CMD_TAB) =/= undefined.
+
+audit_log(Level, From, Log) ->
+    case lookup_command(audit) of
+        {error, _} ->
+            ignore;
+        {ok, {Mod, Fun}} ->
+            case prune_unnecessary_log(Log) of
+                false -> ok;
+                {ok, Log1} -> apply_audit_command(Log1, Mod, Fun, Level, From)
+            end
+    end.
+
+apply_audit_command(Log, Mod, Fun, Level, From) ->
+    try
+        apply(Mod, Fun, [Level, From, Log])
+    catch
+        _:{aborted, {no_exists, emqx_audit}} ->
+            case Log of
+                #{cmd := cluster, args := [<<"leave">>]} ->
+                    ok;
+                _ ->
+                    ?LOG_ERROR(#{
+                        msg => "ctl_command_crashed",
+                        reason => "emqx_audit table not found",
+                        log => Log,
+                        from => From
+                    })
+            end;
+        _:Reason:Stacktrace ->
+            ?LOG_ERROR(#{
+                msg => "ctl_command_crashed",
+                stacktrace => Stacktrace,
+                reason => Reason,
+                log => Log,
+                from => From
+            })
+    end.
+
+prune_unnecessary_log(Log) ->
+    case normalize_audit_log_args(Log) of
+        #{args := [<<"emqx:is_running()">>]} -> false;
+        Log1 -> {ok, Log1}
+    end.
+
+audit_level(ok, _Duration) -> info;
+audit_level({ok, _}, _Duration) -> info;
+audit_level(_, _) -> error.
+
+normalize_audit_log_args(Log = #{args := [Parsed | _] = Exprs, cmd := eval_erl}) when
+    is_tuple(Parsed)
+->
+    String = erl_pp:exprs(Exprs, [{linewidth, 10000}]),
+    Log#{args => [unicode:characters_to_binary(String)]};
+normalize_audit_log_args(Log = #{args := Args}) ->
+    Log#{args => [unicode:characters_to_binary(A) || A <- Args]}.
+
+eval_erl([Parsed | _] = Expr) when is_tuple(Parsed) ->
+    eval_expr(Expr);
+eval_erl([String]) ->
+    % convenience to users, if they forgot a trailing
+    % '.' add it for them.
+    Normalized =
+        case lists:reverse(String) of
+            [$. | _] -> String;
+            R -> lists:reverse([$. | R])
+        end,
+    % then scan and parse the string
+    {ok, Scanned, _} = erl_scan:string(Normalized),
+    {ok, Parsed} = erl_parse:parse_exprs(Scanned),
+    {ok, Value} = eval_expr(Parsed),
+    print("~p~n", [Value]).
+
+eval_expr(Parsed) ->
+    {value, Value, _} = erl_eval:exprs(Parsed, []),
+    {ok, Value}.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -38,7 +38,8 @@ namespace() -> rule_engine.
 tags() ->
     [<<"Rule Engine">>].
 
-roots() -> [{"rule_engine", ?HOCON(?R_REF("rule_engine"), #{importance => ?IMPORTANCE_HIDDEN})}].
+roots() ->
+    [{"rule_engine", ?HOCON(?R_REF("rule_engine"), #{importance => ?IMPORTANCE_HIDDEN})}].
 
 fields("rule_engine") ->
     rule_engine_settings() ++
@@ -63,7 +64,7 @@ fields("rules") ->
             )},
         {"actions",
             ?HOCON(
-                ?ARRAY(?UNION(actions())),
+                ?ARRAY(hoconsc:union(actions())),
                 #{
                     desc => ?DESC("rules_actions"),
                     default => [],
@@ -98,10 +99,26 @@ fields("builtin_action_republish") ->
     ];
 fields("builtin_action_console") ->
     [
-        {function, ?HOCON(console, #{desc => ?DESC("console_function")})}
+        {function, ?HOCON(console, #{desc => ?DESC("console_function")})},
         %% we may support some args for the console action in the future
-        %, {args, sc(map(), #{desc => "The arguments of the built-in 'console' action",
-        %    default => #{}})}
+
+        %% "args" needs to be a reserved/ignored field in the schema
+        %% to maintain compatibility with rule data that may contain
+        %% it due to a validation bug in previous versions.
+
+        %% The "args" field was not validated by the HOCON schema before 5.2.0,
+        %% which allowed rules to be created with invalid "args" data.
+        %% In 5.2.1 the validation was added,
+        %% so existing rules saved with invalid "args" would now fail validation
+        %% To maintain backward compatibility for existing rule data that may contain invalid "args",
+        %% the field needs to be included in the schema even though it is not a valid field.
+        {args,
+            ?HOCON(map(), #{
+                deprecated => true,
+                importance => ?IMPORTANCE_HIDDEN,
+                desc => "The arguments of the built-in 'console' action",
+                default => #{}
+            })}
     ];
 fields("user_provided_function") ->
     [
@@ -127,7 +144,7 @@ fields("republish_args") ->
     [
         {topic,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_topic"),
                     required => true,
@@ -145,7 +162,7 @@ fields("republish_args") ->
             )},
         {retain,
             ?HOCON(
-                hoconsc:union([boolean(), binary()]),
+                hoconsc:union([boolean(), emqx_schema:template()]),
                 #{
                     desc => ?DESC("republish_args_retain"),
                     default => <<"${retain}">>,
@@ -154,22 +171,49 @@ fields("republish_args") ->
             )},
         {payload,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_payload"),
                     default => <<"${payload}">>,
                     example => <<"${payload}">>
                 }
             )},
+        {mqtt_properties,
+            ?HOCON(
+                ?R_REF("republish_mqtt_properties"),
+                #{
+                    desc => ?DESC("republish_args_mqtt_properties"),
+                    default => #{}
+                }
+            )},
         {user_properties,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_user_properties"),
                     default => <<"${user_properties}">>,
                     example => <<"${pub_props.'User-Property'}">>
                 }
+            )},
+        {direct_dispatch,
+            ?HOCON(
+                hoconsc:union([boolean(), emqx_schema:template()]),
+                #{
+                    desc => ?DESC("republish_args_direct_dispatch"),
+                    default => false
+                }
             )}
+    ];
+fields("republish_mqtt_properties") ->
+    [
+        {'Payload-Format-Indicator',
+            ?HOCON(binary(), #{required => false, desc => ?DESC('Payload-Format-Indicator')})},
+        {'Message-Expiry-Interval',
+            ?HOCON(binary(), #{required => false, desc => ?DESC('Message-Expiry-Interval')})},
+        {'Content-Type', ?HOCON(binary(), #{required => false, desc => ?DESC('Content-Type')})},
+        {'Response-Topic', ?HOCON(binary(), #{required => false, desc => ?DESC('Response-Topic')})},
+        {'Correlation-Data',
+            ?HOCON(binary(), #{required => false, desc => ?DESC('Correlation-Data')})}
     ].
 
 desc("rule_engine") ->
@@ -200,15 +244,34 @@ rule_name() ->
         )}.
 
 actions() ->
-    [
-        binary(),
-        ?R_REF("builtin_action_republish"),
-        ?R_REF("builtin_action_console"),
-        ?R_REF("user_provided_function")
-    ].
+    fun
+        (all_union_members) ->
+            [
+                binary(),
+                ?R_REF("builtin_action_republish"),
+                ?R_REF("builtin_action_console"),
+                ?R_REF("user_provided_function")
+            ];
+        ({value, V}) ->
+            case V of
+                #{<<"function">> := <<"console">>} ->
+                    [?R_REF("builtin_action_console")];
+                #{<<"function">> := <<"republish">>} ->
+                    [?R_REF("builtin_action_republish")];
+                #{<<"function">> := <<_/binary>>} ->
+                    [?R_REF("user_provided_function")];
+                <<_/binary>> ->
+                    [binary()];
+                _ ->
+                    throw(#{
+                        field_name => actions,
+                        reason => <<"unknown action type">>
+                    })
+            end
+    end.
 
 qos() ->
-    ?UNION([emqx_schema:qos(), binary()]).
+    hoconsc:union([emqx_schema:qos(), emqx_schema:template()]).
 
 rule_engine_settings() ->
     [

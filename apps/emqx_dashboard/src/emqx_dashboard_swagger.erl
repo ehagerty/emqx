@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,8 +28,9 @@
 -export([error_codes/1, error_codes/2]).
 -export([file_schema/1]).
 -export([base_path/0]).
--export([relative_uri/1]).
+-export([relative_uri/1, get_relative_uri/1]).
 -export([compose_filters/2]).
+-export([validate_content_type_json/2, validate_content_type/3]).
 
 -export([
     filter_check_request/2,
@@ -57,15 +58,12 @@
     allowEmptyValue,
     deprecated,
     minimum,
-    maximum
+    maximum,
+    %% is_template is a type property,
+    %% but some exceptions are made for them to be field property
+    %% for example, HTTP headers (which is a map type)
+    is_template
 ]).
-
--define(INIT_SCHEMA, #{
-    fields => #{},
-    translations => #{},
-    validations => [],
-    namespace => undefined
-}).
 
 -define(TO_REF(_N_, _F_), iolist_to_binary([to_bin(_N_), ".", to_bin(_F_)])).
 -define(TO_COMPONENTS_SCHEMA(_M_, _F_),
@@ -81,13 +79,20 @@
     ])
 ).
 
--define(SPECIAL_LANG_MSGID, <<"$msgid">>).
+-define(NO_I18N, undefined).
 
--define(MAX_ROW_LIMIT, 1000).
+-define(MAX_ROW_LIMIT, 10000).
 -define(DEFAULT_ROW, 100).
 
 -type request() :: #{bindings => map(), query_string => map(), body => map()}.
--type request_meta() :: #{module => module(), path => string(), method => atom()}.
+-type request_meta() :: #{
+    module := module(),
+    path := string(),
+    method := atom(),
+    %% API Operation specification override.
+    %% Takes precedence over the API specification defined in the module.
+    apispec => map()
+}.
 
 %% More exact types are defined in minirest.hrl, but we don't want to include it
 %% because it defines a lot of types and they may clash with the types declared locally.
@@ -148,6 +153,30 @@ spec(Module, Options) ->
         ),
     {ApiSpec, components(lists:usort(AllRefs), Options)}.
 
+validate_content_type_json(Params, Meta) ->
+    validate_content_type(Params, Meta, <<"application/json">>).
+
+%% tip: Skip content-type check if body is empty.
+validate_content_type(
+    #{body := Body, headers := Headers} = Params,
+    #{method := Method},
+    Expect
+) when
+    (Method =:= put orelse
+        Method =:= post orelse
+        method =:= patch) andalso
+        Body =/= #{}
+->
+    ExpectSize = byte_size(Expect),
+    case maps:get(<<"content-type">>, Headers, undefined) of
+        <<Expect:ExpectSize/binary, _/binary>> ->
+            {ok, Params};
+        _ ->
+            {415, 'UNSUPPORTED_MEDIA_TYPE', <<"content-type:", Expect/binary, " Required">>}
+    end;
+validate_content_type(Params, _Meta, _Expect) ->
+    {ok, Params}.
+
 -spec namespace() -> hocon_schema:name().
 namespace() -> "public".
 
@@ -164,6 +193,14 @@ fields(limit) ->
     ]),
     Meta = #{in => query, desc => Desc, default => ?DEFAULT_ROW, example => 50},
     [{limit, hoconsc:mk(range(1, ?MAX_ROW_LIMIT), Meta)}];
+fields(cursor) ->
+    Desc = <<"Opaque value representing the current iteration state.">>,
+    Meta = #{required => false, in => query, desc => Desc},
+    [{cursor, hoconsc:mk(binary(), Meta)}];
+fields(cursor_response) ->
+    Desc = <<"Opaque value representing the current iteration state.">>,
+    Meta = #{desc => Desc, required => false},
+    [{cursor, hoconsc:mk(binary(), Meta)}];
 fields(count) ->
     Desc = <<
         "Total number of records matching the query.<br/>"
@@ -178,14 +215,36 @@ fields(hasnext) ->
     >>,
     Meta = #{desc => Desc, required => true},
     [{hasnext, hoconsc:mk(boolean(), Meta)}];
+fields(position) ->
+    Desc = <<
+        "An opaque token that can then be in subsequent requests to get "
+        " the next chunk of results: \"?position={prev_response.meta.position}\"<br/>"
+        "It is used instead of \"page\" parameter to traverse highly volatile data.<br/>"
+        "Can be omitted or set to \"none\" to get the first chunk of data."
+    >>,
+    Meta = #{
+        in => query, desc => Desc, required => false, example => <<"none">>
+    },
+    [{position, hoconsc:mk(hoconsc:union([none, end_of_data, binary()]), Meta)}];
+fields(start) ->
+    Desc = <<"The position of the current first element of the data collection.">>,
+    Meta = #{
+        desc => Desc, required => true, example => <<"none">>
+    },
+    [{start, hoconsc:mk(hoconsc:union([none, binary()]), Meta)}];
 fields(meta) ->
-    fields(page) ++ fields(limit) ++ fields(count) ++ fields(hasnext).
+    fields(page) ++ fields(limit) ++ fields(count) ++ fields(hasnext);
+fields(meta_with_cursor) ->
+    fields(count) ++ fields(hasnext) ++ fields(cursor_response);
+fields(continuation_meta) ->
+    fields(start) ++ fields(position).
 
--spec schema_with_example(hocon_schema:type(), term()) -> hocon_schema:field_schema_map().
+-spec schema_with_example(hocon_schema:type(), term()) -> hocon_schema:field_schema().
 schema_with_example(Type, Example) ->
     hoconsc:mk(Type, #{examples => #{<<"example">> => Example}}).
 
--spec schema_with_examples(hocon_schema:type(), map()) -> hocon_schema:field_schema_map().
+-spec schema_with_examples(hocon_schema:type(), map() | list(tuple())) ->
+    hocon_schema:field_schema().
 schema_with_examples(Type, Examples) ->
     hoconsc:mk(Type, #{examples => #{<<"examples">> => Examples}}).
 
@@ -212,6 +271,12 @@ base_path() ->
 relative_uri(Uri) ->
     base_path() ++ Uri.
 
+-spec get_relative_uri(uri_string:uri_string()) -> {ok, uri_string:uri_string()} | error.
+get_relative_uri(<<?BASE_PATH, Path/binary>>) ->
+    {ok, Path};
+get_relative_uri(_Path) ->
+    error.
+
 file_schema(FileName) ->
     #{
         content => #{
@@ -227,11 +292,11 @@ file_schema(FileName) ->
     }.
 
 gen_api_schema_json_iodata(SchemaMod, SchemaInfo, Converter) ->
-    {ApiSpec0, Components0} = emqx_dashboard_swagger:spec(
+    {ApiSpec0, Components0} = spec(
         SchemaMod,
         #{
             schema_converter => Converter,
-            i18n_lang => ?SPECIAL_LANG_MSGID
+            i18n_lang => ?NO_I18N
         }
     ),
     ApiSpec = lists:foldl(
@@ -276,14 +341,7 @@ compose_filters(undefined, Filter2) ->
 compose_filters(Filter1, undefined) ->
     Filter1;
 compose_filters(Filter1, Filter2) ->
-    fun(Request, RequestMeta) ->
-        case Filter1(Request, RequestMeta) of
-            {ok, Request1} ->
-                Filter2(Request1, RequestMeta);
-            Response ->
-                Response
-        end
-    end.
+    [Filter1, Filter2].
 
 %%------------------------------------------------------------------------------
 %% Private functions
@@ -295,19 +353,29 @@ filter_check_request_and_translate_body(Request, RequestMeta) ->
 filter_check_request(Request, RequestMeta) ->
     translate_req(Request, RequestMeta, fun check_only/3).
 
-translate_req(Request, #{module := Module, path := Path, method := Method}, CheckFun) ->
-    #{Method := Spec} = apply(Module, schema, [Path]),
+translate_req(Request, ReqMeta = #{module := Module}, CheckFun) ->
+    Spec = find_req_apispec(ReqMeta),
     try
         Params = maps:get(parameters, Spec, []),
         Body = maps:get('requestBody', Spec, []),
         {Bindings, QueryStr} = check_parameters(Request, Params, Module),
-        NewBody = check_request_body(Request, Body, Module, CheckFun, hoconsc:is_schema(Body)),
-        {ok, Request#{bindings => Bindings, query_string => QueryStr, body => NewBody}}
+        case check_request_body(Request, Body, Module, CheckFun, hoconsc:is_schema(Body)) of
+            {ok, NewBody} ->
+                {ok, Request#{bindings => Bindings, query_string => QueryStr, body => NewBody}};
+            Error ->
+                Error
+        end
     catch
         throw:HoconError ->
             Msg = hocon_error_msg(HoconError),
             {400, 'BAD_REQUEST', Msg}
     end.
+
+find_req_apispec(#{apispec := Spec}) ->
+    Spec;
+find_req_apispec(#{module := Module, path := Path, method := Method}) ->
+    #{Method := Spec} = apply(Module, schema, [Path]),
+    Spec.
 
 check_and_translate(Schema, Map, Opts) ->
     hocon_tconf:check_plain(Schema, Map, Opts).
@@ -339,15 +407,7 @@ parse_spec_ref(Module, Path, Options) ->
             erlang:apply(Module, schema, [Path])
         catch
             Error:Reason:Stacktrace ->
-                %% This error is intended to fail the build
-                %% hence print to standard_error
-                io:format(
-                    standard_error,
-                    "Failed to generate swagger for path ~p in module ~p~n"
-                    "error:~p~nreason:~p~n~p~n",
-                    [Module, Path, Error, Reason, Stacktrace]
-                ),
-                error({failed_to_generate_swagger_spec, Module, Path})
+                failed_to_generate_swagger_spec(Module, Path, Error, Reason, Stacktrace)
         end,
     OperationId = maps:get('operationId', Schema),
     {Specs, Refs} = maps:fold(
@@ -363,6 +423,24 @@ parse_spec_ref(Module, Path, Options) ->
     RouteOpts = generate_route_opts(Schema, Options),
     {OperationId, Specs, Refs, RouteOpts}.
 
+-ifdef(TEST).
+-spec failed_to_generate_swagger_spec(_, _, _, _, _) -> no_return().
+failed_to_generate_swagger_spec(Module, Path, Error, Reason, Stacktrace) ->
+    error({failed_to_generate_swagger_spec, Module, Path, Error, Reason, Stacktrace}).
+-else.
+-spec failed_to_generate_swagger_spec(_, _, _, _, _) -> no_return().
+failed_to_generate_swagger_spec(Module, Path, Error, Reason, Stacktrace) ->
+    %% This error is intended to fail the build
+    %% hence print to standard_error
+    io:format(
+        standard_error,
+        "Failed to generate swagger for path ~p in module ~p~n"
+        "error:~p~nreason:~p~n~p~n",
+        [Path, Module, Error, Reason, Stacktrace]
+    ),
+    error({failed_to_generate_swagger_spec, Module, Path}).
+
+-endif.
 generate_route_opts(Schema, Options) ->
     #{filter => compose_filters(filter(Options), custom_filter(Schema))}.
 
@@ -399,31 +477,104 @@ check_parameter(
 check_parameter([], _Bindings, _QueryStr, _Module, NewBindings, NewQueryStr) ->
     {NewBindings, NewQueryStr};
 check_parameter([{Name, Type} | Spec], Bindings, QueryStr, Module, BindingsAcc, QueryStrAcc) ->
-    Schema = ?INIT_SCHEMA#{roots => [{Name, Type}]},
     case hocon_schema:field_schema(Type, in) of
         path ->
+            Schema = #{roots => [{Name, Type}], fields => #{}},
             Option = #{atom_key => true},
             NewBindings = hocon_tconf:check_plain(Schema, Bindings, Option),
             NewBindingsAcc = maps:merge(BindingsAcc, NewBindings),
             check_parameter(Spec, Bindings, QueryStr, Module, NewBindingsAcc, QueryStrAcc);
         query ->
+            Type1 = maybe_wrap_array_qs_param(Type),
+            Schema = #{roots => [{Name, Type1}], fields => #{}},
             Option = #{},
             NewQueryStr = hocon_tconf:check_plain(Schema, QueryStr, Option),
             NewQueryStrAcc = maps:merge(QueryStrAcc, NewQueryStr),
             check_parameter(Spec, Bindings, QueryStr, Module, BindingsAcc, NewQueryStrAcc)
     end.
 
-check_request_body(#{body := Body}, Schema, Module, CheckFun, true) ->
-    Type0 = hocon_schema:field_schema(Schema, type),
-    Type =
-        case Type0 of
-            ?REF(StructName) -> ?R_REF(Module, StructName);
-            _ -> Type0
+%% Compatibility layer for minirest 1.4.0 that parses repetitive QS params into lists.
+%% Previous minirest releases dropped all but the last repetitive params.
+
+maybe_wrap_array_qs_param(FieldSchema) ->
+    Conv = hocon_schema:field_schema(FieldSchema, converter),
+    Type = hocon_schema:field_schema(FieldSchema, type),
+    case array_or_single_qs_param(Type, Conv) of
+        any ->
+            FieldSchema;
+        array ->
+            override_conv(FieldSchema, fun wrap_array_conv/2, Conv);
+        single ->
+            override_conv(FieldSchema, fun unwrap_array_conv/2, Conv)
+    end.
+
+array_or_single_qs_param(?ARRAY(_Type), undefined) ->
+    array;
+%% Qs field schema is an array and defines a converter:
+%% don't change (wrap/unwrap) the original value, and let the converter handle it.
+%% For example, it can be a CSV list.
+array_or_single_qs_param(?ARRAY(_Type), _Conv) ->
+    any;
+array_or_single_qs_param(?UNION(Types), _Conv) ->
+    HasArray = lists:any(
+        fun
+            (?ARRAY(_)) -> true;
+            (_) -> false
         end,
-    NewSchema = ?INIT_SCHEMA#{roots => [{root, Type}]},
-    Option = #{required => false},
-    #{<<"root">> := NewBody} = CheckFun(NewSchema, #{<<"root">> => Body}, Option),
-    NewBody;
+        Types
+    ),
+    case HasArray of
+        true -> any;
+        false -> single
+    end;
+array_or_single_qs_param(_, _Conv) ->
+    single.
+
+override_conv(FieldSchema, NewConv, OldConv) ->
+    Conv = compose_converters(NewConv, OldConv),
+    hocon_schema:override(FieldSchema, FieldSchema#{converter => Conv}).
+
+compose_converters(NewFun, undefined = _OldFun) ->
+    NewFun;
+compose_converters(NewFun, OldFun) ->
+    case erlang:fun_info(OldFun, arity) of
+        {_, 2} ->
+            fun(V, Opts) -> OldFun(NewFun(V, Opts), Opts) end;
+        {_, 1} ->
+            fun(V, Opts) -> OldFun(NewFun(V, Opts)) end
+    end.
+
+wrap_array_conv(Val, _Opts) when is_list(Val); Val =:= undefined -> Val;
+wrap_array_conv(SingleVal, _Opts) -> [SingleVal].
+
+unwrap_array_conv([HVal | _], _Opts) -> HVal;
+unwrap_array_conv(SingleVal, _Opts) -> SingleVal.
+
+check_request_body(#{body := Body}, Schema, Module, CheckFun, true) ->
+    %% the body was already being decoded
+    %% if the content-type header specified application/json.
+    case is_binary(Body) of
+        false ->
+            Type0 = hocon_schema:field_schema(Schema, type),
+            Type =
+                case Type0 of
+                    ?REF(StructName) -> ?R_REF(Module, StructName);
+                    _ -> Type0
+                end,
+            Validations =
+                case hocon_schema:field_schema(Schema, validator) of
+                    undefined ->
+                        [];
+                    Fun when is_function(Fun) ->
+                        [{validator, fun(#{<<"root">> := B}) -> Fun(B) end}]
+                end,
+            NewSchema = #{roots => [{root, Type}], fields => #{}, validations => Validations},
+            Option = #{required => false},
+            #{<<"root">> := NewBody} = CheckFun(NewSchema, #{<<"root">> => Body}, Option),
+            {ok, NewBody};
+        true ->
+            {415, 'UNSUPPORTED_MEDIA_TYPE', <<"content-type:application/json Required">>}
+    end;
 %% TODO not support nest object check yet, please use ref!
 %% 'requestBody' = [ {per_page, mk(integer(), #{}},
 %%                 {nest_object, [
@@ -432,18 +583,19 @@ check_request_body(#{body := Body}, Schema, Module, CheckFun, true) ->
 %%                ]}
 %% ]
 check_request_body(#{body := Body}, Spec, _Module, CheckFun, false) when is_list(Spec) ->
-    lists:foldl(
-        fun({Name, Type}, Acc) ->
-            Schema = ?INIT_SCHEMA#{roots => [{Name, Type}]},
-            maps:merge(Acc, CheckFun(Schema, Body, #{}))
-        end,
-        #{},
-        Spec
-    );
+    {ok,
+        lists:foldl(
+            fun({Name, Type}, Acc) ->
+                Schema = #{roots => [{Name, Type}], fields => #{}},
+                maps:merge(Acc, CheckFun(Schema, Body, #{}))
+            end,
+            #{},
+            Spec
+        )};
 %% requestBody => #{content => #{ 'application/octet-stream' =>
 %% #{schema => #{ type => string, format => binary}}}
 check_request_body(#{body := Body}, Spec, _Module, _CheckFun, false) when is_map(Spec) ->
-    Body.
+    {ok, Body}.
 
 %% tags, description, summary, security, deprecated
 meta_to_spec(Meta, Module, Options) ->
@@ -547,19 +699,6 @@ trans_required(Spec, true, _) -> Spec#{required => true};
 trans_required(Spec, _, path) -> Spec#{required => true};
 trans_required(Spec, _, _) -> Spec.
 
-trans_desc(Init, Hocon, Func, Name, Options) ->
-    Spec0 = trans_description(Init, Hocon, Options),
-    case Func =:= fun hocon_schema_to_spec/2 of
-        true ->
-            Spec0;
-        false ->
-            Spec1 = trans_label(Spec0, Hocon, Name, Options),
-            case Spec1 of
-                #{description := _} -> Spec1;
-                _ -> Spec1#{description => <<Name/binary, " Description">>}
-            end
-    end.
-
 trans_description(Spec, Hocon, Options) ->
     Desc =
         case desc_struct(Hocon) of
@@ -567,10 +706,10 @@ trans_description(Spec, Hocon, Options) ->
             ?DESC(_, _) = Struct -> get_i18n(<<"desc">>, Struct, undefined, Options);
             Text -> to_bin(Text)
         end,
-    case Desc of
-        undefined ->
+    case Desc =:= undefined of
+        true ->
             Spec;
-        Desc ->
+        false ->
             Desc1 = binary:replace(Desc, [<<"\n">>], <<"<br/>">>, [global]),
             Spec#{description => Desc1}
     end.
@@ -578,8 +717,8 @@ trans_description(Spec, Hocon, Options) ->
 get_i18n(Tag, ?DESC(Namespace, Id), Default, Options) ->
     Lang = get_lang(Options),
     case Lang of
-        ?SPECIAL_LANG_MSGID ->
-            make_msgid(Namespace, Id, Tag);
+        ?NO_I18N ->
+            undefined;
         _ ->
             get_i18n_text(Lang, Namespace, Id, Tag, Default)
     end.
@@ -592,26 +731,10 @@ get_i18n_text(Lang, Namespace, Id, Tag, Default) ->
             Text
     end.
 
-%% Format：$msgid:Namespace.Id.Tag
-%% e.g. $msgid:emqx_schema.key.desc
-%%      $msgid:emqx_schema.key.label
-%% if needed, the consumer of this schema JSON can use this msgid to
-%% resolve the text in the i18n database.
-make_msgid(Namespace, Id, Tag) ->
-    iolist_to_binary(["$msgid:", to_bin(Namespace), ".", to_bin(Id), ".", Tag]).
-
 %% So far i18n_lang in options is only used at build time.
 %% At runtime, it's still the global config which controls the language.
 get_lang(#{i18n_lang := Lang}) -> Lang;
 get_lang(_) -> emqx:get_config([dashboard, i18n_lang]).
-
-trans_label(Spec, Hocon, Default, Options) ->
-    Label =
-        case desc_struct(Hocon) of
-            ?DESC(_, _) = Struct -> get_i18n(<<"label">>, Struct, Default, Options);
-            _ -> Default
-        end,
-    Spec#{label => Label}.
 
 desc_struct(Hocon) ->
     R =
@@ -670,7 +793,7 @@ response(Status, #{content := _} = Content, {Acc, RefsAcc, Module, Options}) ->
 response(Status, ?REF(StructName), {Acc, RefsAcc, Module, Options}) ->
     response(Status, ?R_REF(Module, StructName), {Acc, RefsAcc, Module, Options});
 response(Status, ?R_REF(_Mod, _Name) = RRef, {Acc, RefsAcc, Module, Options}) ->
-    SchemaToSpec = schema_converter(Options),
+    SchemaToSpec = get_schema_converter(Options),
     {Spec, Refs} = SchemaToSpec(RRef, Module),
     Content = content(Spec),
     {
@@ -770,7 +893,7 @@ hocon_schema_to_spec(?MAP(Name, Type), LocalModule) ->
         },
         SubRefs
     };
-hocon_schema_to_spec(?UNION(Types), LocalModule) ->
+hocon_schema_to_spec(?UNION(Types, _DisplayName), LocalModule) ->
     {OneOf, Refs} = lists:foldl(
         fun(Type, {Acc, RefsAcc}) ->
             {Schema, SubRefs} = hocon_schema_to_spec(Type, LocalModule),
@@ -783,192 +906,8 @@ hocon_schema_to_spec(?UNION(Types), LocalModule) ->
 hocon_schema_to_spec(Atom, _LocalModule) when is_atom(Atom) ->
     {#{type => string, enum => [Atom]}, []}.
 
-typename_to_spec("term()", _Mod) ->
-    #{type => string, example => <<"any">>};
-typename_to_spec("boolean()", _Mod) ->
-    #{type => boolean};
-typename_to_spec("binary()", _Mod) ->
-    #{type => string};
-typename_to_spec("float()", _Mod) ->
-    #{type => number};
-typename_to_spec("integer()", _Mod) ->
-    #{type => integer};
-typename_to_spec("non_neg_integer()", _Mod) ->
-    #{type => integer, minimum => 0};
-typename_to_spec("pos_integer()", _Mod) ->
-    #{type => integer, minimum => 1};
-typename_to_spec("number()", _Mod) ->
-    #{type => number};
-typename_to_spec("string()", _Mod) ->
-    #{type => string};
-typename_to_spec("atom()", _Mod) ->
-    #{type => string};
-typename_to_spec("epoch_second()", _Mod) ->
-    #{
-        <<"oneOf">> => [
-            #{type => integer, example => 1640995200, description => <<"epoch-second">>},
-            #{type => string, example => <<"2022-01-01T00:00:00.000Z">>, format => <<"date-time">>}
-        ]
-    };
-typename_to_spec("epoch_millisecond()", _Mod) ->
-    #{
-        <<"oneOf">> => [
-            #{type => integer, example => 1640995200000, description => <<"epoch-millisecond">>},
-            #{type => string, example => <<"2022-01-01T00:00:00.000Z">>, format => <<"date-time">>}
-        ]
-    };
-typename_to_spec("duration()", _Mod) ->
-    #{type => string, example => <<"12m">>};
-typename_to_spec("duration_s()", _Mod) ->
-    #{type => string, example => <<"1h">>};
-typename_to_spec("duration_ms()", _Mod) ->
-    #{type => string, example => <<"32s">>};
-typename_to_spec("timeout_duration()", _Mod) ->
-    #{type => string, example => <<"12m">>};
-typename_to_spec("timeout_duration_s()", _Mod) ->
-    #{type => string, example => <<"1h">>};
-typename_to_spec("timeout_duration_ms()", _Mod) ->
-    #{type => string, example => <<"32s">>};
-typename_to_spec("percent()", _Mod) ->
-    #{type => number, example => <<"12%">>};
-typename_to_spec("file()", _Mod) ->
-    #{type => string, example => <<"/path/to/file">>};
-typename_to_spec("ip_port()", _Mod) ->
-    #{type => string, example => <<"127.0.0.1:80">>};
-typename_to_spec("write_syntax()", _Mod) ->
-    #{
-        type => string,
-        example =>
-            <<"${topic},clientid=${clientid}", " ", "payload=${payload},",
-                "${clientid}_int_value=${payload.int_key}i,", "bool=${payload.bool}">>
-    };
-typename_to_spec("url()", _Mod) ->
-    #{type => string, example => <<"http://127.0.0.1">>};
-typename_to_spec("connect_timeout()", Mod) ->
-    typename_to_spec("timeout()", Mod);
-typename_to_spec("timeout()", _Mod) ->
-    #{
-        <<"oneOf">> => [
-            #{type => string, example => infinity},
-            #{type => integer}
-        ],
-        example => infinity
-    };
-typename_to_spec("bytesize()", _Mod) ->
-    #{type => string, example => <<"32MB">>};
-typename_to_spec("mqtt_max_packet_size()", _Mod) ->
-    #{type => string, example => <<"32MB">>};
-typename_to_spec("wordsize()", _Mod) ->
-    #{type => string, example => <<"1024KB">>};
-typename_to_spec("map()", _Mod) ->
-    #{type => object, example => #{}};
-typename_to_spec("service_account_json()", _Mod) ->
-    #{type => object, example => #{}};
-typename_to_spec("#{" ++ _, Mod) ->
-    typename_to_spec("map()", Mod);
-typename_to_spec("qos()", _Mod) ->
-    #{type => integer, minimum => 0, maximum => 2, example => 0};
-typename_to_spec("{binary(), binary()}", _Mod) ->
-    #{type => object, example => #{}};
-typename_to_spec("{string(), string()}", _Mod) ->
-    #{type => object, example => #{}};
-typename_to_spec("comma_separated_list()", _Mod) ->
-    #{type => string, example => <<"item1,item2">>};
-typename_to_spec("comma_separated_binary()", _Mod) ->
-    #{type => string, example => <<"item1,item2">>};
-typename_to_spec("comma_separated_atoms()", _Mod) ->
-    #{type => string, example => <<"item1,item2">>};
-typename_to_spec("pool_type()", _Mod) ->
-    #{type => string, enum => [random, hash]};
-typename_to_spec("log_level()", _Mod) ->
-    #{
-        type => string,
-        enum => [debug, info, notice, warning, error, critical, alert, emergency, all]
-    };
-typename_to_spec("rate()", _Mod) ->
-    #{type => string, example => <<"10MB">>};
-typename_to_spec("burst()", _Mod) ->
-    #{type => string, example => <<"100MB">>};
-typename_to_spec("burst_rate()", _Mod) ->
-    %% 0/0s = no burst
-    #{type => string, example => <<"10MB">>};
-typename_to_spec("failure_strategy()", _Mod) ->
-    #{type => string, example => <<"force">>};
-typename_to_spec("initial()", _Mod) ->
-    #{type => string, example => <<"0MB">>};
-typename_to_spec("bucket_name()", _Mod) ->
-    #{type => string, example => <<"retainer">>};
-typename_to_spec("json_binary()", _Mod) ->
-    #{type => string, example => <<"{\"a\": [1,true]}">>};
-typename_to_spec("port_number()", _Mod) ->
-    range("1..65535");
-typename_to_spec("secret_access_key()", _Mod) ->
-    #{type => string, example => <<"TW8dPwmjpjJJuLW....">>};
-typename_to_spec(Name, Mod) ->
-    try_convert_to_spec(Name, Mod, [
-        fun try_remote_module_type/2,
-        fun try_typerefl_array/2,
-        fun try_range/2,
-        fun try_integer/2
-    ]).
-
-range(Name) ->
-    #{} = try_range(Name, undefined).
-
-try_convert_to_spec(Name, Mod, []) ->
-    throw({error, #{msg => <<"Unsupported Type">>, type => Name, module => Mod}});
-try_convert_to_spec(Name, Mod, [Converter | Rest]) ->
-    case Converter(Name, Mod) of
-        nomatch -> try_convert_to_spec(Name, Mod, Rest);
-        Spec -> Spec
-    end.
-
-try_range(Name, _Mod) ->
-    case string:split(Name, "..") of
-        %% 1..10 1..inf -inf..10
-        [MinStr, MaxStr] ->
-            Schema = #{type => integer},
-            Schema1 = add_integer_prop(Schema, minimum, MinStr),
-            add_integer_prop(Schema1, maximum, MaxStr);
-        _ ->
-            nomatch
-    end.
-
-%% Module:Type
-try_remote_module_type(Name, Mod) ->
-    case string:split(Name, ":") of
-        [_Module, Type] -> typename_to_spec(Type, Mod);
-        _ -> nomatch
-    end.
-
-%% [string()] or [integer()] or [xxx] or [xxx,...]
-try_typerefl_array(Name, Mod) ->
-    case string:trim(Name, leading, "[") of
-        Name ->
-            nomatch;
-        Name1 ->
-            case string:trim(Name1, trailing, ",.]") of
-                Name1 ->
-                    notmatch;
-                Name2 ->
-                    Schema = typename_to_spec(Name2, Mod),
-                    #{type => array, items => Schema}
-            end
-    end.
-
-%% integer(1)
-try_integer(Name, _Mod) ->
-    case string:to_integer(Name) of
-        {Int, []} -> #{type => integer, enum => [Int], default => Int};
-        _ -> nomatch
-    end.
-
-add_integer_prop(Schema, Key, Value) ->
-    case string:to_integer(Value) of
-        {error, no_integer} -> Schema;
-        {Int, []} when Key =:= minimum -> Schema#{Key => Int};
-        {Int, []} -> Schema#{Key => Int}
-    end.
+typename_to_spec(TypeStr, Module) ->
+    emqx_conf_schema_types:readable_swagger(Module, TypeStr).
 
 to_bin(List) when is_list(List) ->
     case io_lib:printable_list(List) of
@@ -992,7 +931,7 @@ parse_object(PropList = [_ | _], Module, Options) when is_list(PropList) ->
 parse_object(Other, Module, Options) ->
     erlang:throw(
         {error, #{
-            msg => <<"Object only supports not empty proplists">>,
+            msg => <<"Object only supports non-empty fields list">>,
             args => Other,
             module => Module,
             options => Options
@@ -1000,18 +939,31 @@ parse_object(Other, Module, Options) ->
     ).
 
 parse_object_loop(PropList0, Module, Options) ->
-    PropList = lists:filter(
-        fun({_, Hocon}) ->
-            case hoconsc:is_schema(Hocon) andalso is_hidden(Hocon) of
-                true -> false;
-                false -> true
-            end
-        end,
-        PropList0
-    ),
+    PropList = filter_hidden_key(PropList0, Module),
     parse_object_loop(PropList, Module, Options, _Props = [], _Required = [], _Refs = []).
 
-parse_object_loop([], _Modlue, _Options, Props, Required, Refs) ->
+filter_hidden_key(PropList0, Module) ->
+    {PropList1, _} = lists:foldr(
+        fun({Key, Hocon} = Prop, {PropAcc, KeyAcc}) ->
+            NewKeyAcc = assert_no_duplicated_key(Key, KeyAcc, Module),
+            case hoconsc:is_schema(Hocon) andalso is_hidden(Hocon) of
+                true -> {PropAcc, NewKeyAcc};
+                false -> {[Prop | PropAcc], NewKeyAcc}
+            end
+        end,
+        {[], []},
+        PropList0
+    ),
+    PropList1.
+
+assert_no_duplicated_key(Key, Keys, Module) ->
+    KeyBin = emqx_utils_conv:bin(Key),
+    case lists:member(KeyBin, Keys) of
+        true -> throw({duplicated_key, #{module => Module, key => KeyBin, keys => Keys}});
+        false -> [KeyBin | Keys]
+    end.
+
+parse_object_loop([], _Module, _Options, Props, Required, Refs) ->
     {lists:reverse(Props), lists:usort(Required), Refs};
 parse_object_loop([{Name, Hocon} | Rest], Module, Options, Props, Required, Refs) ->
     NameBin = to_bin(Name),
@@ -1019,10 +971,10 @@ parse_object_loop([{Name, Hocon} | Rest], Module, Options, Props, Required, Refs
         true ->
             HoconType = hocon_schema:field_schema(Hocon, type),
             Init0 = init_prop([default | ?DEFAULT_FIELDS], #{}, Hocon),
-            SchemaToSpec = schema_converter(Options),
+            SchemaToSpec = get_schema_converter(Options),
             Init = maps:remove(
                 summary,
-                trans_desc(Init0, Hocon, SchemaToSpec, NameBin, Options)
+                trans_description(Init0, Hocon, Options)
             ),
             {Prop, Refs1} = SchemaToSpec(HoconType, Module),
             NewRequiredAcc =
@@ -1049,7 +1001,7 @@ parse_object_loop([{Name, Hocon} | Rest], Module, Options, Props, Required, Refs
 
 %% return true if the field has 'importance' set to 'hidden'
 is_hidden(Hocon) ->
-    hocon_schema:is_hidden(Hocon, #{include_importance_up_from => ?IMPORTANCE_LOW}).
+    hocon_schema:is_hidden(Hocon, #{include_importance_up_from => ?IMPORTANCE_NO_DOC}).
 
 is_required(Hocon) ->
     hocon_schema:field_schema(Hocon, required) =:= true.
@@ -1071,7 +1023,7 @@ to_ref(Mod, StructName, Acc, RefsAcc) ->
     Ref = #{<<"$ref">> => ?TO_COMPONENTS_PARAM(Mod, StructName)},
     {[Ref | Acc], [{Mod, StructName, parameter} | RefsAcc]}.
 
-schema_converter(Options) ->
+get_schema_converter(Options) ->
     maps:get(schema_converter, Options, fun hocon_schema_to_spec/2).
 
 hocon_error_msg(Reason) ->

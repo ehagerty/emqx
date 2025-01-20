@@ -1,11 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_registry).
 
 -behaviour(gen_server).
--behaviour(emqx_config_handler).
--behaviour(emqx_config_backup).
 
 -include("emqx_schema_registry.hrl").
 -include_lib("emqx/include/logger.hrl").
@@ -14,9 +12,10 @@
 %% API
 -export([
     start_link/0,
-    get_serde/1,
     add_schema/2,
     get_schema/1,
+    is_existing_type/1,
+    is_existing_type/2,
     delete_schema/1,
     list_schemas/0
 ]).
@@ -30,13 +29,23 @@
     terminate/2
 ]).
 
-%% `emqx_config_handler' API
--export([post_config_update/5]).
-
-%% Data backup
+%% Internal exports for `emqx_schema_registry_config'
 -export([
-    import_config/1
+    async_delete_serdes/1,
+    ensure_serde_absent/1,
+    build_serdes/1
 ]).
+
+%% for testing
+-export([
+    get_serde/1
+]).
+
+%%-------------------------------------------------------------------------------------------------
+%% Type definitions
+%%-------------------------------------------------------------------------------------------------
+
+-define(BAD_SCHEMA_NAME, <<"bad_schema_name">>).
 
 -type schema() :: #{
     type := serde_type(),
@@ -48,29 +57,43 @@
 %% API
 %%-------------------------------------------------------------------------------------------------
 
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec get_serde(schema_name()) -> {ok, serde_map()} | {error, not_found}.
+-spec get_serde(schema_name()) -> {ok, serde()} | {error, not_found}.
 get_serde(SchemaName) ->
     case ets:lookup(?SERDE_TAB, to_bin(SchemaName)) of
         [] ->
             {error, not_found};
         [Serde] ->
-            {ok, serde_to_map(Serde)}
+            {ok, Serde}
     end.
+
+-spec is_existing_type(schema_name()) -> boolean().
+is_existing_type(SchemaName) ->
+    is_existing_type(SchemaName, []).
+
+-spec is_existing_type(schema_name(), [binary()]) -> boolean().
+is_existing_type(SchemaName, Path) ->
+    emqx_schema_registry_serde:is_existing_type(SchemaName, Path).
 
 -spec get_schema(schema_name()) -> {ok, map()} | {error, not_found}.
 get_schema(SchemaName) ->
-    case
+    try
         emqx_config:get(
-            [?CONF_KEY_ROOT, schemas, binary_to_atom(SchemaName)], undefined
+            [?CONF_KEY_ROOT, schemas, schema_name_bin_to_atom(SchemaName)], undefined
         )
     of
         undefined ->
             {error, not_found};
         Config ->
             {ok, Config}
+    catch
+        throw:#{reason := ?BAD_SCHEMA_NAME} ->
+            {error, not_found};
+        throw:not_found ->
+            {error, not_found}
     end.
 
 -spec add_schema(schema_name(), schema()) -> ok | {error, term()}.
@@ -104,79 +127,6 @@ delete_schema(Name) ->
 -spec list_schemas() -> #{schema_name() => schema()}.
 list_schemas() ->
     emqx_config:get([?CONF_KEY_ROOT, schemas], #{}).
-
-%%-------------------------------------------------------------------------------------------------
-%% `emqx_config_handler' API
-%%-------------------------------------------------------------------------------------------------
-%% remove
-post_config_update(
-    [?CONF_KEY_ROOT, schemas, Name],
-    '$remove',
-    _NewSchemas,
-    _OldSchemas,
-    _AppEnvs
-) ->
-    async_delete_serdes([Name]),
-    ok;
-%% add or update
-post_config_update(
-    [?CONF_KEY_ROOT, schemas, NewName],
-    _Cmd,
-    NewSchemas,
-    %% undefined or OldSchemas
-    _,
-    _AppEnvs
-) ->
-    case build_serdes([{NewName, NewSchemas}]) of
-        ok ->
-            {ok, #{NewName => NewSchemas}};
-        {error, Reason, SerdesToRollback} ->
-            lists:foreach(fun ensure_serde_absent/1, SerdesToRollback),
-            {error, Reason}
-    end;
-post_config_update(?CONF_KEY_PATH, _Cmd, NewConf = #{schemas := NewSchemas}, OldConf, _AppEnvs) ->
-    OldSchemas = maps:get(schemas, OldConf, #{}),
-    #{
-        added := Added,
-        changed := Changed0,
-        removed := Removed
-    } = emqx_utils_maps:diff_maps(NewSchemas, OldSchemas),
-    Changed = maps:map(fun(_N, {_Old, New}) -> New end, Changed0),
-    RemovedNames = maps:keys(Removed),
-    case RemovedNames of
-        [] ->
-            ok;
-        _ ->
-            async_delete_serdes(RemovedNames)
-    end,
-    SchemasToBuild = maps:to_list(maps:merge(Changed, Added)),
-    case build_serdes(SchemasToBuild) of
-        ok ->
-            {ok, NewConf};
-        {error, Reason, SerdesToRollback} ->
-            lists:foreach(fun ensure_serde_absent/1, SerdesToRollback),
-            {error, Reason}
-    end;
-post_config_update(_Path, _Cmd, NewConf, _OldConf, _AppEnvs) ->
-    {ok, NewConf}.
-
-%%-------------------------------------------------------------------------------------------------
-%% Data backup
-%%-------------------------------------------------------------------------------------------------
-
-import_config(#{<<"schema_registry">> := #{<<"schemas">> := Schemas} = SchemaRegConf}) ->
-    OldSchemas = emqx:get_raw_config([?CONF_KEY_ROOT, schemas], #{}),
-    SchemaRegConf1 = SchemaRegConf#{<<"schemas">> => maps:merge(OldSchemas, Schemas)},
-    case emqx_conf:update(?CONF_KEY_PATH, SchemaRegConf1, #{override_to => cluster}) of
-        {ok, #{raw_config := #{<<"schemas">> := NewRawSchemas}}} ->
-            Changed = maps:get(changed, emqx_utils_maps:diff_maps(NewRawSchemas, OldSchemas)),
-            ChangedPaths = [[?CONF_KEY_ROOT, schemas, Name] || Name <- maps:keys(Changed)],
-            {ok, #{root_key => ?CONF_KEY_ROOT, changed => ChangedPaths}};
-        Error ->
-            {error, #{root_key => ?CONF_KEY_ROOT, reason => Error}}
-    end;
-import_config(_RawConf) ->
-    {ok, #{root_key => ?CONF_KEY_ROOT, changed => []}}.
 
 %%-------------------------------------------------------------------------------------------------
 %% `gen_server' API
@@ -214,13 +164,10 @@ terminate(_Reason, _State) ->
 %%-------------------------------------------------------------------------------------------------
 
 create_tables() ->
-    ok = mria:create_table(?SERDE_TAB, [
-        {type, ordered_set},
-        {rlog_shard, ?SCHEMA_REGISTRY_SHARD},
-        {storage, ram_copies},
-        {record_name, serde},
-        {attributes, record_info(fields, serde)}
-    ]),
+    ok = emqx_utils_ets:new(?SERDE_TAB, [public, ordered_set, {keypos, #serde.name}]),
+    %% have to create the table for jesse_database otherwise the on-demand table will disappear
+    %% when the caller process dies
+    ok = emqx_utils_ets:new(jesse_ets, [public, ordered_set]),
     ok = mria:create_table(?PROTOBUF_CACHE_TAB, [
         {type, set},
         {rlog_shard, ?SCHEMA_REGISTRY_SHARD},
@@ -228,7 +175,7 @@ create_tables() ->
         {record_name, protobuf_cache},
         {attributes, record_info(fields, protobuf_cache)}
     ]),
-    ok = mria:wait_for_tables([?SERDE_TAB, ?PROTOBUF_CACHE_TAB]),
+    ok = mria:wait_for_tables([?PROTOBUF_CACHE_TAB]),
     ok.
 
 do_build_serdes(Schemas) ->
@@ -290,15 +237,8 @@ do_build_serde(Name, Serde) when not is_binary(Name) ->
     do_build_serde(to_bin(Name), Serde);
 do_build_serde(Name, #{type := Type, source := Source}) ->
     try
-        {Serializer, Deserializer, Destructor} =
-            emqx_schema_registry_serde:make_serde(Type, Name, Source),
-        Serde = #serde{
-            name = Name,
-            serializer = Serializer,
-            deserializer = Deserializer,
-            destructor = Destructor
-        },
-        ok = mria:dirty_write(?SERDE_TAB, Serde),
+        Serde = emqx_schema_registry_serde:make_serde(Type, Name, Source),
+        true = ets:insert(?SERDE_TAB, Serde),
         ok
     catch
         Kind:Error:Stacktrace ->
@@ -320,9 +260,11 @@ ensure_serde_absent(Name) when not is_binary(Name) ->
     ensure_serde_absent(to_bin(Name));
 ensure_serde_absent(Name) ->
     case get_serde(Name) of
-        {ok, #{destructor := Destructor}} ->
-            Destructor(),
-            ok = mria:dirty_delete(?SERDE_TAB, Name);
+        {ok, Serde} ->
+            ok = emqx_schema_registry_serde:destroy(Serde),
+            _ = ets:delete(?SERDE_TAB, Name),
+            ?tp("schema_registry_serde_deleted", #{name => Name}),
+            ok;
         {error, not_found} ->
             ok
     end.
@@ -333,11 +275,25 @@ async_delete_serdes(Names) ->
 to_bin(A) when is_atom(A) -> atom_to_binary(A);
 to_bin(B) when is_binary(B) -> B.
 
--spec serde_to_map(serde()) -> serde_map().
-serde_to_map(#serde{} = Serde) ->
-    #{
-        name => Serde#serde.name,
-        serializer => Serde#serde.serializer,
-        deserializer => Serde#serde.deserializer,
-        destructor => Serde#serde.destructor
-    }.
+schema_name_bin_to_atom(Bin) when size(Bin) > 255 ->
+    Msg = iolist_to_binary(
+        io_lib:format(
+            "Name is is too long."
+            " Please provide a shorter name (<= 255 bytes)."
+            " The name that is too long: \"~s\"",
+            [Bin]
+        )
+    ),
+    Reason = #{
+        kind => validation_error,
+        reason => ?BAD_SCHEMA_NAME,
+        hint => Msg
+    },
+    throw(Reason);
+schema_name_bin_to_atom(Bin) ->
+    try
+        binary_to_existing_atom(Bin, utf8)
+    catch
+        error:badarg ->
+            throw(not_found)
+    end.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,23 +16,28 @@
 -module(emqx_utils_maps).
 
 -export([
-    deep_get/2,
-    deep_get/3,
-    deep_find/2,
-    deep_put/3,
-    deep_force_put/3,
-    deep_remove/2,
-    deep_merge/2,
+    best_effort_recursive_sum/3,
     binary_key_map/1,
-    safe_atom_key_map/1,
-    unsafe_atom_key_map/1,
-    jsonable_map/1,
-    jsonable_map/2,
     binary_string/1,
     deep_convert/3,
+    deep_find/2,
+    deep_force_put/3,
+    deep_get/2,
+    deep_get/3,
+    deep_merge/2,
+    deep_put/3,
+    deep_remove/2,
     diff_maps/2,
-    best_effort_recursive_sum/3,
     if_only_to_toggle_enable/2,
+    indent/3,
+    jsonable_map/1,
+    jsonable_map/2,
+    key_comparer/1,
+    put_if/4,
+    rename/3,
+    safe_atom_key_map/1,
+    unindent/2,
+    unsafe_atom_key_map/1,
     update_if_present/3
 ]).
 
@@ -153,7 +158,9 @@ deep_convert(Val, _, _Args) ->
 unsafe_atom_key_map(Map) ->
     convert_keys_to_atom(Map, fun(K) -> binary_to_atom(K, utf8) end).
 
--spec binary_key_map(map()) -> map().
+-spec binary_key_map
+    (map()) -> map();
+    (list()) -> list().
 binary_key_map(Map) ->
     deep_convert(
         Map,
@@ -303,3 +310,44 @@ update_if_present(Key, Fun, Map) ->
         _ ->
             Map
     end.
+
+put_if(Acc, K, V, true) ->
+    Acc#{K => V};
+put_if(Acc, _K, _V, false) ->
+    Acc.
+
+rename(OldKey, NewKey, Map) ->
+    case maps:find(OldKey, Map) of
+        {ok, Value} ->
+            maps:put(NewKey, Value, maps:remove(OldKey, Map));
+        error ->
+            Map
+    end.
+
+-spec key_comparer(K) -> fun((M, M) -> boolean()) when M :: #{K => _V}.
+key_comparer(K) ->
+    fun
+        (#{K := V1}, #{K := V2}) ->
+            V1 < V2;
+        (#{K := _}, _) ->
+            false;
+        (_, #{K := _}) ->
+            true;
+        (M1, M2) ->
+            M1 < M2
+    end.
+
+-spec indent(term(), [term()], map()) -> map().
+indent(IndentKey, PickKeys, Map) ->
+    maps:put(
+        IndentKey,
+        maps:with(PickKeys, Map),
+        maps:without(PickKeys, Map)
+    ).
+
+-spec unindent(term(), map()) -> map().
+unindent(Key, Map) ->
+    deep_merge(
+        maps:remove(Key, Map),
+        maps:get(Key, Map, #{})
+    ).

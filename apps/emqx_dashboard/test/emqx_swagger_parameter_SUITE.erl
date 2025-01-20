@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 -behaviour(hocon_schema).
 
 %% API
--export([paths/0, api_spec/0, schema/1, fields/1]).
+-export([paths/0, api_spec/0, schema/1, roots/0, namespace/0, fields/1]).
 -export([init_per_suite/1, end_per_suite/1]).
 -export([t_in_path/1, t_in_query/1, t_in_mix/1, t_without_in/1, t_ref/1, t_public_ref/1]).
 -export([t_require/1, t_query_enum/1, t_nullable/1, t_method/1, t_api_spec/1]).
@@ -28,6 +28,7 @@
 -export([all/0, suite/0, groups/0]).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -import(hoconsc, [mk/2]).
@@ -63,11 +64,20 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 t_in_path(_Config) ->
     Expect =
@@ -140,13 +150,13 @@ t_public_ref(_Config) ->
     ExpectRefs = [
         #{
             <<"public.limit">> => #{
-                description => <<"Results per page(max 1000)">>,
+                description => <<"Results per page(max 10000)">>,
                 in => query,
                 name => limit,
                 example => 50,
                 schema => #{
                     default => 100,
-                    maximum => 1000,
+                    maximum => 10000,
                     minimum => 1,
                     type => integer
                 }
@@ -561,6 +571,9 @@ schema("/method/ok") ->
     );
 schema("/method/error") ->
     #{operationId => test, bar => #{200 => <<"ok">>}}.
+
+namespace() -> undefined.
+roots() -> [].
 
 fields(page) ->
     [

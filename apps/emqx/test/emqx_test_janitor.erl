@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -91,7 +91,7 @@ do_terminate(Callbacks) ->
                 Failed
             catch
                 K:E:S ->
-                    ct:pal("error executing callback ~p: ~p", [Fun, {K, E}]),
+                    ct:pal("error executing callback ~p:\n  ~p", [Fun, {K, E}]),
                     ct:pal("stacktrace: ~p", [S]),
                     [Fun | Failed]
             end

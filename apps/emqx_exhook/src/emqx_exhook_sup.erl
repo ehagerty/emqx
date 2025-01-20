@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -39,6 +39,10 @@
     shutdown => Timeout
 }).
 
+%% TODO: export_type:
+%% grpc_client_sup:options/0
+-type grpc_client_sup_options() :: map().
+
 %%--------------------------------------------------------------------
 %%  Supervisor APIs & Callbacks
 %%--------------------------------------------------------------------
@@ -59,7 +63,7 @@ init([]) ->
 -spec start_grpc_client_channel(
     binary(),
     uri_string:uri_string(),
-    grpc_client_sup:options()
+    grpc_client_sup_options()
 ) -> {ok, pid()} | {error, term()}.
 start_grpc_client_channel(Name, SvrAddr, Options) ->
     grpc_client_sup:create_channel_pool(Name, SvrAddr, Options).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,21 +21,18 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
--include_lib("emqx/src/bpapi/emqx_bpapi.hrl").
+-include("../src/bpapi/emqx_bpapi.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([emqx]),
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
     [mnesia:dirty_write(Rec) || Rec <- fake_records()],
-    Config.
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     meck:unload(),
-    [mnesia:dirty_delete({?TAB, Key}) || #?TAB{key = Key} <- fake_records()],
-    emqx_bpapi:announce(emqx),
-    emqx_common_test_helpers:stop_apps([emqx]),
-    ok.
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 t_max_supported_version(_Config) ->
     ?assertMatch(3, emqx_bpapi:supported_version('fake-node2@localhost', api2)),
@@ -47,10 +44,11 @@ t_announce(Config) ->
     meck:new(emqx_bpapi, [passthrough, no_history]),
     Filename = filename:join(?config(data_dir, Config), "test.versions"),
     meck:expect(emqx_bpapi, versions_file, fun(_) -> Filename end),
-    ?assertMatch(ok, emqx_bpapi:announce(emqx)),
+    FakeNode = 'fake-node@127.0.0.1',
+    ?assertMatch(ok, emqx_bpapi:announce(FakeNode, emqx)),
     timer:sleep(100),
-    ?assertMatch(4, emqx_bpapi:supported_version(node(), api2)),
-    ?assertMatch(2, emqx_bpapi:supported_version(node(), api1)),
+    ?assertMatch(4, emqx_bpapi:supported_version(FakeNode, api2)),
+    ?assertMatch(2, emqx_bpapi:supported_version(FakeNode, api1)),
     ?assertMatch(2, emqx_bpapi:supported_version(api2)),
     ?assertMatch(2, emqx_bpapi:supported_version(api1)).
 

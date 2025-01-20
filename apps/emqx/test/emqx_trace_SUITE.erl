@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_trace.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("kernel/include/file.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 
 %%--------------------------------------------------------------------
 %% Setups
@@ -33,17 +35,22 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:start_apps([]),
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
     Listeners = emqx_listeners:list(),
     ct:pal("emqx_listeners:list() = ~p~n", [Listeners]),
     ?assertMatch(
         [_ | _],
         [ID || {ID, #{running := true}} <- Listeners]
     ),
-    Config.
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    ok = emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
     reload(),
@@ -52,6 +59,7 @@ init_per_testcase(_, Config) ->
     Config.
 
 end_per_testcase(_) ->
+    snabbkaffe:stop(),
     ok.
 
 t_base_create_delete(_Config) ->
@@ -89,7 +97,7 @@ t_base_create_delete(_Config) ->
             start_at => Now,
             end_at => Now + 30 * 60,
             payload_encode => text,
-            extra => #{}
+            formatter => text
         }
     ],
     ?assertEqual(ExpectFormat, emqx_trace:format([TraceRec])),
@@ -274,7 +282,6 @@ t_load_state(_Config) ->
     ok.
 
 t_client_event(_Config) ->
-    application:set_env(emqx, allow_anonymous, true),
     ClientId = <<"client-test">>,
     Now = erlang:system_time(second),
     Name = <<"test_client_id_event">>,
@@ -310,6 +317,61 @@ t_client_event(_Config) ->
     ?assert(erlang:byte_size(Bin) > 0),
     ?assert(erlang:byte_size(Bin) < erlang:byte_size(Bin2)),
     ?assert(erlang:byte_size(Bin3) > 0),
+    ok.
+
+t_client_huge_payload_truncated(_Config) ->
+    ClientId = <<"client-truncated1">>,
+    Now = erlang:system_time(second),
+    Name = <<"test_client_id_truncated1">>,
+    {ok, _} = emqx_trace:create([
+        {<<"name">>, Name},
+        {<<"type">>, clientid},
+        {<<"clientid">>, ClientId},
+        {<<"start_at">>, Now}
+    ]),
+    ok = emqx_trace_handler_SUITE:filesync(Name, clientid),
+    {ok, Client} = emqtt:start_link([{clean_start, true}, {clientid, ClientId}]),
+    {ok, _} = emqtt:connect(Client),
+    emqtt:ping(Client),
+    NormalPayload = iolist_to_binary(lists:duplicate(1024, "x")),
+    Size1 = 1025,
+    TruncatedBytes1 = Size1 - ?TRUNCATED_PAYLOAD_SIZE,
+    HugePayload1 = iolist_to_binary(lists:duplicate(Size1, "y")),
+    Size2 = 1024 * 10,
+    HugePayload2 = iolist_to_binary(lists:duplicate(Size2, "z")),
+    TruncatedBytes2 = Size2 - ?TRUNCATED_PAYLOAD_SIZE,
+    ok = emqtt:publish(Client, <<"/test">>, #{}, NormalPayload, [{qos, 0}]),
+    ok = emqx_trace_handler_SUITE:filesync(Name, clientid),
+    {ok, _} = emqx_trace:create([
+        {<<"name">>, <<"test_topic">>},
+        {<<"type">>, topic},
+        {<<"topic">>, <<"/test">>},
+        {<<"start_at">>, Now}
+    ]),
+    ok = emqx_trace_handler_SUITE:filesync(<<"test_topic">>, topic),
+    {ok, Bin} = file:read_file(emqx_trace:log_file(Name, Now)),
+    ok = emqtt:publish(Client, <<"/test">>, #{}, NormalPayload, [{qos, 0}]),
+    ok = emqtt:publish(Client, <<"/test">>, #{}, HugePayload1, [{qos, 0}]),
+    ok = emqtt:publish(Client, <<"/test">>, #{}, HugePayload2, [{qos, 0}]),
+    ok = emqtt:disconnect(Client),
+    ok = emqx_trace_handler_SUITE:filesync(Name, clientid),
+    ok = emqx_trace_handler_SUITE:filesync(<<"test_topic">>, topic),
+    {ok, Bin2} = file:read_file(emqx_trace:log_file(Name, Now)),
+    {ok, Bin3} = file:read_file(emqx_trace:log_file(<<"test_topic">>, Now)),
+    ?assert(erlang:byte_size(Bin) > 1024),
+    ?assert(erlang:byte_size(Bin) < erlang:byte_size(Bin2)),
+    ?assert(erlang:byte_size(Bin3) > 1024),
+
+    %% Don't have format crash
+    CrashBin = <<"CRASH">>,
+    ?assertEqual(nomatch, binary:match(Bin, [CrashBin])),
+    ?assertEqual(nomatch, binary:match(Bin2, [CrashBin])),
+    ?assertEqual(nomatch, binary:match(Bin3, [CrashBin])),
+    Re = <<"\\.\\.\\.\\([0-9]+\\sbytes\\)">>,
+    ?assertMatch(nomatch, re:run(Bin, Re, [unicode])),
+    ReN = fun(N) -> iolist_to_binary(["\\.\\.\\.\\(", integer_to_list(N), "\\sbytes\\)"]) end,
+    ?assertMatch({match, _}, re:run(Bin2, ReN(TruncatedBytes1), [unicode])),
+    ?assertMatch({match, _}, re:run(Bin3, ReN(TruncatedBytes2), [unicode])),
     ok.
 
 t_get_log_filename(_Config) ->
@@ -401,6 +463,36 @@ t_migrate_trace(_Config) ->
     ),
     ok.
 
+%% If no relevant event occurred, the log file size must be exactly 0 after stopping the trace.
+t_empty_trace_log_file(_Config) ->
+    ?check_trace(
+        begin
+            Now = erlang:system_time(second),
+            Name = <<"empty_trace_log">>,
+            Trace = [
+                {<<"name">>, Name},
+                {<<"type">>, clientid},
+                {<<"clientid">>, <<"test_trace_no_clientid_1">>},
+                {<<"start_at">>, Now},
+                {<<"end_at">>, Now + 100}
+            ],
+            ?wait_async_action(
+                ?assertMatch({ok, _}, emqx_trace:create(Trace)),
+                #{?snk_kind := update_trace_done}
+            ),
+            ok = emqx_trace_handler_SUITE:filesync(Name, clientid),
+            {ok, Filename} = emqx_trace:get_trace_filename(Name),
+            ?assertMatch({ok, #{size := 0}}, emqx_trace:trace_file_detail(Filename)),
+            ?wait_async_action(
+                ?assertEqual(ok, emqx_trace:update(Name, false)),
+                #{?snk_kind := update_trace_done}
+            ),
+            ?assertMatch({ok, #{size := 0}}, emqx_trace:trace_file_detail(Filename)),
+            ?assertEqual(ok, emqx_trace:delete(Name))
+        end,
+        []
+    ).
+
 build_new_trace_data() ->
     Now = erlang:system_time(second),
     {ok, _} = emqx_trace:create([
@@ -421,4 +513,13 @@ build_old_trace_data() ->
 
 reload() ->
     catch ok = gen_server:stop(emqx_trace),
-    {ok, _Pid} = emqx_trace:start_link().
+    case emqx_trace:start_link() of
+        {ok, _Pid} = Res ->
+            Res;
+        NotOKRes ->
+            ct:pal(
+                "emqx_trace:start_link() gave result: ~p\n"
+                "(perhaps it is already started)",
+                [NotOKRes]
+            )
+    end.

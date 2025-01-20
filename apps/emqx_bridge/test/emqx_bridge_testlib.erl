@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_testlib).
 
@@ -92,7 +92,7 @@ end_per_testcase(_Testcase, Config) ->
 delete_all_bridges() ->
     lists:foreach(
         fun(#{name := Name, type := Type}) ->
-            emqx_bridge:remove(Type, Name)
+            ok = emqx_bridge:remove(Type, Name)
         end,
         emqx_bridge:list()
     ).
@@ -105,9 +105,15 @@ parse_and_check(BridgeType, BridgeName, ConfigString) ->
     BridgeConfig.
 
 resource_id(Config) ->
+    BridgeKind = proplists:get_value(bridge_kind, Config, action),
+    ConfRootKey =
+        case BridgeKind of
+            action -> actions;
+            source -> sources
+        end,
     BridgeType = ?config(bridge_type, Config),
     BridgeName = ?config(bridge_name, Config),
-    emqx_bridge_resource:resource_id(BridgeType, BridgeName).
+    emqx_bridge_resource:resource_id(ConfRootKey, BridgeType, BridgeName).
 
 create_bridge(Config) ->
     create_bridge(Config, _Overrides = #{}).
@@ -119,6 +125,22 @@ create_bridge(Config, Overrides) ->
     BridgeConfig = emqx_utils_maps:deep_merge(BridgeConfig0, Overrides),
     ct:pal("creating bridge with config: ~p", [BridgeConfig]),
     emqx_bridge:create(BridgeType, BridgeName, BridgeConfig).
+
+list_bridges_api() ->
+    Params = [],
+    Path = emqx_mgmt_api_test_util:api_path(["bridges"]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    Opts = #{return_all => true},
+    ct:pal("listing bridges (via http)"),
+    Res =
+        case emqx_mgmt_api_test_util:request_api(get, Path, "", AuthHeader, Params, Opts) of
+            {ok, {Status, Headers, Body0}} ->
+                {ok, {Status, Headers, emqx_utils_json:decode(Body0, [return_maps])}};
+            Error ->
+                Error
+        end,
+    ct:pal("list bridge result: ~p", [Res]),
+    Res.
 
 create_bridge_api(Config) ->
     create_bridge_api(Config, _Overrides = #{}).
@@ -168,23 +190,37 @@ update_bridge_api(Config, Overrides) ->
     ct:pal("bridge update result: ~p", [Res]),
     Res.
 
+get_bridge_api(Config) ->
+    BridgeType = ?config(bridge_type, Config),
+    Name = ?config(bridge_name, Config),
+    BridgeId = emqx_bridge_resource:bridge_id(BridgeType, Name),
+    Path = emqx_mgmt_api_test_util:api_path(["bridges", BridgeId]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    ct:pal("getting bridge (via http)", []),
+    Res =
+        case emqx_mgmt_api_test_util:request_api(get, Path, "", AuthHeader) of
+            {ok, Body0} -> {ok, emqx_utils_json:decode(Body0, [return_maps])};
+            Error -> Error
+        end,
+    ct:pal("bridge result: ~p", [Res]),
+    Res.
+
+delete_bridge_http_api_v1(Opts) ->
+    #{type := Type, name := Name} = Opts,
+    BridgeId = emqx_bridge_resource:bridge_id(Type, Name),
+    Path = emqx_mgmt_api_test_util:api_path(["bridges", BridgeId]),
+    ct:pal("deleting bridge (http v1)"),
+    Res = emqx_bridge_v2_testlib:request(delete, Path, _Params = []),
+    ct:pal("bridge delete (http v1) result:\n  ~p", [Res]),
+    Res.
+
 op_bridge_api(Op, BridgeType, BridgeName) ->
     BridgeId = emqx_bridge_resource:bridge_id(BridgeType, BridgeName),
     Path = emqx_mgmt_api_test_util:api_path(["bridges", BridgeId, Op]),
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    Opts = #{return_all => true},
     ct:pal("calling bridge ~p (via http): ~p", [BridgeId, Op]),
-    Res =
-        case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, "", Opts) of
-            {ok, {Status = {_, 204, _}, Headers, Body}} ->
-                {ok, {Status, Headers, Body}};
-            {ok, {Status, Headers, Body}} ->
-                {ok, {Status, Headers, emqx_utils_json:decode(Body, [return_maps])}};
-            {error, {Status, Headers, Body}} ->
-                {error, {Status, Headers, emqx_utils_json:decode(Body, [return_maps])}};
-            Error ->
-                Error
-        end,
+    Method = post,
+    Params = [],
+    Res = emqx_bridge_v2_testlib:request(Method, Path, Params),
     ct:pal("bridge op result: ~p", [Res]),
     Res.
 
@@ -231,11 +267,14 @@ create_rule_and_action_http(BridgeType, RuleTopic, Config) ->
 create_rule_and_action_http(BridgeType, RuleTopic, Config, Opts) ->
     BridgeName = ?config(bridge_name, Config),
     BridgeId = emqx_bridge_resource:bridge_id(BridgeType, BridgeName),
+    create_rule_and_action(BridgeId, RuleTopic, Opts).
+
+create_rule_and_action(Action, RuleTopic, Opts) ->
     SQL = maps:get(sql, Opts, <<"SELECT * FROM \"", RuleTopic/binary, "\"">>),
     Params = #{
         enable => true,
         sql => SQL,
-        actions => [BridgeId]
+        actions => [Action]
     },
     Path = emqx_mgmt_api_test_util:api_path(["rules"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
@@ -249,32 +288,42 @@ create_rule_and_action_http(BridgeType, RuleTopic, Config, Opts) ->
             Error
     end.
 
+make_message(Config, MakeMessageFun) ->
+    BridgeType = ?config(bridge_type, Config),
+    case emqx_bridge_v2:is_bridge_v2_type(BridgeType) of
+        true ->
+            BridgeId = emqx_bridge_v2_testlib:bridge_id(Config),
+            {BridgeId, MakeMessageFun()};
+        false ->
+            {send_message, MakeMessageFun()}
+    end.
+
 %%------------------------------------------------------------------------------
 %% Testcases
 %%------------------------------------------------------------------------------
 
 t_sync_query(Config, MakeMessageFun, IsSuccessCheck, TracePoint) ->
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             ?assertMatch({ok, _}, create_bridge_api(Config)),
+            ResourceId = resource_id(Config),
             ?retry(
                 _Sleep = 1_000,
                 _Attempts = 20,
                 ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
             ),
-            Message = {send_message, MakeMessageFun()},
+            Message = make_message(Config, MakeMessageFun),
             IsSuccessCheck(emqx_resource:simple_sync_query(ResourceId, Message)),
             ok
         end,
         fun(Trace) ->
+            ResourceId = resource_id(Config),
             ?assertMatch([#{instance_id := ResourceId}], ?of_kind(TracePoint, Trace))
         end
     ),
     ok.
 
 t_async_query(Config, MakeMessageFun, IsSuccessCheck, TracePoint) ->
-    ResourceId = resource_id(Config),
     ReplyFun =
         fun(Pid, Result) ->
             Pid ! {result, Result}
@@ -282,12 +331,13 @@ t_async_query(Config, MakeMessageFun, IsSuccessCheck, TracePoint) ->
     ?check_trace(
         begin
             ?assertMatch({ok, _}, create_bridge_api(Config)),
+            ResourceId = resource_id(Config),
             ?retry(
                 _Sleep = 1_000,
                 _Attempts = 20,
                 ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
             ),
-            Message = {send_message, MakeMessageFun()},
+            Message = make_message(Config, MakeMessageFun),
             ?assertMatch(
                 {ok, {ok, _}},
                 ?wait_async_action(
@@ -301,6 +351,7 @@ t_async_query(Config, MakeMessageFun, IsSuccessCheck, TracePoint) ->
             ok
         end,
         fun(Trace) ->
+            ResourceId = resource_id(Config),
             ?assertMatch([#{instance_id := ResourceId}], ?of_kind(TracePoint, Trace))
         end
     ),
@@ -342,7 +393,6 @@ t_start_stop(Config, StopTracePoint) ->
     t_start_stop(BridgeType, BridgeName, BridgeConfig, StopTracePoint).
 
 t_start_stop(BridgeType, BridgeName, BridgeConfig, StopTracePoint) ->
-    ResourceId = emqx_bridge_resource:resource_id(BridgeType, BridgeName),
     ?check_trace(
         begin
             %% Check that the bridge probe API doesn't leak atoms.
@@ -365,6 +415,7 @@ t_start_stop(BridgeType, BridgeName, BridgeConfig, StopTracePoint) ->
             ?assertEqual(AtomsBefore, AtomsAfter),
 
             ?assertMatch({ok, _}, emqx_bridge:create(BridgeType, BridgeName, BridgeConfig)),
+            ResourceId = emqx_bridge_resource:resource_id(BridgeType, BridgeName),
 
             %% Since the connection process is async, we give it some time to
             %% stabilize and avoid flakiness.
@@ -428,6 +479,7 @@ t_start_stop(BridgeType, BridgeName, BridgeConfig, StopTracePoint) ->
             ok
         end,
         fun(Trace) ->
+            ResourceId = emqx_bridge_resource:resource_id(BridgeType, BridgeName),
             %% one for each probe, two for real
             ?assertMatch(
                 [_, _, #{instance_id := ResourceId}, #{instance_id := ResourceId}],
@@ -445,9 +497,9 @@ t_on_get_status(Config, Opts) ->
     ProxyPort = ?config(proxy_port, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyName = ?config(proxy_name, Config),
-    ResourceId = resource_id(Config),
     FailureStatus = maps:get(failure_status, Opts, disconnected),
     ?assertMatch({ok, _}, create_bridge(Config)),
+    ResourceId = resource_id(Config),
     %% Since the connection process is async, we give it some time to
     %% stabilize and avoid flakiness.
     ?retry(

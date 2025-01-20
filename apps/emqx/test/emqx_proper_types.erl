@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 -include_lib("proper/include/proper.hrl").
 -include("emqx.hrl").
+-include("emqx_session_mem.hrl").
 -include("emqx_access_control.hrl").
 
 %% High level Types
@@ -49,12 +50,14 @@
     printable_utf8/0,
     printable_codepoint/0,
     raw_duration/0,
-    large_raw_duration/0
+    large_raw_duration/0,
+    clientid/0
 ]).
 
 %% Generic Types
 -export([
     scaled/2,
+    logscaled/2,
     fixedmap/1
 ]).
 
@@ -106,14 +109,15 @@ clientinfo() ->
     Keys = [
         {zone, zone()},
         {protocol, protocol()},
+        {peername, peername()},
         {peerhost, ip()},
         {sockport, port()},
         {clientid, clientid()},
         {username, username()},
         {is_bridge, boolean()},
         {is_supuser, boolean()},
-        {mountpoint, maybe(utf8())},
-        {ws_cookie, maybe(list())}
+        {mountpoint, option(utf8())},
+        {ws_cookie, option(list())}
         % password,
         % auth_result,
         % anonymous,
@@ -132,33 +136,22 @@ clientinfo() ->
 sessioninfo() ->
     ?LET(
         Session,
-        {session, clientid(),
-            % id
-            sessionid(),
-            % is_persistent
-            boolean(),
-            % subscriptions
-            subscriptions(),
-            % max_subscriptions
-            non_neg_integer(),
-            % upgrade_qos
-            boolean(),
-            % emqx_inflight:inflight()
-            inflight(),
-            % emqx_mqueue:mqueue()
-            mqueue(),
-            % next_pkt_id
-            packet_id(),
-            % retry_interval
-            safty_timeout(),
-            % awaiting_rel
-            awaiting_rel(),
-            % max_awaiting_rel
-            non_neg_integer(),
-            % await_rel_timeout
-            safty_timeout(),
-            % created_at
-            timestamp()},
+        #session{
+            clientid = clientid(),
+            id = sessionid(),
+            is_persistent = boolean(),
+            subscriptions = subscriptions(),
+            max_subscriptions = non_neg_integer(),
+            upgrade_qos = boolean(),
+            inflight = inflight(),
+            mqueue = mqueue(),
+            next_pkt_id = packet_id(),
+            retry_interval = safty_timeout(),
+            awaiting_rel = awaiting_rel(),
+            max_awaiting_rel = non_neg_integer(),
+            await_rel_timeout = safty_timeout(),
+            created_at = timestamp()
+        },
         emqx_session:info(Session)
     ).
 
@@ -505,7 +498,7 @@ pubsub() ->
 %% Basic Types
 %%--------------------------------------------------------------------
 
-maybe(T) ->
+option(T) ->
     oneof([undefined, T]).
 
 socktype() ->
@@ -521,13 +514,7 @@ peercert() ->
 conn_mod() ->
     oneof([
         emqx_connection,
-        emqx_ws_connection,
-        emqx_coap_mqtt_adapter,
-        emqx_sn_gateway,
-        emqx_lwm2m_protocol,
-        emqx_gbt32960_conn,
-        emqx_jt808_connection,
-        emqx_tcp_connection
+        emqx_ws_connection
     ]).
 
 proto_name() ->
@@ -537,7 +524,7 @@ clientid() ->
     utf8().
 
 username() ->
-    maybe(utf8()).
+    option(utf8()).
 
 properties() ->
     map(limited_latin_atom(), binary()).
@@ -704,6 +691,10 @@ limited_list(N, T) ->
 -spec scaled(number(), proptype()) -> proptype().
 scaled(F, T) when F > 0 ->
     ?SIZED(S, resize(round(S * F), T)).
+
+-spec logscaled(number(), proptype()) -> proptype().
+logscaled(F, T) when F > 0 ->
+    ?SIZED(S, resize(round(math:log(S + 1) * F), T)).
 
 -spec fixedmap(#{_Key => proptype()}) -> proptype().
 fixedmap(M) ->

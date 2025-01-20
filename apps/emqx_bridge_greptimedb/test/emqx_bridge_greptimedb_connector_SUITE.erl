@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_greptimedb_connector_SUITE).
@@ -25,11 +25,17 @@ init_per_suite(Config) ->
     Servers = [{GreptimedbTCPHost, GreptimedbTCPPort}],
     case emqx_common_test_helpers:is_all_tcp_servers_available(Servers) of
         true ->
-            ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource]),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            {ok, _} = application:ensure_all_started(greptimedb),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_greptimedb,
+                    emqx_bridge
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             [
+                {apps, Apps},
                 {greptimedb_tcp_host, GreptimedbTCPHost},
                 {greptimedb_tcp_port, GreptimedbTCPPort}
                 | Config
@@ -43,11 +49,9 @@ init_per_suite(Config) ->
             end
     end.
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_resource]),
-    _ = application:stop(emqx_connector),
-    _ = application:stop(greptimedb),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(_, Config) ->
@@ -65,7 +69,7 @@ t_lifecycle(Config) ->
     Port = ?config(greptimedb_tcp_port, Config),
     perform_lifecycle_check(
         <<"emqx_bridge_greptimedb_connector_SUITE">>,
-        greptimedb_config(Host, Port)
+        greptimedb_connector_config(Host, Port)
     ).
 
 perform_lifecycle_check(PoolName, InitialConfig) ->
@@ -75,6 +79,7 @@ perform_lifecycle_check(PoolName, InitialConfig) ->
     % expects this
     FullConfig = CheckedConfig#{write_syntax => greptimedb_write_syntax()},
     {ok, #{
+        id := ResourceId,
         state := #{client := #{pool := ReturnedPoolName}} = State,
         status := InitialStatus
     }} = emqx_resource:create_local(
@@ -92,8 +97,13 @@ perform_lifecycle_check(PoolName, InitialConfig) ->
     }} =
         emqx_resource:get_instance(PoolName),
     ?assertEqual({ok, connected}, emqx_resource:health_check(PoolName)),
+    %% install actions to the connector
+    ActionConfig = greptimedb_action_config(),
+    ChannelId = <<"test_channel">>,
+    ?assertEqual(ok, emqx_resource_manager:add_channel(ResourceId, ChannelId, ActionConfig)),
+    ?assertMatch(#{status := connected}, emqx_resource:channel_health_check(ResourceId, ChannelId)),
     % % Perform query as further check that the resource is working as expected
-    ?assertMatch({ok, _}, emqx_resource:query(PoolName, test_query())),
+    ?assertMatch({ok, _}, emqx_resource:query(PoolName, test_query(ChannelId))),
     ?assertEqual(ok, emqx_resource:stop(PoolName)),
     % Resource will be listed still, but state will be changed and healthcheck will fail
     % as the worker no longer exists.
@@ -115,7 +125,9 @@ perform_lifecycle_check(PoolName, InitialConfig) ->
     {ok, ?CONNECTOR_RESOURCE_GROUP, #{status := InitialStatus}} =
         emqx_resource:get_instance(PoolName),
     ?assertEqual({ok, connected}, emqx_resource:health_check(PoolName)),
-    ?assertMatch({ok, _}, emqx_resource:query(PoolName, test_query())),
+    ?assertEqual(ok, emqx_resource_manager:add_channel(ResourceId, ChannelId, ActionConfig)),
+    ?assertMatch(#{status := connected}, emqx_resource:channel_health_check(ResourceId, ChannelId)),
+    ?assertMatch({ok, _}, emqx_resource:query(PoolName, test_query(ChannelId))),
     % Stop and remove the resource in one go.
     ?assertEqual(ok, emqx_resource:remove_local(PoolName)),
     ?assertEqual({error, not_found}, ecpool:stop_sup_pool(ReturnedPoolName)),
@@ -126,7 +138,7 @@ perform_lifecycle_check(PoolName, InitialConfig) ->
 % %% Helpers
 % %%------------------------------------------------------------------------------
 
-greptimedb_config(Host, Port) ->
+greptimedb_connector_config(Host, Port) ->
     Server = list_to_binary(io_lib:format("~s:~b", [Host, Port])),
     ResourceConfig = #{
         <<"dbname">> => <<"public">>,
@@ -135,6 +147,14 @@ greptimedb_config(Host, Port) ->
         <<"password">> => <<"greptime_pwd">>
     },
     #{<<"config">> => ResourceConfig}.
+
+greptimedb_action_config() ->
+    #{
+        parameters => #{
+            write_syntax => greptimedb_write_syntax(),
+            precision => ms
+        }
+    }.
 
 greptimedb_write_syntax() ->
     [
@@ -146,8 +166,8 @@ greptimedb_write_syntax() ->
         }
     ].
 
-test_query() ->
-    {send_message, #{
+test_query(ChannelId) ->
+    {ChannelId, #{
         <<"clientid">> => <<"something">>,
         <<"payload">> => #{bool => true},
         <<"topic">> => <<"connector_test">>,

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -27,7 +27,12 @@
     publish/1,
     subscribe/3,
     unsubscribe/2,
-    log/3
+    log/3,
+    log/4,
+    rendered_action_template/2,
+    make_rendered_action_template_trace_context/1,
+    rendered_action_template_with_ctx/2,
+    is_rule_trace_active/0
 ]).
 
 -export([
@@ -65,6 +70,15 @@
 -export_type([ip_address/0]).
 -type ip_address() :: string().
 
+-export_type([ruleid/0]).
+-type ruleid() :: binary().
+
+-export_type([rendered_action_template_ctx/0]).
+-opaque rendered_action_template_ctx() :: #{
+    trace_ctx := map(),
+    action_id := any()
+}.
+
 publish(#message{topic = <<"$SYS/", _/binary>>}) ->
     ignore;
 publish(#message{from = From, topic = Topic, payload = Payload}) when
@@ -82,8 +96,103 @@ unsubscribe(<<"$SYS/", _/binary>>, _SubOpts) ->
 unsubscribe(Topic, SubOpts) ->
     ?TRACE("UNSUBSCRIBE", "unsubscribe", #{topic => Topic, sub_opts => SubOpts}).
 
+rendered_action_template(<<"action:", _/binary>> = ActionID, RenderResult) ->
+    do_rendered_action_template(ActionID, RenderResult);
+rendered_action_template(#{mod := _, func := _} = ActionID, RenderResult) ->
+    do_rendered_action_template(ActionID, RenderResult);
+rendered_action_template(_ActionID, _RenderResult) ->
+    %% We do nothing if we don't get a valid Action ID. This can happen when
+    %% called from connectors that are used for actions as well as authz and
+    %% authn.
+    ok.
+
+do_rendered_action_template(ActionID, RenderResult) ->
+    TraceResult = ?TRACE(
+        "QUERY_RENDER",
+        "action_template_rendered",
+        #{
+            result => RenderResult,
+            action_id => ActionID
+        }
+    ),
+    case logger:get_process_metadata() of
+        #{stop_action_after_render := true} ->
+            %% We throw an unrecoverable error to stop action before the
+            %% resource is called/modified
+            ActionIDStr =
+                case ActionID of
+                    Bin when is_binary(Bin) ->
+                        Bin;
+                    Term ->
+                        ActionIDFormatted = io_lib:format("~tw", [Term]),
+                        unicode:characters_to_binary(ActionIDFormatted)
+                end,
+            StopMsg =
+                io_lib:format(
+                    "Action ~ts stopped after template rendering due to test setting.",
+                    [ActionIDStr]
+                ),
+            MsgBin = unicode:characters_to_binary(StopMsg),
+            error(?EMQX_TRACE_STOP_ACTION(MsgBin));
+        _ ->
+            ok
+    end,
+    TraceResult.
+
+%% The following two functions are used for connectors that don't do the
+%% rendering in the main process (the one that called on_*query). In this case
+%% we need to pass the trace context to the sub process that do the rendering
+%% so that the result of the rendering can be traced correctly. It is also
+%% important to  ensure that the error that can be thrown from
+%% rendered_action_template_with_ctx is handled in the appropriate way in the
+%% sub process.
+-spec make_rendered_action_template_trace_context(any()) -> rendered_action_template_ctx().
+make_rendered_action_template_trace_context(ActionID) ->
+    MetaData =
+        case logger:get_process_metadata() of
+            undefined -> #{};
+            M -> M
+        end,
+    #{trace_ctx => MetaData, action_id => ActionID}.
+
+-spec rendered_action_template_with_ctx(rendered_action_template_ctx(), Result :: term()) -> term().
+rendered_action_template_with_ctx(
+    #{
+        trace_ctx := LogMetaData,
+        action_id := ActionID
+    },
+    RenderResult
+) ->
+    OldMetaData =
+        case logger:get_process_metadata() of
+            undefined -> #{};
+            M -> M
+        end,
+    try
+        logger:set_process_metadata(LogMetaData),
+        emqx_trace:rendered_action_template(
+            ActionID,
+            RenderResult
+        )
+    after
+        logger:set_process_metadata(OldMetaData)
+    end.
+
+is_rule_trace_active() ->
+    case logger:get_process_metadata() of
+        #{rule_id := RID} when is_binary(RID) ->
+            true;
+        #{rule_ids := RIDs} when map_size(RIDs) > 0 ->
+            true;
+        _ ->
+            false
+    end.
+
 log(List, Msg, Meta) ->
-    Log = #{level => debug, meta => enrich_meta(Meta), msg => Msg},
+    log(debug, List, Msg, Meta).
+
+log(Level, List, Msg, Meta) ->
+    Log = #{level => Level, meta => enrich_meta(Meta), msg => Msg},
     log_filter(List, Log).
 
 enrich_meta(Meta) ->
@@ -101,7 +210,7 @@ log_filter([{Id, FilterFun, Filter, Name} | Rest], Log0) ->
         ignore ->
             ignore;
         Log ->
-            case logger_config:get(ets:whereis(logger), Id) of
+            case logger_config:get(logger, Id) of
                 {ok, #{module := Module} = HandlerConfig0} ->
                     HandlerConfig = maps:without(?OWN_KEYS, HandlerConfig0),
                     try
@@ -155,12 +264,14 @@ create(Trace) ->
     case mnesia:table_info(?TRACE, size) < ?MAX_SIZE of
         true ->
             case to_trace(Trace) of
-                {ok, TraceRec} -> insert_new_trace(TraceRec);
-                {error, Reason} -> {error, Reason}
+                {ok, TraceRec} ->
+                    insert_new_trace(TraceRec);
+                {error, Reason} ->
+                    {error, Reason}
             end;
         false ->
             {error,
-                "The number of traces created has reache the maximum"
+                "The number of traces created has reached the maximum"
                 " please delete the useless ones first"}
     end.
 
@@ -218,7 +329,11 @@ format(Traces) ->
     lists:map(
         fun(Trace0 = #?TRACE{}) ->
             [_ | Values] = tuple_to_list(Trace0),
-            maps:from_list(lists:zip(Fields, Values))
+            Map0 = maps:from_list(lists:zip(Fields, Values)),
+            Extra = maps:get(extra, Map0, #{}),
+            Formatter = maps:get(formatter, Extra, text),
+            Map1 = Map0#{formatter => Formatter},
+            maps:remove(extra, Map1)
         end,
         Traces
     ).
@@ -247,14 +362,14 @@ handle_call(check, _From, State) ->
     {_, NewState} = handle_info({mnesia_table_event, check}, State),
     {reply, ok, NewState};
 handle_call(Req, _From, State) ->
-    ?SLOG(error, #{unexpected_call => Req}),
+    ?SLOG(error, #{msg => "unexpected_call", req => Req}),
     {reply, ok, State}.
 
 handle_cast({delete_tag, Pid, Files}, State = #{monitors := Monitors}) ->
     erlang:monitor(process, Pid),
     {noreply, State#{monitors => Monitors#{Pid => Files}}};
 handle_cast(Msg, State) ->
-    ?SLOG(error, #{unexpected_cast => Msg}),
+    ?SLOG(error, #{msg => "unexpected_cast", req => Msg}),
     {noreply, State}.
 
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, State = #{monitors := Monitors}) ->
@@ -275,7 +390,7 @@ handle_info({mnesia_table_event, _Events}, State = #{timer := TRef}) ->
     emqx_utils:cancel_timer(TRef),
     handle_info({timeout, TRef, update_trace}, State);
 handle_info(Info, State) ->
-    ?SLOG(error, #{unexpected_info => Info}),
+    ?SLOG(error, #{msg => "unexpected_info", req => Info}),
     {noreply, State}.
 
 terminate(_Reason, #{timer := TRef}) ->
@@ -290,7 +405,14 @@ code_change(_, State, _Extra) ->
     {ok, State}.
 
 insert_new_trace(Trace) ->
-    transaction(fun emqx_trace_dl:insert_new_trace/1, [Trace]).
+    case transaction(fun emqx_trace_dl:insert_new_trace/1, [Trace]) of
+        {error, _} = Error ->
+            Error;
+        Res ->
+            %% We call this to ensure the trace is active when we return
+            check(),
+            Res
+    end.
 
 update_trace(Traces) ->
     Now = now_second(),
@@ -364,17 +486,31 @@ start_trace(Trace) ->
         type = Type,
         filter = Filter,
         start_at = Start,
-        payload_encode = PayloadEncode
+        payload_encode = PayloadEncode,
+        extra = Extra
     } = Trace,
-    Who = #{name => Name, type => Type, filter => Filter, payload_encode => PayloadEncode},
+    Formatter = maps:get(formatter, Extra, text),
+    Who = #{
+        name => Name,
+        type => Type,
+        filter => Filter,
+        payload_encode => PayloadEncode,
+        formatter => Formatter
+    },
     emqx_trace_handler:install(Who, debug, log_file(Name, Start)).
 
 stop_trace(Finished, Started) ->
     lists:foreach(
-        fun(#{name := Name, type := Type, filter := Filter}) ->
+        fun(#{name := Name, id := HandlerID, dst := FilePath, type := Type, filter := Filter}) ->
             case lists:member(Name, Finished) of
                 true ->
-                    ?TRACE("API", "trace_stopping", #{Type => Filter}),
+                    _ = maybe_sync_logfile(HandlerID),
+                    case file:read_file_info(FilePath) of
+                        {ok, #file_info{size = Size}} when Size > 0 ->
+                            ?TRACE("API", "trace_stopping", #{Type => Filter});
+                        _ ->
+                            ok
+                    end,
                     emqx_trace_handler:uninstall(Type, Name);
                 false ->
                     ok
@@ -382,6 +518,19 @@ stop_trace(Finished, Started) ->
         end,
         Started
     ).
+
+maybe_sync_logfile(HandlerID) ->
+    case logger:get_handler_config(HandlerID) of
+        {ok, #{module := Mod}} ->
+            case erlang:function_exported(Mod, filesync, 1) of
+                true ->
+                    Mod:filesync(HandlerID);
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
 
 clean_stale_trace_files() ->
     TraceDir = trace_dir(),
@@ -494,13 +643,15 @@ to_trace(#{type := ip_address, ip_address := Filter} = Trace, Rec) ->
         Error ->
             Error
     end;
+to_trace(#{type := ruleid, ruleid := Filter} = Trace, Rec) ->
+    Trace0 = maps:without([type, ruleid], Trace),
+    to_trace(Trace0, Rec#?TRACE{type = ruleid, filter = Filter});
 to_trace(#{type := Type}, _Rec) ->
     {error, io_lib:format("required ~s field", [Type])};
 to_trace(#{payload_encode := PayloadEncode} = Trace, Rec) ->
     to_trace(maps:remove(payload_encode, Trace), Rec#?TRACE{payload_encode = PayloadEncode});
 to_trace(#{start_at := StartAt} = Trace, Rec) ->
-    {ok, Sec} = to_system_second(StartAt),
-    to_trace(maps:remove(start_at, Trace), Rec#?TRACE{start_at = Sec});
+    to_trace(maps:remove(start_at, Trace), Rec#?TRACE{start_at = StartAt});
 to_trace(#{end_at := EndAt} = Trace, Rec) ->
     Now = now_second(),
     case to_system_second(EndAt) of
@@ -509,6 +660,12 @@ to_trace(#{end_at := EndAt} = Trace, Rec) ->
         {ok, _Sec} ->
             {error, "end_at time has already passed"}
     end;
+to_trace(#{formatter := Formatter} = Trace, Rec) ->
+    Extra = Rec#?TRACE.extra,
+    to_trace(
+        maps:remove(formatter, Trace),
+        Rec#?TRACE{extra = Extra#{formatter => Formatter}}
+    );
 to_trace(_, Rec) ->
     {ok, Rec}.
 

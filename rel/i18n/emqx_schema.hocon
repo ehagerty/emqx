@@ -92,7 +92,7 @@ mqtt_max_topic_alias.label:
 """Max Topic Alias"""
 
 common_ssl_opts_schema_user_lookup_fun.desc:
-"""EMQX-internal callback that is used to lookup pre-shared key (PSK) identity.</br>
+"""EMQX-internal callback that is used to lookup pre-shared key (PSK) identity.<br/>
 Has no effect when TLS version is configured (or negotiated) to 1.3"""
 
 common_ssl_opts_schema_user_lookup_fun.label:
@@ -113,7 +113,7 @@ sysmon_top_max_procs.label:
 
 mqtt_use_username_as_clientid.desc:
 """Whether to use Username as Client ID.
-This setting takes effect later than <code>Use Peer Certificate as Username</code> and <code>Use peer certificate as Client ID</code>."""
+This setting takes effect later than `peer_cert_as_username` and `peer_cert_as_clientid`."""
 
 mqtt_use_username_as_clientid.label:
 """Use Username as Client ID"""
@@ -148,15 +148,9 @@ mqtt_max_subscriptions.desc:
 mqtt_max_subscriptions.label:
 """Max Subscriptions"""
 
-persistent_session_builtin_messages_table.desc:
-"""Performance tuning options for built-in messages table."""
-
-persistent_session_builtin_messages_table.label:
-"""Persistent messages"""
-
 sysmon_os_cpu_low_watermark.desc:
 """The threshold, as percentage of system CPU load,
- for how much system cpu can be used before the corresponding alarm is cleared."""
+ for how much system cpu can be used before the corresponding alarm is cleared. Disabled on Windows platform"""
 
 sysmon_os_cpu_low_watermark.label:
 """CPU low watermark"""
@@ -190,6 +184,12 @@ mqtt_session_expiry_interval.desc:
 
 mqtt_session_expiry_interval.label:
 """Session Expiry Interval"""
+
+mqtt_message_expiry_interval.desc:
+"""The expiry interval of MQTT messages. For MQTT 5.0 clients, this configuration will only take effect when the `Message-Expiry-Interval` property is not set in the message; otherwise, the value of the `Message-Expiry-Interval` property will be used. For MQTT versions older than 5.0, this configuration will always take effect. Please note that setting `message_expiry_interval` greater than `session_expiry_interval` is meaningless, as all messages will be cleared when the session expires."""
+
+mqtt_message_expiry_interval.label:
+"""Message Expiry Interval"""
 
 fields_listener_enabled.desc:
 """Enable listener."""
@@ -262,15 +262,15 @@ already established connections."""
 common_ssl_opts_schema_cacertfile.label:
 """CACertfile"""
 
-common_ssl_opts_schema_cacerts.desc:
-"""When enabled, uses the system trusted CA certificates for establishing to TLS connections."""
+fields_ws_opts_mqtt_path.desc: """~
+    WebSocket's MQTT protocol path. By default, the full URL for the WebSocket client to connect is:
+    `ws://{host}:{port}/mqtt`.
+    Append `/[...]` to the end of the path to make EMQX accept any subpath.
+    For example, specifying `mqtt/[...]` would allow clients to connect at paths like
+    `mqtt/org1` or `mqtt/group2`, etc.
 
-common_ssl_opts_schema_cacerts.label:
-"""Use System CA Certificates"""
-
-fields_ws_opts_mqtt_path.desc:
-"""WebSocket's MQTT protocol path. So the address of EMQX Broker's WebSocket is:
-<code>ws://{ip}:{port}/mqtt</code>"""
+    NOTE: An unmatched path will cause the client to be rejected immediately at the HTTP layer,
+    meaning it will not be traceable at the MQTT layer."""
 
 fields_ws_opts_mqtt_path.label:
 """WS MQTT Path"""
@@ -278,7 +278,7 @@ fields_ws_opts_mqtt_path.label:
 sysmon_os_procmem_high_watermark.desc:
 """The threshold, as percentage of system memory,
  for how much system memory can be allocated by one Erlang process before
- the corresponding alarm is raised."""
+ the corresponding alarm is raised. Disabled on Windows platform."""
 
 sysmon_os_procmem_high_watermark.label:
 """ProcMem high wartermark"""
@@ -326,7 +326,7 @@ which accepts the connection and performs TLS handshake may differ from the
 host the TLS client initially connects to, e.g. when connecting to an IP address
 or when the host has multiple resolvable DNS records <br/>
 If not specified, it will default to the host name string which is used
-to establish the connection, unless it is IP addressed used.<br/>
+to establish the connection, unless it is IP address used.<br/>
 The host name is then also used in the host name verification of the peer
 certificate.<br/> The special value 'disable' prevents the Server Name
 Indication extension from being sent and disables the hostname
@@ -342,7 +342,13 @@ fields_mqtt_quic_listener_retry_memory_limit.label:
 """Retry memory limit"""
 
 force_shutdown_max_mailbox_size.desc:
-"""In EMQX, each online client corresponds to an individual Erlang process. The configuration value establishes a mailbox size limit for these processes. If the mailbox size surpasses this limit, the client will be automatically terminated."""
+"""EMQX creates at least one lightweight process for each client connection.
+
+Each process has its own message queue (aka mailbox) to hold messages from other processes (e.g. MQTT messages) so that the process can read messages from the message queue (mailbox) at any time.
+
+If the system is busy or the process hangs due to a busy socket (see `high_watermark`), the message queue can accumulate many messages.
+
+To avoid excessive memory usage, EMQX will force a process to shut down when the length of its message queue exceeds `max_mailbox_size`."""
 
 force_shutdown_max_mailbox_size.label:
 """Maximum mailbox size."""
@@ -364,12 +370,6 @@ sysmon_top_num_items.desc:
 sysmon_top_num_items.label:
 """Top num items"""
 
-persistent_session_builtin_session_table.desc:
-"""Performance tuning options for built-in session table."""
-
-persistent_session_builtin_session_table.label:
-"""Persistent session"""
-
 mqtt_upgrade_qos.desc:
 """Force upgrade of QoS level according to subscription."""
 
@@ -389,7 +389,7 @@ fields_tcp_opts_sndbuf.label:
 """TCP send buffer"""
 
 sysmon_os_mem_check_interval.desc:
-"""The time interval for the periodic memory check."""
+"""The time interval for the periodic memory check. Disabled on Windows platform."""
 
 sysmon_os_mem_check_interval.label:
 """Mem check interval"""
@@ -412,25 +412,28 @@ fields_ws_opts_mqtt_piggyback.desc:
 fields_ws_opts_mqtt_piggyback.label:
 """MQTT Piggyback"""
 
-base_listener_mountpoint.desc:
-"""When publishing or subscribing, prefix all topics with a mountpoint string.
-The prefixed string will be removed from the topic name when the message
-is delivered to the subscriber. The mountpoint is a way that users can use
-to implement isolation of message routing between different listeners.
-For example if a client A subscribes to `t` with `listeners.tcp.\<name>.mountpoint`
-set to `some_tenant`, then the client actually subscribes to the topic
-`some_tenant/t`. Similarly, if another client B (connected to the same listener
-as the client A) sends a message to topic `t`, the message is routed
-to all the clients subscribed `some_tenant/t`, so client A will receive the
-message, with topic name `t`.<br/>
-Set to `""` to disable the feature.<br/>
+base_listener_mountpoint.desc: """~
+    - Adds a static or templated prefix (e.g., `n1/` or `${username}/`) to topics used by clients in `SUBSCRIBE` and `UNSUBSCRIBE` requests, `PUBLISH` messages, and Will Message (if supplied in the `CONNECT` packet).
+    - Removes this prefix from topics of messages published to the respective subscriptions.
 
-Variables in mountpoint string:
-  - <code>${clientid}</code>: clientid
-  - <code>${username}</code>: username"""
+    The supported placeholders are:
+    - `${username}`
+    - `${clientid}`
+    - `${zone}`
+    - `${client_attrs.NAME}`
 
-base_listener_mountpoint.label:
-"""mountpoint"""
+    For example, with `mountpoint="${username}/"` a client using `u1` as username will have:
+    - Client SUBSCRIBE `sensors/#` -> `u1/sensors/#` internally in the broker.
+    - Broker PUBLISH `u1/sensors/data` -> `sensors/data` sent to the client.
+
+    The prefix mount/unmount is applied to:
+    - Will in `CONNECT`
+    - `PUBLISH`
+    - `SUBSCRIBE`
+    - `UNSUBSCRIBE`
+
+    Note: mounting occurs **after authorization/ACL checks**.~"""
+base_listener_mountpoint.label: "Mountpoint"
 
 mqtt_max_awaiting_rel.desc:
 """For each publisher session, the maximum number of outstanding QoS 2 messages pending on the client to send PUBREL. After reaching this limit, new QoS 2 PUBLISH requests will be rejected with `147(0x93)` until either PUBREL is received or timed out."""
@@ -470,7 +473,7 @@ RSA-PSK-DES-CBC3-SHA,RSA-PSK-RC4-SHA"</code><br/>
 NOTE: QUIC listener supports only 'tlsv1.3' ciphers"""
 
 ciphers_schema_quic.label:
-""""""
+"""QUIC TLS cipher suites"""
 
 fields_mqtt_quic_listener_max_bytes_per_key.desc:
 """Maximum number of bytes to encrypt with a single 1-RTT encryption key before initiating key update. Default: 274877906944"""
@@ -512,14 +515,6 @@ mqtt_max_inflight.desc:
 mqtt_max_inflight.label:
 """Max Inflight"""
 
-persistent_session_store_enabled.desc:
-"""Use the database to store information about persistent sessions.
-This makes it possible to migrate a client connection to another
-cluster node if a node is stopped."""
-
-persistent_session_store_enabled.label:
-"""Enable persistent session store"""
-
 fields_deflate_opts_level.desc:
 """Compression level."""
 
@@ -532,35 +527,11 @@ mqtt_server_keepalive.desc:
 mqtt_server_keepalive.label:
 """Server Keep Alive"""
 
-global_authentication.desc:
-"""Default authentication configs for all MQTT listeners.
-
-For per-listener overrides see <code>authentication</code> in listener configs
-
-This option can be configured with:
-<ul>
-  <li><code>[]</code>: The default value, it allows *ALL* logins</li>
-  <li>one: For example <code>{enable:true,backend:"built_in_database",mechanism="password_based"}</code></li>
-  <li>chain: An array of structs.</li>
-</ul>
-
-When a chain is configured, the login credentials are checked against the backends per the configured order, until an 'allow' or 'deny' decision can be made.
-
-If there is no decision after a full chain exhaustion, the login is rejected."""
-
 fields_mqtt_quic_listener_load_balancing_mode.desc:
 """0: Disabled, 1: SERVER_ID_IP, 2: SERVER_ID_FIXED. default: 0"""
 
 fields_mqtt_quic_listener_load_balancing_mode.label:
 """Load balancing mode"""
-
-persistent_session_store_session_message_gc_interval.desc:
-"""The starting interval for garbage collection of transient data for
-persistent session messages. This does not affect the lifetime length
-of persistent session messages."""
-
-persistent_session_store_session_message_gc_interval.label:
-"""Session message GC interval"""
 
 server_ssl_opts_schema_ocsp_refresh_http_timeout.desc:
 """The timeout for the HTTP request when checking OCSP responses."""
@@ -569,7 +540,11 @@ server_ssl_opts_schema_ocsp_refresh_http_timeout.label:
 """OCSP Refresh HTTP Timeout"""
 
 fields_tcp_opts_send_timeout.desc:
-"""The TCP send timeout for the connections."""
+"""The maximum time a process is suspended for sending data to a busy socket. After the timeout, the TCP connection and the process will be closed.
+
+The process is unsuspended only when the socket is unbusy, that is, the data accumulated in the Erlang internal buffer drops from the high watermark (specified by `high_watermark`) to the low watermark (default 4 KB).
+
+Therefore, `(high_watermark - 4 KB) / send_timeout` must be a suitable message outflow speed, otherwise the suspended process will never be able to recover before the timeout."""
 
 fields_tcp_opts_send_timeout.label:
 """TCP send timeout"""
@@ -588,11 +563,23 @@ fields_tcp_opts_buffer.desc:
 fields_tcp_opts_buffer.label:
 """TCP user-space buffer"""
 
+fields_mqtt_opts_parse_unit.desc:
+"""This setting specifies the level of granularity for data processed during MQTT framing, determining how frames are extracted and parsed from a byte stream:
+
+- `chunk`: Frames are processed at the transport layer packet level. This method uses raw byte chunks as the parsing unit, requiring the application logic to assemble and interpret MQTT frames. The size of each chunk non-deterministically depends on factors such as transmission speed, socket buffer size, and other kernel settings.
+- `frame`: Frames are processed as complete MQTT messages. This method ensures that only fully-formed MQTT frames are delivered to the application logic for further handling. In most of the cases, it offers better performance than the `chunk` option.
+
+Note, the choice of `parse_unit` affects the interpretation of the `active_n` setting: it defines either the number of raw byte chunks or complete MQTT messages are delivered to the connection process."""
+
+fields_mqtt_opts_parse_unit.label:
+"""MQTT Message Parse Unit"""
+
 server_ssl_opts_schema_honor_cipher_order.desc:
-"""An important security setting, it forces the cipher to be set based
- on the server-specified order instead of the client-specified order,
- hence enforcing the (usually more properly configured) security
- ordering of the server administrator."""
+"""An important security setting. If this setting is enabled, the server will prioritize the cipher suites it prefers most from the list of cipher suites supported by the client, thus ignoring the client's preferences.
+
+The server's cipher suites are specified by `ciphers`, with preference decreasing from left to right.
+
+It is often better to use the server's preferences, as it is more likely that the server will be configured correctly."""
 
 server_ssl_opts_schema_honor_cipher_order.label:
 """SSL honor cipher order"""
@@ -622,12 +609,6 @@ broker_session_locking_strategy.desc:
   - `quorum`: select some nodes to lock the session
   - `all`: lock the session on all the nodes in the cluster"""
 
-persistent_store_ram_cache.desc:
-"""Maintain a copy of the data in RAM for faster access."""
-
-persistent_store_ram_cache.label:
-"""RAM cache"""
-
 fields_mqtt_quic_listener_stream_recv_window_default.desc:
 """Initial stream receive window size. Default: 32678"""
 
@@ -635,15 +616,19 @@ fields_mqtt_quic_listener_stream_recv_window_default.label:
 """Stream recv window default"""
 
 mqtt_mqueue_priorities.desc:
-"""Topic priorities. Priority number [1-255]
-There's no priority table by default, hence all messages are treated equal.
+"""Topic priority list. Prioritize messages in the message queue by topic. The priority range is `[1, 255]`.
 
-**NOTE**: Comma and equal signs are not allowed for priority topic names.
-**NOTE**: Messages for topics not in the priority table are treated as either highest or lowest priority depending on the configured value for <code>mqtt.mqueue_default_priority</code>.
+The larger the value, the higher the priority. Messages with higher priority will be sent first.
 
-**Examples**:
-To configure <code>"topic/1" > "topic/2"</code>:
-<code>mqueue_priorities: {"topic/1": 10, "topic/2": 8}</code>"""
+Topics not in this list will use the default priority (specified by `mqueue_default_priority`).
+
+By default, this list is empty, which means all topics have the same priority.
+
+Note: commas and equal signs are not supported in topic names.
+
+For example, if you want `topic/1` to have a higher priority than `topic/2`, you can configure it like this:
+
+`mqueue_priorities: {\"topic/1\": 10, \"topic/2\": 8}`"""
 
 mqtt_mqueue_priorities.label:
 """Topic Priorities"""
@@ -661,7 +646,9 @@ fields_rate_limit_max_conn_rate.label:
 """Max connection rate"""
 
 alarm_size_limit.desc:
-"""The maximum total number of deactivated alarms to keep as history.<br/>When this limit is exceeded, the oldest deactivated alarms are deleted to cap the total number."""
+"""The maximum number of historical alarms that can be stored.
+
+When the maximum number is reached, the oldest historical alarms will be deleted to store new historical alarms."""
 
 alarm_size_limit.label:
 """Alarm size limit"""
@@ -685,7 +672,9 @@ conn_congestion_enable_alarm.label:
 """Enable/disable congestion alarm"""
 
 fields_ws_opts_proxy_port_header.desc:
-"""HTTP header used to pass information about the client port. Relevant when the EMQX cluster is deployed behind a load-balancer."""
+"""The HTTP request header that carries the original client's source port, EMQX will take the leftmost port in the header as the original client's source port.
+
+This option is typically used when EMQX is deployed behind a WebSocket proxy."""
 
 fields_ws_opts_proxy_port_header.label:
 """Proxy port header"""
@@ -742,7 +731,7 @@ common_ssl_opts_schema_keyfile.label:
 
 sysmon_os_cpu_high_watermark.desc:
 """The threshold, as percentage of system CPU load,
- for how much system cpu can be used before the corresponding alarm is raised."""
+ for how much system cpu can be used before the corresponding alarm is raised. Disabled on Windows platform"""
 
 sysmon_os_cpu_high_watermark.label:
 """CPU high watermark"""
@@ -778,7 +767,7 @@ fields_tcp_opts_recbuf.label:
 """TCP receive buffer"""
 
 sysmon_vm_process_check_interval.desc:
-"""The time interval for the periodic process limit check."""
+"""The time interval for the periodic process count limit check, used together with `process_high_watermark` and `process_low_watermark`."""
 
 sysmon_vm_process_check_interval.label:
 """Process limit check interval"""
@@ -790,22 +779,30 @@ fields_mqtt_quic_listener_server_resumption_level.label:
 """Server resumption level"""
 
 fields_ws_opts_proxy_address_header.desc:
-"""HTTP header used to pass information about the client IP address.
-Relevant when the EMQX cluster is deployed behind a load-balancer."""
+"""The HTTP request header that carries the original client's IP address, EMQX will take the leftmost IP in the header as the original client's IP.
+
+This option is typically used when EMQX is deployed behind a WebSocket proxy."""
 
 fields_ws_opts_proxy_address_header.label:
 """Proxy address header"""
 
 sysmon_os_sysmem_high_watermark.desc:
 """The threshold, as percentage of system memory,
- for how much system memory can be allocated before the corresponding alarm is raised."""
+ for how much system memory can be allocated before the corresponding alarm is raised. Disabled on Windows platform"""
 
 sysmon_os_sysmem_high_watermark.label:
 """SysMem high wartermark"""
 
 fields_tcp_opts_high_watermark.desc:
-"""The socket is set to a busy state when the amount of data queued internally
-by the VM socket implementation reaches this limit."""
+"""When EMQX tries to send more data than the OS has allocated for the socket's send buffer, the remaining data will be temporarily stored in Erlang's internal buffer and then sent in the background.
+
+If the amount of data queued in the internal buffer exceeds `high_watermark`, the corresponding socket will be marked as busy.
+
+The process sending data to this busy socket will be suspended until the socket is no longer busy, or the suspension time exceeds `send_timeout`.
+
+The socket will only be unbusy when the data in the internal buffer is below the low watermark.
+
+While the process is suspended, the message queue of the process may accumulate, see `max_mailbox_len` for details."""
 
 fields_tcp_opts_high_watermark.label:
 """TCP high watermark"""
@@ -839,18 +836,16 @@ mqtt_max_topic_levels.label:
 """Max Topic Levels"""
 
 force_shutdown_max_heap_size.desc:
-"""Total heap size"""
+"""The maximum heap size of the process. If the `force_shutdown` is enabled, processes that exceed this limit will automatically exit or be forcibly killed. Messages in the process message queue (mailbox) are also part of the heap. The shutdown of a process can be divided into the following two situations:
+
+- The process actively checks the current heap size during its own operation, and actively exits after finding that it exceeds the limit.
+- The underlying scheduling system checks the current heap size after performing garbage collection for the process, and forcibly kills the process after finding that it exceeds the limit.
+
+Note: The Error logs generated by the above two will be different. The log generated by the former is similar to `...errorContext: connection_shutdown, reason: #{max => 2097152, reason => proc_heap_too_large, value => 2787348}..`,
+and the log generated by the latter is similar to `...Context: maximum heap size reached...`."""
 
 force_shutdown_max_heap_size.label:
-"""Total heap size"""
-
-persistent_store_on_disc.desc:
-"""Save information about the persistent sessions on disc.
-If this option is enabled, persistent sessions will survive full restart of the cluster.
-Otherwise, all the data will be stored in RAM, and it will be lost when all the nodes in the cluster are stopped."""
-
-persistent_store_on_disc.label:
-"""Persist on disc"""
+"""Maximum Process Heap Size"""
 
 mqtt_ignore_loop_deliver.desc:
 """Whether the messages sent by the MQTT v3.1.1/v3.1.0 client will be looped back to the publisher itself, similar to <code>No Local</code> in MQTT 5.0."""
@@ -901,6 +896,15 @@ The default value 1.5 is following the MQTT 5.0 specification. This multiplier i
 mqtt_keepalive_multiplier.label:
 """Keep Alive Multiplier"""
 
+mqtt_keepalive_check_interval.desc:
+"""The frequency of checking for incoming MQTT packets determines how often the server will check for new MQTT packets.
+If a certain amount of time passes without any packets being sent from the client, this time will be added up.
+Once the accumulated time exceeds `keepalive-interval * keepalive-multiplier`, the connection will be terminated.
+The default is set to 30 seconds, with a minimum value of 1 second and a maximum value of `keepalive-interval / 2`."""
+
+mqtt_keepalive_check_interval.label:
+"""Keep Alive Check Interval"""
+
 force_gc_bytes.desc:
 """GC the process after specified number of bytes have passed through."""
 
@@ -908,17 +912,18 @@ force_gc_bytes.label:
 """Process GC bytes"""
 
 server_ssl_opts_schema_fail_if_no_peer_cert.desc:
-"""Used together with {verify, verify_peer} by an TLS/DTLS server.
-If set to true, the server fails if the client does not have a
-certificate to send, that is, sends an empty certificate.
-If set to false, it fails only if the client sends an invalid
-certificate (an empty certificate is considered valid)."""
+"""This option is only effective if `verify` is set to `verify_peer`.
+
+If set to `true`, EMQX will reject the connection if the client fails to provide a certificate.
+
+If set to `false`, EMQX will accept clients which don't present a certificate."""
 
 server_ssl_opts_schema_fail_if_no_peer_cert.label:
 """SSL fail if no peer cert"""
 
 fields_ws_opts_compress.desc:
-"""If <code>true</code>, compress WebSocket messages using <code>zlib</code>.<br/>
+"""If <code>true</code>, compress WebSocket messages using <code>zlib</code>.
+
 The configuration items under <code>deflate_opts</code> belong to the compression-related parameter configuration."""
 
 fields_ws_opts_compress.label:
@@ -935,6 +940,12 @@ fields_cache_ttl.desc:
 
 fields_cache_ttl.label:
 """Time to live for the cached data."""
+
+fields_authz_cache_excludes.label:
+"""Excludes"""
+
+fields_authz_cache_excludes.desc:
+"""Exclude caching ACL check results for topics matching the given patterns."""
 
 sys_topics.desc:
 """System topics configuration."""
@@ -982,10 +993,18 @@ NOTE: when changing from/to `global` lock, it requires all nodes in the cluster 
   - `global`: updates are protected with a global lock. Recommended for large clusters."""
 
 fields_tcp_opts_nodelay.desc:
-"""The TCP_NODELAY flag for the connections."""
+"""The `TCP_NODELAY` flag for the connections.
+When set to `true`, data is sent immediately, regardless of size."""
 
 fields_tcp_opts_nodelay.label:
-"""TCP_NODELAY"""
+"""No Delay"""
+
+fields_tcp_opts_nolinger.desc:
+"""When enabled, `SO_LINGER` flag is set as `(onoff=1, linger=0)`, which means the TCP socket is to be closed immediately by sending a TCP-RST packet,
+discarding any unsent data and skipping the graceful close steps, including CLOSE_WAIT, FIN_WAIT, and TIME_WAIT."""
+
+fields_tcp_opts_nolinger.label:
+"""No Linger"""
 
 fields_tcp_opts_keepalive.desc:
 """Enable TCP keepalive for MQTT connections over TCP or SSL.
@@ -1026,15 +1045,22 @@ fields_ws_opts_supported_subprotocols.desc:
 fields_ws_opts_supported_subprotocols.label:
 """Supported subprotocols"""
 
-broker_shared_subscription_strategy.desc:
+mqtt_shared_subscription_strategy.desc:
 """Dispatch strategy for shared subscription.
-  - `random`: dispatch the message to a random selected subscriber
-  - `round_robin`: select the subscribers in a round-robin manner
-  - `round_robin_per_group`: select the subscribers in round-robin fashion within each shared subscriber group
-  - `local`: select random local subscriber otherwise select random cluster-wide
-  - `sticky`: always use the last selected subscriber to dispatch, until the subscriber disconnects.
-  - `hash_clientid`: select the subscribers by hashing the `clientIds`
-  - `hash_topic`: select the subscribers by hashing the source topic"""
+ - `random`: Randomly select a subscriber for dispatch;
+ - `round_robin`: Clients in a shared subscription group will consume messages in turn, and the progress of the loop is recorded independently in each publisher, so two adjacent messages from **different publishers** may be consumed by the same client in the subscription group;
+ - `round_robin_per_group`: Clients in a shared subscription group will consume messages in turn, and the progress of the loop is recorded independently in each node, so two adjacent messages from **different nodes** may be consumed by the same client in the subscription group;
+ - `local`: Randomly select a subscriber on the current node, if there are no subscribers on the current node, then randomly select within the cluster;
+ - `sticky`: Continuously dispatch messages to the initially selected subscriber until their session ends. The initial selection is made based on `mqtt_shared_subscription_initial_sticky_pick`;
+ - `hash_clientid`: Hash the publisher's client ID to select a subscriber;
+ - `hash_topic`: Hash the publishing topic to select a subscriber."""
+
+mqtt_shared_subscription_initial_sticky_pick.desc:
+"""The strategy to use for the initial subscriber pick when shared_subscription_strategy is `sticky`.
+ - `random`: Randomly select the subscriber;
+ - `local`: Randomly select a subscriber on the current node, if there are no subscribers on the current node, then randomly select within the cluster;
+ - `hash_clientid`: Hash the publisher's client ID to select a subscriber;
+ - `hash_topic`: Hash the publishing topic to select a subscriber."""
 
 fields_deflate_opts_mem_level.desc:
 """Specifies the size of the compression state.<br/>
@@ -1055,37 +1081,10 @@ base_listener_limiter.desc:
 base_listener_limiter.label:
 """Type of the rate limit."""
 
-max_conn_rate.desc:
-"""Maximum connection rate.<br/>
-This is used to limit the connection rate for this listener,
-once the limit is reached, new connections will be deferred or refused"""
-max_conn_rate.label:
-"""Maximum Connection Rate"""
-
-messages_rate.desc:
-"""Messages publish rate.<br/>
-This is used to limit the inbound message numbers for each client connected to this listener,
-once the limit is reached, the restricted client will slow down and even be hung for a while."""
-messages_rate.label:
-"""Messages Publish Rate"""
-
-bytes_rate.desc:
-"""Data publish rate.<br/>
-This is used to limit the inbound bytes rate for each client connected to this listener,
-once the limit is reached, the restricted client will slow down and even be hung for a while."""
-bytes_rate.label:
-"""Data Publish Rate"""
-
-persistent_session_store_backend.desc:
-"""Database management system used to store information about persistent sessions and messages.
-- `builtin`: Use the embedded database (mria)"""
-
-persistent_session_store_backend.label:
-"""Backend"""
-
 alarm_validity_period.desc:
-"""Retention time of deactivated alarms. Alarms are not deleted immediately
-when deactivated, but after the retention time."""
+"""The validity period of historical alarms. Calculated from the time of activation of the historical alarm instead of the time of cancelation.
+
+If it exists longer than the validity period, the alarm will be deleted."""
 
 alarm_validity_period.label:
 """Alarm validity period"""
@@ -1102,14 +1101,6 @@ See: https://erlang.org/doc/man/inet.html#setopts-2"""
 
 fields_tcp_opts_active_n.label:
 """active_n"""
-
-listener_authentication.desc:
-"""Per-listener authentication override.
-Authentication can be one single authenticator instance or a chain of authenticators as an array.
-When authenticating a login (username, client ID, etc.) the authenticators are checked in the configured order."""
-
-listener_authentication.label:
-"""Per-listener authentication override"""
 
 fields_trace_payload_encode.desc:
 """Determine the format of the payload format in the trace file.<br/>
@@ -1128,14 +1119,6 @@ To disable this feature, input <code>""</code> in the text box below. Only appli
 mqtt_response_information.label:
 """Response Information"""
 
-persistent_session_store_max_retain_undelivered.desc:
-"""The time messages that was not delivered to a persistent session
-is stored before being garbage collected if the node the previous
-session was handled on restarts of is stopped."""
-
-persistent_session_store_max_retain_undelivered.label:
-"""Max retain undelivered"""
-
 fields_mqtt_quic_listener_migration_enabled.desc:
 """Enable clients to migrate IP addresses and tuples. Requires a cooperative load-balancer, or no load-balancer. Default: 1 (Enabled)"""
 
@@ -1146,13 +1129,16 @@ common_ssl_opts_schema_password.desc:
 """String containing the user's password. Only used if the private key file is password-protected."""
 
 common_ssl_opts_schema_password.label:
-"""Keyfile passphrase"""
+"""Keyfile Passphrase"""
 
 common_ssl_opts_schema_hibernate_after.desc:
-"""Hibernate the SSL process after idling for amount of time reducing its memory footprint."""
+"""Specifies the amount of time that an SSL process will hibernate after being idle, thus reducing its memory footprint.
+
+The hibernating process will be woken up when a new message arrives.
+Hibernating and waking up too often can cause CPU utilization to increase, as they both perform garbage collection on the process."""
 
 common_ssl_opts_schema_hibernate_after.label:
-"""hibernate after"""
+"""Hibernate After"""
 
 fields_mqtt_quic_listener_send_buffering_enabled.desc:
 """Buffer send data instead of holding application buffers until sent data is acknowledged. Default: 1 (Enabled)"""
@@ -1223,20 +1209,20 @@ fields_deflate_opts_strategy.label:
 
 shared_subscription_strategy_enum.desc:
 """Dispatch strategy for shared subscription.
-- `random`: dispatch the message to a random selected subscriber
-- `round_robin`: select the subscribers in a round-robin manner
-- `round_robin_per_group`: select the subscribers in round-robin fashion within each shared subscriber group
-- `sticky`: always use the last selected subscriber to dispatch,
-until the subscriber disconnects.
-- `hash`: select the subscribers by the hash of `clientIds`
-- `local`: send to a random local subscriber. If local
-subscriber was not found, send to a random subscriber cluster-wide"""
+ - `random`: Randomly select a subscriber for dispatch;
+ - `round_robin`: Clients in a shared subscription group will consume messages in turn, and the progress of the loop is recorded independently in each publisher, so two adjacent messages from **different publishers** may be consumed by the same client in the subscription group;
+ - `round_robin_per_group`: Clients in a shared subscription group will consume messages in turn, and the progress of the loop is recorded independently in each node, so two adjacent messages from **different nodes** may be consumed by the same client in the subscription group;
+ - `local`: Randomly select a subscriber on the current node, if there are no subscribers on the current node, then randomly select within the cluster;
+ - `sticky`: Continuously dispatch messages to the initially selected subscriber until their session ends. The initial selection is made based on the value of `initial_sticky_pick`;
+ - `hash_clientid`: Hash the publisher's client ID to select a subscriber;
+ - `hash_topic`: Hash the publishing topic to select a subscriber."""
 
-persistent_session_builtin_sess_msg_table.desc:
-"""Performance tuning options for built-in session messages table."""
-
-persistent_session_builtin_sess_msg_table.label:
-"""Persistent session messages"""
+shared_subscription_initial_sticky_pick_enum.desc:
+"""The strategy to use for the initial subscriber pick when the shared subscription strategy is `sticky`.
+ - `random`: Randomly select the subscriber;
+ - `local`: Randomly select a subscriber on the current node, if there are no subscribers on the current node, then randomly select within the cluster;
+ - `hash_clientid`: Hash the publisher's client ID to select a subscriber;
+ - `hash_topic`: Hash the publishing topic to select a subscriber."""
 
 mqtt_mqueue_store_qos0.desc:
 """Specifies whether to store QoS 0 messages in the message queue while the connection is down but the session remains."""
@@ -1252,7 +1238,7 @@ The SSL application already takes measures to counter-act such attempts,
 but client-initiated renegotiation can be strictly disabled by setting this option to false.
 The default value is true. Note that disabling renegotiation can result in
 long-lived connections becoming unusable due to limits on
-the number of messages the underlying cipher suite can encipher.</br>
+the number of messages the underlying cipher suite can encipher.<br/>
 Has no effect when TLS version is configured (or negotiated) to 1.3"""
 
 server_ssl_opts_schema_client_renegotiation.label:
@@ -1277,10 +1263,10 @@ fields_mqtt_quic_listener_max_stateless_operations.label:
 """Max stateless operations"""
 
 fields_ws_opts_idle_timeout.desc:
-"""Close transport-layer connections from the clients that have not sent MQTT CONNECT message within this interval."""
+"""The timeout for waiting for the WebSocket upgrade request. After the timeout, the connection will be closed."""
 
 fields_ws_opts_idle_timeout.label:
-"""WS idle timeout"""
+"""WebSocket Upgrade Timeout"""
 
 fields_mqtt_quic_listener_max_ack_delay_ms.desc:
 """How long to wait after receiving data before sending an ACK. Default: 25"""
@@ -1288,11 +1274,18 @@ fields_mqtt_quic_listener_max_ack_delay_ms.desc:
 fields_mqtt_quic_listener_max_ack_delay_ms.label:
 """Max ack delay ms"""
 
-base_listener_zone.desc:
-"""The configuration zone to which the listener belongs."""
+base_listener_zone.desc: """~
+    The configuration zone to which the listener belongs.
+    Clients connected to this listener will inherit zone-settings created under this zone name.
 
-base_listener_zone.label:
-"""Zone"""
+    A zone can override the configs under below root names:
+    - `mqtt`
+    - `force_shutdown`
+    - `force_gc`
+    - `flapping_detect`
+    - `durable_sessions`"""
+
+base_listener_zone.label: "Zone"
 
 fields_mqtt_quic_listener_handshake_idle_timeout.desc:
 """How long a handshake can idle before it is discarded."""
@@ -1314,6 +1307,12 @@ fields_ws_opts_allow_origin_absence.desc:
 fields_ws_opts_allow_origin_absence.label:
 """Allow origin absence"""
 
+fields_ws_opts_validate_utf8.desc:
+"""Whether to verify that the payload of `text` and `close` frames is valid UTF-8. Disabling it can save resources and improve performance."""
+
+fields_ws_opts_validate_utf8.label:
+"""Enable/Disable WebSocket Frame utf8 validation"""
+
 common_ssl_opts_schema_versions.desc:
 """All TLS/DTLS versions to be supported.<br/>
 NOTE: PSK ciphers are suppressed by 'tlsv1.3' version config.<br/>
@@ -1324,7 +1323,11 @@ common_ssl_opts_schema_versions.label:
 """SSL versions"""
 
 mqtt_listener_proxy_protocol_timeout.desc:
-"""Timeout for proxy protocol. EMQX will close the TCP connection if proxy protocol packet is not received within the timeout."""
+"""If a reverse proxy is deployed for EMQX, and the PROXY protocol is enabled at the proxy to pass the client's real IP, this option needs to be turned on so that EMQX can extract the client's real IP from the PROXY protocol header.
+
+EMQX will automatically detect the version of the PROXY protocol and support V1 and V2.
+
+For a detailed description of the PROXY protocol, please refer to: https://www.haproxy.com/blog/haproxy/proxy-protocol/"""
 
 mqtt_listener_proxy_protocol_timeout.label:
 """Proxy protocol timeout"""
@@ -1336,19 +1339,23 @@ fields_mqtt_quic_listener_idle_timeout.label:
 """Idle Timeout"""
 
 common_ssl_opts_schema_secure_renegotiate.desc:
-"""SSL parameter renegotiation is a feature that allows a client and a server
-to renegotiate the parameters of the SSL connection on the fly.
-RFC 5746 defines a more secure way of doing this. By enabling secure renegotiation,
-you drop support for the insecure renegotiation, prone to MitM attacks.</br>
-Has no effect when TLS version is configured (or negotiated) to 1.3"""
+"""Whether to reject TLS renegotiation attempts that are not compliant with [RFC 5746](http://www.ietf.org/rfc/rfc5746.txt).
+
+By default, `secure_renegotiate` is set to `true`, which forces secure renegotiation.
+If set to `false`, secure renegotiation will still be used, but will fall back to insecure renegotiation if the peer does not support [RFC 5746](http://www.ietf.org/rfc/rfc5746.txt), which increases the risk of a MitM attack.
+
+Has no effect when TLS version is configured (or negotiated) to 1.3."""
 
 common_ssl_opts_schema_secure_renegotiate.label:
-"""SSL renegotiate"""
+"""SSL Secure Renegotiation"""
 
 common_ssl_opts_schema_log_level.desc:
-"""Log level for SSL communication. Default is 'notice'. Set to 'debug' to inspect TLS handshake messages."""
+"""The minimum level of logging allowed for SSL output.
+
+The default is `notice`, set to a lower `debug` level for more detailed logging that can be used to investigate SSL handshake issues."""
+
 common_ssl_opts_schema_log_level.label:
-"""SSL log level"""
+"""SSL Log Level"""
 
 sysmon_vm_busy_port.desc:
 """When a port (e.g. TCP socket) is overloaded, there will be a <code>busy_port</code> warning log,
@@ -1369,17 +1376,17 @@ sysmon_vm_process_low_watermark.label:
 """Process low watermark"""
 
 mqtt_max_packet_size.desc:
-"""Maximum MQTT packet size allowed."""
+"""Maximum MQTT packet size allowed. Default: 1 MB, Maximum: 256 MB"""
 
 mqtt_max_packet_size.label:
 """Max Packet Size"""
 
 common_ssl_opts_schema_reuse_sessions.desc:
-"""Enable TLS session reuse.</br>
+"""Enable TLS session reuse.<br/>
 Has no effect when TLS version is configured (or negotiated) to 1.3"""
 
 common_ssl_opts_schema_reuse_sessions.label:
-"""TLS session reuse"""
+"""TLS Session Reuse"""
 
 common_ssl_opts_schema_depth.desc:
 """Maximum number of non-self-issued intermediate certificates that can follow the peer certificate in a valid certification path.
@@ -1415,14 +1422,6 @@ Supported configurations are the following:
 mqtt_peer_cert_as_clientid.label:
 """Use Peer Certificate as Client ID"""
 
-persistent_session_store_message_gc_interval.desc:
-"""The starting interval for garbage collection of undelivered messages to
-a persistent session. This affects how often the "max_retain_undelivered"
-is checked for removal."""
-
-persistent_session_store_message_gc_interval.label:
-"""Message GC interval"""
-
 broker_shared_dispatch_ack_enabled.desc:
 """Deprecated.
 This was designed to avoid dispatching messages to a shared-subscription session which has the client disconnected.
@@ -1431,7 +1430,7 @@ However it's no longer useful because the shared-subscrption messages in a expir
 base_listener_enable_authn.desc:
 """Set <code>true</code> (default) to enable client authentication on this listener, the authentication
 process goes through the configured authentication chain.
-When set to <code>false</code> to allow any clients with or without authentication information such as username or password to log in.
+When set to <code>false</code>, any client (with or without username/password) is allowed to connect.
 When set to <code>quick_deny_anonymous</code>, it behaves like when set to <code>true</code>, but clients will be
 denied immediately without going through any authenticators if <code>username</code> is not provided. This is useful to fence off
 anonymous clients early."""
@@ -1446,7 +1445,21 @@ force_shutdown_enable.label:
 """Enable `force_shutdown` feature"""
 
 broker_enable_session_registry.desc:
-"""Enable session registry"""
+"""The Global Session Registry is a cluster-wide mechanism designed to maintain the uniqueness of client IDs within the cluster.
+Recommendations for Use<br/>
+- Default Setting: It is generally advisable to enable. This feature is crucial for session takeover to work properly. For example if a client reconnected to another node in the cluster, the new connection will need to find the old session and take it over.
+- Disabling the Feature: Disabling is an option for scenarios when all sessions expire immediately after client is disconnected (i.e. session expiry interval is zero). This can be relevant in certain specialized use cases.
+
+Advantages of Disabling<br/>
+- Reduced Memory Usage: Turning off the session registry can lower the overall memory footprint of the system.
+- Improved Performance: Without the overhead of maintaining a global registry, the node can process client connections faster."""
+
+broker_session_history_retain.desc:
+"""The duration to retain the session registration history. Setting this to a value greater than `0s` will increase memory usage and impact peformance.
+This retained history can be used to monitor how many sessions were registered in the past configured duration.
+Note: This config has no effect if `enable_session_registry` is set to `false`.<br/>
+Note: If the clients are using random client IDs, it's not recommended to enable this feature, at least not for a long retention period.<br/>
+Note: When clustered, the lowest (but greater than `0s`) value among the nodes in the cluster will take effect."""
 
 overload_protection_backoff_delay.desc:
 """The maximum duration of delay for background task execution during high load conditions."""
@@ -1484,7 +1497,7 @@ RSA-PSK-AES256-CBC-SHA,RSA-PSK-AES128-CBC-SHA,
 RSA-PSK-DES-CBC3-SHA,RSA-PSK-RC4-SHA"</code>"""
 
 ciphers_schema_common.label:
-""""""
+"""TLS cipher suites"""
 
 sys_event_client_disconnected.desc:
 """Enable to publish client disconnected event messages."""
@@ -1503,7 +1516,12 @@ mqtt_listener_proxy_protocol.label:
 """Proxy protocol"""
 
 mqtt_listener_access_rules.desc:
-"""The access control rules for this listener.<br/>See: https://github.com/emqtt/esockd#allowdeny"""
+"""An access rule list consisting of string rules to restrict or allow access from some addresses. The rules that appear earlier in the list are matched first.
+The format is `allow | deny <address> | <CIDR> | all`.
+
+For example:
+
+`[\"deny 192.168.1.1\", \"allow 192.168.1.0/24\", \"deny, all\"]`"""
 
 mqtt_listener_access_rules.label:
 """Access rules"""
@@ -1521,7 +1539,7 @@ fields_tcp_opts_send_timeout_close.label:
 """TCP send timeout close"""
 
 sysmon_os_cpu_check_interval.desc:
-"""The time interval for the periodic CPU check."""
+"""The time interval for the periodic CPU check. Disabled on Windows platform."""
 
 sysmon_os_cpu_check_interval.label:
 """The time interval for the periodic CPU check."""
@@ -1573,6 +1591,22 @@ fields_ws_opts_max_frame_size.label:
 sys_event_messages.desc:
 """Client events messages."""
 
+broker_routing_storage_schema.desc:
+"""Routing storage schema.
+Set <code>v1</code> to use the former schema.
+<code>v2</code> is introduced in 5.2. It enables routing through 2 separate tables, one for topic filter and one for regular topic subscriptions. This schema should increase both subscription and routing performance at the cost of slight increase in memory consumption per subscription.
+NOTE: Schema <code>v2</code> is still experimental.
+NOTE: Full non-rolling cluster restart is needed after altering this option for it to take any effect."""
+
+broker_routing_batch_sync_enable_on.desc:
+"""Use separate process pool to synchronize subscriptions with the global routing table in a batched manner.
+Especially useful in clusters interconnected through links with non-negligible latency, but might help in other scenarios by ensuring that the broker pool has less chance being overloaded.
+The selected value determines which nodes in the cluster will have this feature enabled.
+- <code>all</code>: enables it unconditionally on each node,
+- <code>replicant</code>: enables it only on replicants (e.g. those where <code>node.role = replicant</code>),
+- <code>core</code>: enables it only on core nodes,
+- <code>none</code>: disables this altogether."""
+
 broker_perf_trie_compaction.desc:
 """Enable trie path compaction.
 Enabling it significantly improves wildcard topic subscribe rate, if wildcard topics have unique prefixes like: 'sensor/{{id}}/+/', where ID is unique per subscriber.
@@ -1581,11 +1615,196 @@ Topic match performance (when publishing) may degrade if messages are mostly pub
 NOTE: This is a cluster-wide configuration. It requires all nodes to be stopped before changing it."""
 
 sysmon_vm_large_heap.desc:
-"""When an Erlang process consumed a large amount of memory for its heap space,
-the system will write a warning level <code>large_heap</code> log, and an MQTT message is published to
-the system topic <code>$SYS/sysmon/large_heap</code>."""
+"""When the heap memory occupied by a process exceeds the size specified by `large_heap`, the system will write a warning level `large_heap` log, and an MQTT message will be published to the system topic `$SYS/sysmon/large_heap`."""
 
 sysmon_vm_large_heap.label:
 """Enable Large Heap monitoring."""
 
+description.label:
+"""Description"""
+description.desc:
+"""Descriptive text."""
+
+resource_tags.label:
+"""Tags"""
+resource_tags.desc:
+"""Tags to annotate this config entry."""
+
+durable_sessions.label:
+"""Durable sessoins"""
+durable_sessions.desc:
+"""Settings related to the durable session feature."""
+
+durable_sessions_enable.label:
+"""Enable session persistence"""
+durable_sessions_enable.desc:
+"""Use durable storage for client sessions persistence.
+If enabled, sessions configured to outlive client connections, along with their corresponding messages, will be durably stored and survive broker downtime.
+
+:::warning
+Messages sent to the durable sessions are saved on disc.
+This inevitably limits the overall throughput of the system.
+:::"""
+
+session_ds_heartbeat_interval.label:
+"""Durable session heartbeat interval"""
+session_ds_heartbeat_interval.desc:
+"""Durable sessions back up their state on disc every heartbeat interval.
+
+Heartbeat interval is also taken into account during garbage collection of expired sessions.
+It is added to the session expiry time as a safety margin when precise time of session termination is not precisely known."""
+
+session_ds_idle_poll_interval.label:
+"""Durable session idle poll interval"""
+session_ds_idle_poll_interval.desc:
+"""Expiry interval for poll requests sent by durable sessions to the storage."""
+
+session_ds_message_retention_period.label:
+"""Message retenetion period"""
+session_ds_message_retention_period.desc:
+"""Broker keeps messages sent to the durable sessions for this period of time."""
+
+session_ds_session_gc_interval.label:
+"""Session garbage collection interval"""
+
+session_ds_session_gc_interval.desc:
+"""The interval at which session garbage collection is executed for persistent sessions."""
+
+session_ds_session_gc_batch_size.label:
+"""Session garbage collection batch size"""
+
+session_ds_session_gc_batch_size.desc:
+"""The size of each batch of expired persistent sessions to be garbage collected per iteration."""
+
+session_ds_batch_size.label:
+"""Batch size"""
+
+session_ds_batch_size.desc:
+"""This value affects the flow control for the persistent sessions.
+Persistent session queries the durable message storage in batches.
+This value specifies size of the batch.
+
+Note: larger batches generally improve the throughput and overall performance of the system, but increase RAM usage per client."""
+
+durable_storage.label:"Durable storage"
+durable_storage.desc: """~
+    Configuration related to the EMQX durable storages.
+
+    EMQX uses durable storages to offload various data, such as MQTT messages, to disc."""
+
+client_attrs_init {
+  label: "Client Attributes Initialization"
+  desc: """~
+    Specify how to initialize client attributes.
+    Each client attribute can be initialized as `client_attrs.{NAME}`,
+    where `{NAME}` is the name of the attribute specified in the config field `set_as_attr`.
+
+    The initialized client attribute will be stored in the `client_attrs` property with the specified name,
+    and can be used as a variable to render a template for mountpoint, authentication and authorization requests.
+
+    For example, use `${client_attrs.tns}` to render an HTTP POST body when `set_as_attr = tns`,
+    or render listener config `moutpoint = ${client_attrs.tns}/` for topic namespacing."""
+}
+
+client_attrs_init_expression {
+  label: "Client Attribute Extraction Regular Expression"
+  desc: """~
+    A one line expression to evaluate a set of predefined string functions (like in the rule engine SQL statements).
+    The expression can be a function call with nested calls as its arguments, or direct variable reference.
+    So far, it does not provide user-defined variable binding (like `var a=1`) or user-defined functions.
+    As an example, to extract the prefix of client ID delimited by a dot: `nth(1, tokens(clientid, '.'))`.
+
+    The variables pre-bound variables are:
+    - `clientid`: MQTT Client ID.
+    - `username`: MQTT Client's username.
+    - `user_property.{NAME}`: User properties in the CONNECT packet.
+    For TLS clients, connected directly or via proxy-protocol (v2) enabled load balancer,
+    some extra variables can be used:
+    - `cn`: Client's TLS certificate common name.
+    - `dn`: Client's TLS certificate distinguished name (the subject).
+    - `peersni`: TLS server name indication sent by the client.
+
+    You can read more about variform expressions in EMQX docs."""
+}
+
+client_attrs_init_set_as_attr {
+  label: "Name The Extracted Attribute"
+  desc: """~
+    The name of the client attribute extracted from the client data.
+    The extracted attribute will be stored in the `client_attrs` property with this name."""
+}
+
+clientid_override {
+  label: "Client ID Override Expression"
+  desc: """~
+    A one line expression to evaluate a set of predefined string functions (like in the rule engine SQL statements).
+    The expression can be a function call with nested calls as its arguments, or direct variable reference.
+    So far, it does not provide user-defined variable binding (like `var a=1`) or user-defined functions.
+    As an example, to extract the prefix of username delimited by a dot: `nth(1, tokens(username, '.'))`.
+
+    The variables pre-bound variables are:
+    - `clientid`: The original MQTT Client ID.
+    - `username`: MQTT Client's username.
+    - `client_attrs.{NAME}`: Client attributes initialized by per config `client_attrs_init`.
+    For TLS clients, connected directly or via proxy-protocol (v2) enabled load balancer,
+    some extra variables can be used:
+    - `cn`: Client's TLS certificate common name.
+    - `dn`: Client's TLS certificate distinguished name (the subject).
+    - `peersni`: TLS server name indication sent by the client.
+
+    You can read more about variform expressions in EMQX docs."""
+}
+
+banned_bootstrap_file.desc:
+"""The bootstrap file is a CSV file used to batch loading banned data when initializing a single node or cluster, in other words, the import operation is performed only if there is no data in the database.
+
+The delimiter for this file is `,`.
+
+The first line of this file must be a header line. All valid headers are listed here:
+- as :: required
+- who :: required
+- by  :: optional
+- reason :: optional
+- at :: optional
+- until :: optional
+
+See the documentation for details on each field.
+
+Each row in the rest of this file must contain the same number of columns as the header line,
+and column can be omitted then its value will be `undefined`."""
+
+socket_tcp_keepalive.desc:
+"""Enable TCP keepalive.
+The value is three comma separated numbers in the format of 'Idle,Interval,Probes'
+ - Idle: The number of seconds a connection needs to be idle before the server begins to send out keep-alive probes (Linux default 7200).
+ - Interval: The number of seconds between TCP keep-alive probes (Linux default 75).
+ - Probes: The maximum number of TCP keep-alive probes to send before giving up and killing the connection if no response is obtained from the other end (Linux default 9).
+For example "240,30,5" means: EMQX will start sending probes after the connection is idle for 240 seconds, and the probes are sent every 30 seconds until a response is received, if it misses 5 consecutive responses, the connection should be closed.
+Default: 'none'"""
+
+socket_tcp_keepalive.label:
+"""TCP keepalive options"""
+
+  sysmon_mnesia_tm_mailbox_size_alarm_threshold {
+    label: "Size Alarm"
+    desc: """~
+    The threshold above which an alarm is raised for the mailbox size of the mnesia transaction manager.  This process handles all transactions in EMQX's internal database mnesia.
+
+    There are several reasons that could give raise to this alarm.  A few things to check for or consider:
+    - Lower `max_conn_rate`, so that clients join at a slower pace;
+    - Increase CPU / RAM resources for EMQX;
+    - Lower retained message rate from the client side;
+    - Check if intra-cluster network bandwidth is reaching a maximum.~"""
+  }
+
+  sysmon_broker_pool_mailbox_size_alarm_threshold {
+    label: "Size Alarm"
+    desc: """~
+    The threshold above which an alarm is raised for the maximum mailbox size among the broker pool workers.  Broker pool workers handle adding and removing subscriptions, and replication of routing information.
+
+    There are several reasons that could give raise to this alarm.  A few things to check for or consider:
+    - Increase CPU / RAM resources for EMQX;
+    - Review the subscriptions that clients are doing, for example, try to compact topic filters;
+    - Check if intra-cluster network bandwidth is reaching a maximum.~"""
+  }
 }

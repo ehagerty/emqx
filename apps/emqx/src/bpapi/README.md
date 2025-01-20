@@ -137,7 +137,7 @@ to negotiate protocol version:
 protocol version supported by the remote node
 `Node`. `emqx_bpapi:supported_version(ProtocolId)` returns maximum
 protocol version that is supported by all nodes in the cluster. It can
-be useful when the protocol involves multicalls or multicasts.
+be useful when the protocol involves multi-calls or multi-casts.
 
 The business logic can assume that the supported protocol version is
 not going to change on the remote node, while it is running. So it is
@@ -145,12 +145,12 @@ free to cache it for the duration of the session.
 
 # New minor release
 
-After releasing, let's say, 5.1.0, the following actions should be performed to prepare for the next release:
+After releasing, let's say, 5.5.0, the following actions should be performed to prepare for the next release:
 
-1. Checkout 5.1.0 tag
+1. Checkout 5.5.0 tag
 1. Build the code
-1. Replace api version string `"master"` in `apps/emqx/test/emqx_static_checks_data/master.bpapi` with `"5.1"`
-1. Rename `apps/emqx/test/emqx_static_checks_data/master.bpapi` to `apps/emqx/test/emqx_static_checks_data/5.1.bpapi`
-1. Add `apps/emqx/test/emqx_static_checks_data/5.1.bpapi` to the repo
-1. Delete the previous file (e.g. `5.0.bpapi`), unless there is plan to support rolling upgrade from 5.0 to 5.2
+1. Replace api version string `"master"` in `apps/emqx/test/emqx_static_checks_data/master.bpapi2` with `"5.5"`
+1. Rename `apps/emqx/test/emqx_static_checks_data/master.bpapi` to `apps/emqx/test/emqx_static_checks_data/5.5.bpapi2`
+1. Add `apps/emqx/test/emqx_static_checks_data/5.5.bpapi2` to the repo
+1. Delete the previous file (e.g. `5.4.bpapi2`), unless there is plan to support rolling upgrade from 5.0.
 1. Merge the commit to master branch

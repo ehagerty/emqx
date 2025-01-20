@@ -9,6 +9,28 @@ secret_access_key.desc:
 bucket.desc:
 """The name of the S3 bucket."""
 
+bucket.label:
+"""Bucket"""
+
+bucket_access_method.desc:
+"""Method to be used to access the bucket through HTTP API."""
+
+bucket_access_method.label:
+"""Bucket Access Method"""
+
+key.desc:
+"""Key of the S3 object."""
+
+key.label:
+"""Object Key"""
+
+upload_headers.label:
+"""S3 object HTTP headers"""
+
+upload_headers.desc:
+"""HTTP headers to include in the S3 object upload request.<br/>
+Useful to specify content type, content encoding, etc. of the S3 object."""
+
 host.desc:
 """The host of the S3 endpoint."""
 

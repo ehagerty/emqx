@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,11 +25,18 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:start_apps([emqx_ft], emqx_ft_test_helpers:env_handler(Config)),
-    Config.
+    WorkDir = ?config(priv_dir, Config),
+    Storage = emqx_ft_test_helpers:local_storage(Config),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_ft, #{config => emqx_ft_test_helpers:config(Storage)}}
+        ],
+        #{work_dir => WorkDir}
+    ),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_ft]),
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
     ok.
 
 init_per_testcase(_Case, Config) ->
@@ -118,6 +125,7 @@ t_bad_messages(Config) ->
     ).
 
 t_nonexistent_file(_Config) ->
+    erlang:process_flag(trap_exit, true),
     ?assertEqual(
         {error, enoent},
         emqx_ft_storage_fs_reader:start_link(self(), "/a/b/c/bar")

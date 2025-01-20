@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 -define(LOGT(Format, Args), logger:debug("TEST_SUITE: " ++ Format, Args)).
 
 -include("emqx_lwm2m.hrl").
--include("emqx_gateway_coap/include/emqx_coap.hrl").
+-include("../../emqx_gateway_coap/include/emqx_coap.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%--------------------------------------------------------------------

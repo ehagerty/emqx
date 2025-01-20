@@ -20,7 +20,8 @@ options:
   -h|--help:         Print this usage.
 
   -b|--base:         Specify the current release base branch, can be one of
-                     release-51
+                     release-55
+                     release-56
                      NOTE: this option should be used when --dryrun.
 
   --dryrun:          Do not actually create the git tag.
@@ -31,14 +32,11 @@ options:
   --prev-tag <tag>:  Provide the prev tag to automatically generate changelogs
                      If this option is absent, the tag found by git describe will be used
 
-  --docker-latest:   Set this option to assign :latest tag on the corresponding docker image
-                     in addition to regular :<version> one
 
-
-NOTE: For 5.1 series the current working branch must be 'release-51'
+For 5.X series the current working branch must be 'release-5X'
       --.--[  master  ]---------------------------.-----------.---
          \\                                      /
-          \`---[release-51]----(v5.1.1 | e5.1.1)
+          \`---[release-5X]----(v5.4.0 | e5.4.0)
 EOF
 }
 
@@ -55,21 +53,18 @@ logmsg() {
 }
 
 TAG="${1:-}"
-DOCKER_LATEST_TAG=
 
 case "$TAG" in
     v*)
         TAG_PREFIX='v'
         PROFILE='emqx'
         SKIP_APPUP='yes'
-        DOCKER_LATEST_TAG='docker-latest-ce'
         ;;
     e*)
         TAG_PREFIX='e'
         PROFILE='emqx-enterprise'
         #TODO change to no when we are ready to support hot-upgrade
         SKIP_APPUP='yes'
-        DOCKER_LATEST_TAG='docker-latest-ee'
         ;;
     -h|--help)
         usage
@@ -85,7 +80,6 @@ esac
 shift 1
 
 DRYRUN='no'
-DOCKER_LATEST='no'
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -113,10 +107,6 @@ while [ "$#" -gt 0 ]; do
             PREV_TAG="$1"
             shift
             ;;
-        --docker-latest)
-            DOCKER_LATEST='yes'
-            shift
-            ;;
         *)
             logerr "Unknown option $1"
             exit 1
@@ -127,11 +117,29 @@ done
 rel_branch() {
     local tag="$1"
     case "$tag" in
-        v5.1.*)
-            echo 'release-51'
+        v5.5.*)
+            echo 'release-55'
             ;;
-        e5.1.*)
-            echo 'release-51'
+        e5.5.*)
+            echo 'release-55'
+            ;;
+        v5.6.*)
+            echo 'release-56'
+            ;;
+        e5.6.*)
+            echo 'release-56'
+            ;;
+        v5.7.*)
+            echo 'release-57'
+            ;;
+        e5.7.*)
+            echo 'release-57'
+            ;;
+        v5.8.*)
+            echo 'release-58'
+            ;;
+        e5.8.*)
+            echo 'release-58'
             ;;
         *)
             logerr "Unsupported version tag $TAG"
@@ -139,6 +147,21 @@ rel_branch() {
             ;;
     esac
 }
+
+assert_profile() {
+    local tag="$1"
+    local allowed_prefix
+    if [ -f .emqx-platform ]; then
+        allowed_prefix='e'
+    else
+        allowed_prefix='v'
+    fi
+    if [[ "${tag}" != "${allowed_prefix}"* ]]; then
+        logerr "Expecting a '${allowed_prefix}' tag on this commit"
+        exit 1
+    fi
+}
+assert_profile "$TAG"
 
 ## Ensure the current work branch
 assert_work_branch() {
@@ -182,15 +205,13 @@ assert_tag_absent() {
 }
 assert_tag_absent "$TAG"
 
-PKG_VSN=$(./pkg-vsn.sh "$PROFILE")
+RELEASE_VSN=$(./pkg-vsn.sh "$PROFILE" --release)
 
 ## Assert package version is updated to the tag which is being created
 assert_release_version() {
     local tag="$1"
-    # shellcheck disable=SC2001
-    pkg_vsn="$(echo "$PKG_VSN" | sed 's/-g[0-9a-f]\{8\}$//g')"
-    if [ "${TAG_PREFIX}${pkg_vsn}" != "${tag}" ]; then
-        logerr "The release version ($pkg_vsn) is different from the desired git tag."
+    if [ "${TAG_PREFIX}${RELEASE_VSN}" != "${tag}" ]; then
+        logerr "The release version ($RELEASE_VSN) is different from the desired git tag."
         logerr "Update the release version in emqx_release.hrl"
         exit 1
     fi
@@ -220,7 +241,7 @@ fi
 
 ## Ensure relup paths are updated
 ## TODO: add relup path db
-#./scripts/relup-base-vsns.escript check-vsn-db "$PKG_VSN" "$RELUP_PATHS"
+#./scripts/relup-base-vsns.escript check-vsn-db "$RELEASE_VSN" "$RELUP_PATHS"
 
 ## Run some additional checks (e.g. some for enterprise edition only)
 CHECKS_DIR="./scripts/rel/checks"
@@ -232,58 +253,61 @@ if [ -d "${CHECKS_DIR}" ]; then
     done
 fi
 
-generate_changelog () {
-    local from_tag
-    from_tag="${PREV_TAG:-}"
-    if [[ -z $from_tag ]]; then
-        from_tag="$(./scripts/find-prev-rel-tag.sh "$PROFILE")"
-    fi
-    # num_en=$(git diff --name-only -a "${from_tag}...HEAD" "changes" | grep -c '.en.md')
-    # num_zh=$(git diff --name-only -a "${from_tag}...HEAD" "changes" | grep -c '.zh.md')
-    # if [ "$num_en" -ne "$num_zh" ]; then
-    #     echo "Number of English and Chinese changelog files added since ${from_tag} do not match."
-    #     exit 1
-    # fi
-    ./scripts/rel/format-changelog.sh -b "${from_tag}" -l 'en' -v "$TAG" > "changes/${TAG}.en.md"
-    # ./scripts/rel/format-changelog.sh -b "${from_tag}" -l 'zh' -v "$TAG" > "changes/${TAG}.zh.md"
-    git add changes/"${TAG}".*.md
-    if [ -n "$(git diff --staged --stat)" ]; then
-        git commit -m "docs: Generate changelog for ${TAG}"
-    else
-        logmsg "No changelog update."
+check_changelog() {
+    local file="changes/${TAG}.en.md"
+    if [ ! -f  "$file" ]; then
+        logerr "Changelog file $file is missing."
+        logerr "Generate it with command: ./scripts/rel/format-changelog.sh -b ${PREV_TAG} -v ${TAG} > ${file}"
+        exit 1
     fi
 }
 
-if [ "$DRYRUN" = 'yes' ]; then
-    logmsg "Release tag is ready to be created with command: git tag $TAG"
-    if [ "$DOCKER_LATEST" = 'yes' ]; then
-        logmsg "Docker latest tag is ready to be created with command: git tag --force $DOCKER_LATEST_TAG"
-    fi
-else
+check_bpapi() {
+    local fname
     case "$TAG" in
-        *rc*)
-            true
-            ;;
-        *alpha*)
-            true
-            ;;
-        *beta*)
-            true
+        *.0)
+            fname="$(echo "$TAG" | sed 's/^e//; s/\.0$//')"
+            fpath="apps/emqx/test/emqx_static_checks_data/${fname}.bpapi2"
+            logmsg "Checking $fpath"
+            if [ ! -f "$fpath" ]; then
+                logerr "BPAPI file missing: $fpath"
+                exit 1
+            fi
             ;;
         *)
-            generate_changelog
+            true
             ;;
     esac
+}
+
+case "$TAG" in
+    *rc*)
+        true
+        ;;
+    *alpha*)
+        true
+        ;;
+    *beta*)
+        true
+        ;;
+    e*)
+        check_bpapi
+        check_changelog
+        ;;
+    v*)
+        check_changelog
+        ;;
+esac
+
+if [ "$DRYRUN" = 'yes' ]; then
+    logmsg "Release tag is ready to be created with command: git tag $TAG"
+else
     git tag "$TAG"
     logmsg "$TAG is created OK."
-    if [ "$DOCKER_LATEST" = 'yes' ]; then
-        git tag --force "$DOCKER_LATEST_TAG"
-        logmsg "$DOCKER_LATEST_TAG is created OK."
+    PUSH_TO="both emqx.git and emqx-platform.git!"
+    if [ -f .emqx-platform ]; then
+        PUSH_TO="emqx-platform.git but NOT emqx.git!"
     fi
-    logwarn "Don't forget to push the tags!"
-    if [ "$DOCKER_LATEST" = 'yes' ]; then
-        echo "git push --atomic --force origin $TAG $DOCKER_LATEST_TAG"
-    else
-        echo "git push origin $TAG"
-    fi
+    logwarn "Don't forget to push the tag to ${PUSH_TO}"
+    echo "git push origin $TAG"
 fi

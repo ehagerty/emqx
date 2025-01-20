@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, mnesia/1]).
+-export([start_link/0, create_tables/0]).
 
 %% Note: multicall functions are statically checked by
 %% `emqx_bapi_trans' and `emqx_bpapi_static_checks' modules. Don't
@@ -27,24 +27,33 @@
     query/1,
     reset/0,
     status/0,
+    is_initiator/1,
+    find_leader/0,
     skip_failed_commit/1,
     fast_forward_to_commit/2,
     on_mria_stop/1,
+    force_leave_clean/1,
     wait_for_cluster_rpc/0,
-    maybe_init_tnx_id/2
+    maybe_init_tnx_id/2,
+    update_mfa/3
 ]).
 -export([
     commit/2,
     commit_status_trans/2,
     get_cluster_tnx_id/0,
+    get_current_tnx_id/0,
     get_node_tnx_id/1,
     init_mfa/2,
+    force_sync_tnx_id/3,
     latest_tnx_id/0,
     make_initiate_call_req/3,
     read_next_mfa/1,
     trans_query/1,
     trans_status/0,
-    on_leave_clean/0
+    on_leave_clean/1,
+    on_leave_clean/0,
+    get_commit_lag/0,
+    get_commit_lag/1
 ]).
 
 -export([
@@ -61,9 +70,9 @@
 
 -export_type([tnx_id/0, succeed_num/0]).
 
--boot_mnesia({mnesia, [boot]}).
-
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include("emqx_conf.hrl").
 
 -ifdef(TEST).
@@ -75,8 +84,6 @@
 -define(INITIATE(MFA), {initiate, MFA}).
 -define(CATCH_UP, catch_up).
 -define(TIMEOUT, timer:minutes(1)).
--define(APPLY_KIND_REPLICATE, replicate).
--define(APPLY_KIND_INITIATE, initiate).
 -define(IS_STATUS(_A_), (_A_ =:= peers_lagging orelse _A_ =:= stopped_nodes)).
 
 -type tnx_id() :: pos_integer().
@@ -94,7 +101,8 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-mnesia(boot) ->
+
+create_tables() ->
     ok = mria:create_table(?CLUSTER_MFA, [
         {type, ordered_set},
         {rlog_shard, ?CLUSTER_RPC_SHARD},
@@ -108,7 +116,11 @@ mnesia(boot) ->
         {storage, disc_copies},
         {record_name, cluster_rpc_commit},
         {attributes, record_info(fields, cluster_rpc_commit)}
-    ]).
+    ]),
+    [
+        ?CLUSTER_MFA,
+        ?CLUSTER_COMMIT
+    ].
 
 start_link() ->
     start_link(node(), ?MODULE, get_retry_ms()).
@@ -216,8 +228,26 @@ reset() -> gen_server:call(?MODULE, reset).
 status() ->
     transaction(fun ?MODULE:trans_status/0, []).
 
+is_initiator(Opts) ->
+    ?KIND_INITIATE =:= maps:get(kind, Opts, ?KIND_INITIATE).
+
+find_leader() ->
+    {atomic, Status} = status(),
+    case Status of
+        [#{node := N} | _] ->
+            N;
+        [] ->
+            %% running nodes already sort.
+            [N | _] = emqx:running_nodes(),
+            N
+    end.
+
+%% DO NOT delete this on_leave_clean/0, It's use when rpc before v560.
 on_leave_clean() ->
-    mnesia:delete({?CLUSTER_COMMIT, node()}).
+    on_leave_clean(node()).
+
+on_leave_clean(Node) ->
+    mnesia:delete({?CLUSTER_COMMIT, Node}).
 
 -spec latest_tnx_id() -> pos_integer().
 latest_tnx_id() ->
@@ -231,13 +261,29 @@ make_initiate_call_req(M, F, A) ->
 -spec get_node_tnx_id(node()) -> integer().
 get_node_tnx_id(Node) ->
     case mnesia:wread({?CLUSTER_COMMIT, Node}) of
-        [] -> -1;
+        [] -> ?DEFAULT_INIT_TXN_ID;
         [#cluster_rpc_commit{tnx_id = TnxId}] -> TnxId
     end.
 
+%% @doc Return the commit lag of *this* node.
+-spec get_commit_lag() -> #{my_id := pos_integer(), latest := pos_integer()}.
+get_commit_lag() ->
+    {atomic, Result} = transaction(fun ?MODULE:get_commit_lag/1, [node()]),
+    Result.
+
+get_commit_lag(Node) ->
+    LatestId = get_cluster_tnx_id(),
+    LatestNode =
+        case mnesia:read(?CLUSTER_MFA, LatestId) of
+            [#?CLUSTER_MFA{initiator = N}] -> N;
+            _ -> undefined
+        end,
+    MyId = get_node_tnx_id(Node),
+    #{my_id => MyId, latest => LatestId, latest_node => LatestNode}.
+
 %% Checks whether the Mnesia tables used by this module are waiting to
 %% be loaded and from where.
--spec get_tables_status() -> #{atom() => {waiting, [node()]} | {disc | network, node()}}.
+-spec get_tables_status() -> #{atom() => {waiting, [node()]} | {loaded, local | node()}}.
 get_tables_status() ->
     maps:from_list([
         {Tab, do_get_tables_status(Tab)}
@@ -249,13 +295,16 @@ do_get_tables_status(Tab) ->
     TabNodes = proplists:get_value(all_nodes, Props),
     KnownDown = mnesia_recover:get_mnesia_downs(),
     LocalNode = node(),
-    case proplists:get_value(load_node, Props) of
+    %% load_node. Returns the name of the node that Mnesia loaded the table from.
+    %% The structure of the returned value is unspecified, but can be useful for debugging purposes.
+    LoadedFrom = proplists:get_value(load_node, Props),
+    case LoadedFrom of
         unknown ->
             {waiting, TabNodes -- [LocalNode | KnownDown]};
         LocalNode ->
-            {disc, LocalNode};
+            {loaded, local};
         Node ->
-            {network, Node}
+            {loaded, Node}
     end.
 
 %% Regardless of what MFA is returned, consider it a success),
@@ -278,6 +327,12 @@ on_mria_stop(leave) ->
     gen_server:call(?MODULE, on_leave);
 on_mria_stop(_) ->
     ok.
+
+force_leave_clean(Node) ->
+    case transaction(fun ?MODULE:on_leave_clean/1, [Node]) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {error, Reason}
+    end.
 
 wait_for_cluster_rpc() ->
     %% Workaround for https://github.com/emqx/mria/issues/94:
@@ -321,13 +376,8 @@ handle_call(reset, _From, State) ->
     _ = mria:clear_table(?CLUSTER_COMMIT),
     _ = mria:clear_table(?CLUSTER_MFA),
     {reply, ok, State, {continue, ?CATCH_UP}};
-handle_call(?INITIATE(MFA), _From, State = #{node := Node}) ->
-    case transaction(fun ?MODULE:init_mfa/2, [Node, MFA]) of
-        {atomic, {ok, TnxId, Result}} ->
-            {reply, {ok, TnxId, Result}, State, {continue, ?CATCH_UP}};
-        {aborted, Error} ->
-            {reply, {init_failure, Error}, State, {continue, ?CATCH_UP}}
-    end;
+handle_call(?INITIATE(MFA), _From, State) ->
+    do_initiate(MFA, State, 1, #{});
 handle_call(skip_failed_commit, _From, State = #{node := Node}) ->
     Timeout = catch_up(State, true),
     {atomic, LatestId} = transaction(fun ?MODULE:get_node_tnx_id/1, [Node]),
@@ -336,7 +386,7 @@ handle_call({fast_forward_to_commit, ToTnxId}, _From, State) ->
     NodeId = do_fast_forward_to_commit(ToTnxId, State),
     {reply, NodeId, State, catch_up(State)};
 handle_call(on_leave, _From, State) ->
-    {atomic, ok} = transaction(fun ?MODULE:on_leave_clean/0, []),
+    {atomic, ok} = transaction(fun ?MODULE:on_leave_clean/1, [node()]),
     {reply, ok, State#{is_leaving := true}};
 handle_call(_, _From, State) ->
     {reply, ok, State, catch_up(State)}.
@@ -363,9 +413,10 @@ catch_up(State) -> catch_up(State, false).
 catch_up(#{node := Node, retry_interval := RetryMs, is_leaving := false} = State, SkipResult) ->
     case transaction(fun ?MODULE:read_next_mfa/1, [Node]) of
         {atomic, caught_up} ->
+            ?tp(cluster_rpc_caught_up, #{}),
             ?TIMEOUT;
         {atomic, {still_lagging, NextId, MFA}} ->
-            {Succeed, _} = apply_mfa(NextId, MFA, ?APPLY_KIND_REPLICATE),
+            {Succeed, _} = apply_mfa(NextId, MFA, ?KIND_REPLICATE),
             case Succeed orelse SkipResult of
                 true ->
                     case transaction(fun ?MODULE:commit/2, [Node, NextId]) of
@@ -436,17 +487,54 @@ get_cluster_tnx_id() ->
         Id -> Id
     end.
 
+get_current_tnx_id() ->
+    case mnesia:dirty_read(?CLUSTER_COMMIT, node()) of
+        [] -> ?DEFAULT_INIT_TXN_ID;
+        [#cluster_rpc_commit{tnx_id = TnxId}] -> TnxId
+    end.
+
 get_oldest_mfa_id() ->
     case mnesia:first(?CLUSTER_MFA) of
         '$end_of_table' -> 0;
         Id -> Id
     end.
 
+do_initiate(_MFA, State, Count, Failure) when Count > 10 ->
+    %% refuse to initiate cluster call from this node
+    %% because it's likely that the caller is based on
+    %% a stale view event we retry 10 time.
+    Error = stale_view_of_cluster_msg(Failure, Count),
+    {reply, {init_failure, Error}, State, {continue, ?CATCH_UP}};
+do_initiate(MFA, State = #{node := Node}, Count, Failure0) ->
+    case transaction(fun ?MODULE:init_mfa/2, [Node, MFA]) of
+        {atomic, {ok, TnxId, Result}} ->
+            {reply, {ok, TnxId, Result}, State, {continue, ?CATCH_UP}};
+        {atomic, {retry, Failure1}} when Failure0 =:= Failure1 ->
+            %% Useless retry, so we return early.
+            Error = stale_view_of_cluster_msg(Failure0, Count),
+            {reply, {init_failure, Error}, State, {continue, ?CATCH_UP}};
+        {atomic, {retry, Failure1}} ->
+            catch_up(State),
+            do_initiate(MFA, State, Count + 1, Failure1);
+        {aborted, Error} ->
+            {reply, {init_failure, Error}, State, {continue, ?CATCH_UP}}
+    end.
+
+stale_view_of_cluster_msg(Meta, Count) ->
+    Node = find_leader(),
+    Reason = Meta#{
+        msg => stale_view_of_cluster,
+        retry_times => Count,
+        suggestion => ?SUGGESTION(Node)
+    },
+    ?SLOG(warning, Reason),
+    {error, Reason}.
+
 %% The entry point of a config change transaction.
 init_mfa(Node, MFA) ->
     mnesia:write_lock_table(?CLUSTER_MFA),
     LatestId = get_cluster_tnx_id(),
-    MyTnxId = get_node_tnx_id(node()),
+    MyTnxId = get_node_tnx_id(Node),
     case MyTnxId =:= LatestId of
         true ->
             TnxId = LatestId + 1,
@@ -458,28 +546,50 @@ init_mfa(Node, MFA) ->
             },
             ok = mnesia:write(?CLUSTER_MFA, MFARec, write),
             ok = commit(Node, TnxId),
-            case apply_mfa(TnxId, MFA, ?APPLY_KIND_INITIATE) of
+            case apply_mfa(TnxId, MFA, ?KIND_INITIATE) of
                 {true, Result} -> {ok, TnxId, Result};
                 {false, Error} -> mnesia:abort(Error)
             end;
         false ->
-            %% refuse to initiate cluster call from this node
-            %% because it's likely that the caller is based on
-            %% a stale view.
-            Reason = #{
-                msg => stale_view_of_cluster_state,
-                cluster_tnx_id => LatestId,
-                node_tnx_id => MyTnxId
+            Meta = #{cluster_tnx_id => LatestId, node_tnx_id => MyTnxId},
+            {retry, Meta}
+    end.
+
+force_sync_tnx_id(Node, MFA, NodeTnxId) ->
+    mnesia:write_lock_table(?CLUSTER_MFA),
+    case get_node_tnx_id(Node) of
+        NodeTnxId ->
+            TnxId = NodeTnxId + 1,
+            MFARec = #cluster_rpc_mfa{
+                tnx_id = TnxId,
+                mfa = MFA,
+                initiator = Node,
+                created_at = erlang:localtime()
             },
-            ?SLOG(warning, Reason),
+            ok = mnesia:write(?CLUSTER_MFA, MFARec, write),
+            lists:foreach(
+                fun(N) ->
+                    ok = emqx_cluster_rpc:commit(N, NodeTnxId)
+                end,
+                mria:running_nodes()
+            );
+        NewTnxId ->
+            Fmt = "aborted_force_sync, tnx_id(~w) is not the latest(~w)",
+            Reason = emqx_utils:format(Fmt, [NodeTnxId, NewTnxId]),
             mnesia:abort({error, Reason})
+    end.
+
+update_mfa(Node, MFA, LatestId) ->
+    case transaction(fun ?MODULE:force_sync_tnx_id/3, [Node, MFA, LatestId]) of
+        {atomic, ok} -> ok;
+        {aborted, Error} -> Error
     end.
 
 transaction(Func, Args) ->
     mria:transaction(?CLUSTER_RPC_SHARD, Func, Args).
 
 trans_status() ->
-    mnesia:foldl(
+    List = mnesia:foldl(
         fun(Rec, Acc) ->
             #cluster_rpc_commit{node = Node, tnx_id = TnxId} = Rec,
             case mnesia:read(?CLUSTER_MFA, TnxId) of
@@ -502,7 +612,35 @@ trans_status() ->
         end,
         [],
         ?CLUSTER_COMMIT
+    ),
+    Cores = lists:sort(mria:cluster_nodes(cores)),
+    RunningNodes = mria:running_nodes(),
+    %% Make sure cores is ahead of replicants
+    Replicants = lists:subtract(RunningNodes, Cores),
+    Nodes = lists:append(Cores, Replicants),
+    {NodeIndices, _} = lists:foldl(
+        fun(N, {Acc, Seq}) ->
+            {maps:put(N, Seq, Acc), Seq + 1}
+        end,
+        {#{}, 1},
+        Nodes
+    ),
+    lists:sort(
+        fun(A, B) ->
+            compare_tnx_id_and_node(A, B, NodeIndices)
+        end,
+        List
     ).
+
+compare_tnx_id_and_node(
+    #{tnx_id := Id, node := NA},
+    #{tnx_id := Id, node := NB},
+    NodeIndices
+    %% The smaller the seq, the higher the priority level.
+) ->
+    maps:get(NA, NodeIndices, undefined) < maps:get(NB, NodeIndices, undefined);
+compare_tnx_id_and_node(#{tnx_id := IdA}, #{tnx_id := IdB}, _NodeIndices) ->
+    IdA > IdB.
 
 trans_query(TnxId) ->
     case mnesia:read(?CLUSTER_MFA, TnxId) of
@@ -517,23 +655,7 @@ trans_query(TnxId) ->
 apply_mfa(TnxId, {M, F, A}, Kind) ->
     Res =
         try
-            case erlang:apply(M, F, A) of
-                {error, {post_config_update, HandlerName, {Reason0, PostFailureFun}}} when
-                    Kind =/= ?APPLY_KIND_INITIATE
-                ->
-                    ?SLOG(error, #{
-                        msg => "post_config_update_failed",
-                        handler => HandlerName,
-                        reason => Reason0
-                    }),
-                    PostFailureFun();
-                {error, {post_config_update, HandlerName, {Reason0, _Fun}}} when
-                    Kind =:= ?APPLY_KIND_INITIATE
-                ->
-                    {error, {post_config_update, HandlerName, Reason0}};
-                Result ->
-                    Result
-            end
+            erlang:apply(M, F, A ++ [#{kind => Kind}])
         catch
             throw:Reason ->
                 {error, #{reason => Reason}};
@@ -553,7 +675,7 @@ is_success(ok) -> true;
 is_success({ok, _}) -> true;
 is_success(_) -> false.
 
-log_and_alarm(IsSuccess, Res, #{kind := ?APPLY_KIND_INITIATE} = Meta) ->
+log_and_alarm(IsSuccess, Res, #{kind := ?KIND_INITIATE} = Meta) ->
     %% no alarm or error log in case of failure at originating a new cluster-call
     %% because nothing is committed
     case IsSuccess of
@@ -649,7 +771,7 @@ do_wait_for_emqx_ready(N) ->
         ok ->
             ok;
         timeout ->
-            ?SLOG(warning, #{msg => "stil_waiting_for_emqx_app_to_be_ready"}),
+            ?SLOG(warning, #{msg => "still_waiting_for_emqx_app_to_be_ready"}),
             do_wait_for_emqx_ready(N - 1)
     end.
 

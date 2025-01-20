@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -47,13 +47,16 @@
     api_spec/0,
     paths/0,
     schema/1,
-    fields/1
+    fields/1,
+    namespace/0
 ]).
 
 -define(EXCEED_LIMIT, 'EXCEED_LIMIT').
 -define(BAD_TOPIC, 'BAD_TOPIC').
 -define(TOPIC_NOT_FOUND, 'TOPIC_NOT_FOUND').
 -define(BAD_REQUEST, 'BAD_REQUEST').
+
+namespace() -> undefined.
 
 api_spec() ->
     emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
@@ -183,7 +186,7 @@ fields(topic_metrics) ->
             )},
         {create_time,
             mk(
-                emqx_datetime:epoch_second(),
+                emqx_utils_calendar:epoch_second(),
                 #{
                     desc => ?DESC(create_time),
                     required => true,
@@ -192,7 +195,7 @@ fields(topic_metrics) ->
             )},
         {reset_time,
             mk(
-                emqx_datetime:epoch_second(),
+                emqx_utils_calendar:epoch_second(),
                 #{
                     desc => ?DESC(reset_time),
                     required => false,

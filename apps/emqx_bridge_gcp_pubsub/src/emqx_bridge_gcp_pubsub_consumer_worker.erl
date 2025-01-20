@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_gcp_pubsub_consumer_worker).
@@ -30,18 +30,21 @@
 -type bridge_name() :: atom() | binary().
 -type ack_id() :: binary().
 -type message_id() :: binary().
+-type duration() :: non_neg_integer().
 -type config() :: #{
     ack_deadline := emqx_schema:timeout_duration_s(),
     ack_retry_interval := emqx_schema:timeout_duration_ms(),
     client := emqx_bridge_gcp_pubsub_client:state(),
     ecpool_worker_id => non_neg_integer(),
-    forget_interval := timer:time(),
-    hookpoint := binary(),
-    instance_id := binary(),
+    forget_interval := duration(),
+    hookpoints := [binary()],
+    connector_resource_id := binary(),
+    source_resource_id := binary(),
     mqtt_config => emqx_bridge_gcp_pubsub_impl_consumer:mqtt_config(),
     project_id := emqx_bridge_gcp_pubsub_client:project_id(),
     pull_max_messages := non_neg_integer(),
     pull_retry_interval := emqx_schema:timeout_duration_ms(),
+    request_ttl := emqx_schema:duration_ms() | infinity,
     subscription_id => subscription_id(),
     topic => emqx_bridge_gcp_pubsub_client:topic()
 }.
@@ -52,15 +55,17 @@
     async_workers := #{pid() => reference()},
     client := emqx_bridge_gcp_pubsub_client:state(),
     ecpool_worker_id := non_neg_integer(),
-    forget_interval := timer:time(),
-    hookpoint := binary(),
-    instance_id := binary(),
-    mqtt_config := emqx_bridge_gcp_pubsub_impl_consumer:mqtt_config(),
+    forget_interval := duration(),
+    hookpoints := [binary()],
+    connector_resource_id := binary(),
+    source_resource_id := binary(),
+    mqtt_config := #{} | emqx_bridge_gcp_pubsub_impl_consumer:mqtt_config(),
     pending_acks := #{message_id() => ack_id()},
     project_id := emqx_bridge_gcp_pubsub_client:project_id(),
     pull_max_messages := non_neg_integer(),
     pull_retry_interval := emqx_schema:timeout_duration_ms(),
     pull_timer := undefined | reference(),
+    request_ttl := emqx_schema:duration_ms() | infinity,
     %% In order to avoid re-processing the same message twice due to race conditions
     %% between acknlowledging a message and receiving a duplicate pulled message, we need
     %% to keep the seen message IDs for a while...
@@ -94,7 +99,7 @@ ensure_subscription(WorkerPid) ->
     gen_server:cast(WorkerPid, ensure_subscription).
 
 -spec reply_delegator(pid(), pull_async, binary(), {ok, map()} | {error, timeout | term()}) -> ok.
-reply_delegator(WorkerPid, pull_async = _Action, InstanceId, Result) ->
+reply_delegator(WorkerPid, pull_async = _Action, SourceResId, Result) ->
     ?tp(gcp_pubsub_consumer_worker_reply_delegator, #{result => Result}),
     case Result of
         {error, timeout} ->
@@ -104,7 +109,7 @@ reply_delegator(WorkerPid, pull_async = _Action, InstanceId, Result) ->
                 warning,
                 "gcp_pubsub_consumer_worker_pull_error",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     reason => Reason
                 }
             ),
@@ -141,7 +146,7 @@ health_check(WorkerPid) ->
     end.
 
 %%-------------------------------------------------------------------------------------------------
-%% `emqx_resource' API
+%% `ecpool' API
 %%-------------------------------------------------------------------------------------------------
 
 connect(Opts0) ->
@@ -153,11 +158,13 @@ connect(Opts0) ->
         client := Client,
         ecpool_worker_id := WorkerId,
         forget_interval := ForgetInterval,
-        hookpoint := Hookpoint,
-        instance_id := InstanceId,
+        hookpoints := Hookpoints,
+        connector_resource_id := ConnectorResId,
+        source_resource_id := SourceResId,
         project_id := ProjectId,
         pull_max_messages := PullMaxMessages,
         pull_retry_interval := PullRetryInterval,
+        request_ttl := RequestTTL,
         topic_mapping := TopicMapping
     } = Opts,
     TopicMappingList = lists:keysort(1, maps:to_list(TopicMapping)),
@@ -171,15 +178,18 @@ connect(Opts0) ->
         %% workers.
         client => Client,
         forget_interval => ForgetInterval,
-        hookpoint => Hookpoint,
-        instance_id => InstanceId,
+        hookpoints => Hookpoints,
+        connector_resource_id => ConnectorResId,
+        source_resource_id => SourceResId,
         mqtt_config => MQTTConfig,
         project_id => ProjectId,
         pull_max_messages => PullMaxMessages,
         pull_retry_interval => PullRetryInterval,
+        request_ttl => RequestTTL,
         topic => Topic,
         subscription_id => subscription_id(BridgeName, Topic)
     },
+    ?tp(gcp_pubsub_consumer_worker_about_to_spawn, #{}),
     start_link(Config).
 
 %%-------------------------------------------------------------------------------------------------
@@ -204,36 +214,43 @@ handle_continue(?ensure_subscription, State0) ->
         already_exists ->
             {noreply, State0, {continue, ?patch_subscription}};
         continue ->
-            #{instance_id := InstanceId} = State0,
+            #{source_resource_id := SourceResId} = State0,
             ?MODULE:pull_async(self()),
             optvar:set(?OPTVAR_SUB_OK(self()), subscription_ok),
             ?tp(
                 debug,
                 "gcp_pubsub_consumer_worker_subscription_ready",
-                #{instance_id => InstanceId}
+                #{instance_id => SourceResId}
             ),
             {noreply, State0};
         retry ->
             {noreply, State0, {continue, ?ensure_subscription}};
         not_found ->
             %% there's nothing much to do if the topic suddenly doesn't exist anymore.
-            {stop, {error, topic_not_found}, State0}
+            {stop, {error, topic_not_found}, State0};
+        bad_credentials ->
+            {stop, {error, bad_credentials}, State0};
+        permission_denied ->
+            {stop, {error, permission_denied}, State0}
     end;
 handle_continue(?patch_subscription, State0) ->
     ?tp(gcp_pubsub_consumer_worker_patch_subscription_enter, #{}),
     case patch_subscription(State0) of
         ok ->
-            #{instance_id := InstanceId} = State0,
+            #{source_resource_id := SourceResId} = State0,
             ?MODULE:pull_async(self()),
             optvar:set(?OPTVAR_SUB_OK(self()), subscription_ok),
             ?tp(
                 debug,
                 "gcp_pubsub_consumer_worker_subscription_ready",
-                #{instance_id => InstanceId}
+                #{instance_id => SourceResId}
             ),
             {noreply, State0};
         error ->
-            %% retry
+            %% retry; add a random delay for the case where multiple workers step on each
+            %% other's toes before retrying.
+            RandomMS = rand:uniform(500),
+            timer:sleep(RandomMS),
             {noreply, State0, {continue, ?patch_subscription}}
     end.
 
@@ -280,25 +297,29 @@ handle_info({forget_message_ids, MsgIds}, State0) ->
     {noreply, State};
 handle_info(Msg, State0) ->
     #{
-        instance_id := InstanceId,
+        source_resource_id := SoureceResId,
         topic := Topic
     } = State0,
     ?SLOG(debug, #{
         msg => "gcp_pubsub_consumer_worker_unexpected_message",
         unexpected_msg => Msg,
-        instance_id => InstanceId,
+        instance_id => SoureceResId,
         topic => Topic
     }),
     {noreply, State0}.
 
-terminate({error, topic_not_found} = _Reason, State) ->
+terminate({error, Reason}, State) when
+    Reason =:= topic_not_found;
+    Reason =:= bad_credentials;
+    Reason =:= permission_denied
+->
     #{
-        instance_id := InstanceId,
+        source_resource_id := SourceResId,
         topic := _Topic
     } = State,
     optvar:unset(?OPTVAR_SUB_OK(self())),
-    emqx_bridge_gcp_pubsub_impl_consumer:mark_topic_as_nonexistent(InstanceId),
-    ?tp(gcp_pubsub_consumer_worker_terminate, #{reason => _Reason, topic => _Topic}),
+    emqx_bridge_gcp_pubsub_impl_consumer:mark_as_unhealthy(SourceResId, Reason),
+    ?tp(gcp_pubsub_consumer_worker_terminate, #{reason => {error, Reason}, topic => _Topic}),
     ok;
 terminate(_Reason, _State) ->
     optvar:unset(?OPTVAR_SUB_OK(self())),
@@ -329,19 +350,22 @@ ensure_pull_timer(State = #{pull_timer := TRef}) when is_reference(TRef) ->
 ensure_pull_timer(State = #{pull_retry_interval := PullRetryInterval}) ->
     State#{pull_timer := emqx_utils:start_timer(PullRetryInterval, pull)}.
 
--spec ensure_subscription_exists(state()) -> continue | retry | not_found | already_exists.
+-spec ensure_subscription_exists(state()) ->
+    continue | retry | not_found | permission_denied | bad_credentials | already_exists.
 ensure_subscription_exists(State) ->
     ?tp(gcp_pubsub_consumer_worker_create_subscription_enter, #{}),
     #{
         client := Client,
-        instance_id := InstanceId,
+        source_resource_id := SourceResId,
+        request_ttl := RequestTTL,
         subscription_id := SubscriptionId,
         topic := Topic
     } = State,
     Method = put,
     Path = path(State, create),
     Body = body(State, create),
-    PreparedRequest = {prepared_request, {Method, Path, Body}},
+    ReqOpts = #{request_ttl => RequestTTL},
+    PreparedRequest = {prepared_request, {Method, Path, Body}, ReqOpts},
     Res = emqx_bridge_gcp_pubsub_client:query_sync(PreparedRequest, Client),
     case Res of
         {error, #{status_code := 409}} ->
@@ -350,7 +374,7 @@ ensure_subscription_exists(State) ->
                 debug,
                 "gcp_pubsub_consumer_worker_subscription_already_exists",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic,
                     subscription_id => SubscriptionId
                 }
@@ -362,17 +386,39 @@ ensure_subscription_exists(State) ->
                 warning,
                 "gcp_pubsub_consumer_worker_nonexistent_topic",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic
                 }
             ),
             not_found;
+        {error, #{status_code := 403}} ->
+            %% permission denied
+            ?tp(
+                warning,
+                "gcp_pubsub_consumer_worker_permission_denied",
+                #{
+                    instance_id => SourceResId,
+                    topic => Topic
+                }
+            ),
+            permission_denied;
+        {error, #{status_code := 401}} ->
+            %% bad credentials
+            ?tp(
+                warning,
+                "gcp_pubsub_consumer_worker_bad_credentials",
+                #{
+                    instance_id => SourceResId,
+                    topic => Topic
+                }
+            ),
+            bad_credentials;
         {ok, #{status_code := 200}} ->
             ?tp(
                 debug,
                 "gcp_pubsub_consumer_worker_subscription_created",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic,
                     subscription_id => SubscriptionId
                 }
@@ -383,7 +429,7 @@ ensure_subscription_exists(State) ->
                 error,
                 "gcp_pubsub_consumer_worker_subscription_error",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic,
                     reason => Reason
                 }
@@ -395,14 +441,16 @@ ensure_subscription_exists(State) ->
 patch_subscription(State) ->
     #{
         client := Client,
-        instance_id := InstanceId,
+        source_resource_id := SourceResId,
         subscription_id := SubscriptionId,
+        request_ttl := RequestTTL,
         topic := Topic
     } = State,
     Method1 = patch,
     Path1 = path(State, create),
     Body1 = body(State, patch_subscription),
-    PreparedRequest1 = {prepared_request, {Method1, Path1, Body1}},
+    ReqOpts = #{request_ttl => RequestTTL},
+    PreparedRequest1 = {prepared_request, {Method1, Path1, Body1}, ReqOpts},
     Res = emqx_bridge_gcp_pubsub_client:query_sync(PreparedRequest1, Client),
     case Res of
         {ok, _} ->
@@ -410,7 +458,7 @@ patch_subscription(State) ->
                 debug,
                 "gcp_pubsub_consumer_worker_subscription_patched",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic,
                     subscription_id => SubscriptionId,
                     result => Res
@@ -422,7 +470,7 @@ patch_subscription(State) ->
                 warning,
                 "gcp_pubsub_consumer_worker_subscription_patch_error",
                 #{
-                    instance_id => InstanceId,
+                    instance_id => SourceResId,
                     topic => Topic,
                     subscription_id => SubscriptionId,
                     reason => Reason
@@ -440,14 +488,15 @@ do_pull_async(State0) ->
         begin
             #{
                 client := Client,
-                instance_id := InstanceId
+                source_resource_id := SourceResId,
+                request_ttl := RequestTTL
             } = State0,
             Method = post,
             Path = path(State0, pull),
             Body = body(State0, pull),
-            PreparedRequest = {prepared_request, {Method, Path, Body}},
-            ReplyFunAndArgs = {fun ?MODULE:reply_delegator/4, [self(), pull_async, InstanceId]},
-            %% `ehttpc_pool'/`gproc_pool' might return `false' if there are no workers...
+            ReqOpts = #{request_ttl => RequestTTL},
+            PreparedRequest = {prepared_request, {Method, Path, Body}, ReqOpts},
+            ReplyFunAndArgs = {fun ?MODULE:reply_delegator/4, [self(), pull_async, SourceResId]},
             Res = emqx_bridge_gcp_pubsub_client:query_async(
                 PreparedRequest,
                 ReplyFunAndArgs,
@@ -525,13 +574,16 @@ do_acknowledge(State0) ->
     #{
         client := Client,
         forget_interval := ForgetInterval,
+        request_ttl := RequestTTL,
         pending_acks := PendingAcks
     } = State1,
     AckIds = maps:values(PendingAcks),
     Method = post,
     Path = path(State1, ack),
     Body = body(State1, ack, #{ack_ids => AckIds}),
-    PreparedRequest = {prepared_request, {Method, Path, Body}},
+    ReqOpts = #{request_ttl => RequestTTL},
+    PreparedRequest = {prepared_request, {Method, Path, Body}, ReqOpts},
+    ?tp(gcp_pubsub_consumer_worker_will_acknowledge, #{acks => PendingAcks}),
     Res = emqx_bridge_gcp_pubsub_client:query_sync(PreparedRequest, Client),
     case Res of
         {error, Reason} ->
@@ -558,12 +610,14 @@ do_acknowledge(State0) ->
 -spec do_get_subscription(state()) -> {ok, emqx_utils_json:json_term()} | {error, term()}.
 do_get_subscription(State) ->
     #{
-        client := Client
+        client := Client,
+        request_ttl := RequestTTL
     } = State,
     Method = get,
     Path = path(State, get_subscription),
     Body = body(State, get_subscription),
-    PreparedRequest = {prepared_request, {Method, Path, Body}},
+    ReqOpts = #{request_ttl => RequestTTL},
+    PreparedRequest = {prepared_request, {Method, Path, Body}, ReqOpts},
     Res = emqx_bridge_gcp_pubsub_client:query_sync(PreparedRequest, Client),
     case Res of
         {error, Reason} ->
@@ -685,13 +739,9 @@ handle_message(State, #{<<"ackId">> := AckId, <<"message">> := InnerMsg} = _Mess
         #{message_id => maps:get(<<"messageId">>, InnerMsg), message => _Message, ack_id => AckId},
         begin
             #{
-                instance_id := InstanceId,
-                hookpoint := Hookpoint,
-                mqtt_config := #{
-                    payload_template := PayloadTemplate,
-                    qos := MQTTQoS,
-                    mqtt_topic := MQTTTopic
-                },
+                source_resource_id := SourceResId,
+                hookpoints := Hookpoints,
+                mqtt_config := MQTTConfig,
                 topic := Topic
             } = State,
             #{
@@ -715,14 +765,31 @@ handle_message(State, #{<<"ackId">> := AckId, <<"message">> := InnerMsg} = _Mess
                         {<<"orderingKey">>, ordering_key}
                     ]
                 ),
-            Payload = render(FullMessage, PayloadTemplate),
-            MQTTMessage = emqx_message:make(InstanceId, MQTTQoS, MQTTTopic, Payload),
-            _ = emqx:publish(MQTTMessage),
-            emqx:run_hook(Hookpoint, [FullMessage]),
-            emqx_resource_metrics:received_inc(InstanceId),
+            legacy_maybe_publish_mqtt_message(MQTTConfig, SourceResId, FullMessage),
+            lists:foreach(
+                fun(Hookpoint) -> emqx_hooks:run(Hookpoint, [FullMessage]) end,
+                Hookpoints
+            ),
+            emqx_resource_metrics:received_inc(SourceResId),
             ok
         end
     ).
+
+legacy_maybe_publish_mqtt_message(
+    _MQTTConfig = #{
+        payload_template := PayloadTemplate,
+        qos := MQTTQoS,
+        mqtt_topic := MQTTTopic
+    },
+    SourceResId,
+    FullMessage
+) when MQTTTopic =/= <<>> ->
+    Payload = render(FullMessage, PayloadTemplate),
+    MQTTMessage = emqx_message:make(SourceResId, MQTTQoS, MQTTTopic, Payload),
+    _ = emqx:publish(MQTTMessage),
+    ok;
+legacy_maybe_publish_mqtt_message(_MQTTConfig, _SourceResId, _FullMessage) ->
+    ok.
 
 -spec add_if_present(any(), map(), any(), map()) -> map().
 add_if_present(FromKey, Message, ToKey, Map) ->

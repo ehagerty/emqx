@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("typerefl/include/types.hrl").
+-include_lib("emqx_utils/include/emqx_utils_api.hrl").
 
 -behaviour(minirest_api).
 
@@ -37,6 +38,7 @@
     '/rule_test'/2,
     '/rules'/2,
     '/rules/:id'/2,
+    '/rules/:id/test'/2,
     '/rules/:id/metrics'/2,
     '/rules/:id/metrics/reset'/2
 ]).
@@ -60,7 +62,8 @@ end).
     end
 ).
 
--define(METRICS(
+%% Metrics map value
+-define(METRICS_VAL(
     MATCH,
     PASS,
     FAIL,
@@ -71,6 +74,7 @@ end).
     O_FAIL_OOS,
     O_FAIL_UNKNOWN,
     O_SUCC,
+    O_DISCARDED,
     RATE,
     RATE_MAX,
     RATE_5
@@ -86,13 +90,17 @@ end).
         'actions.failed.out_of_service' => O_FAIL_OOS,
         'actions.failed.unknown' => O_FAIL_UNKNOWN,
         'actions.success' => O_SUCC,
+        'actions.discarded' => O_DISCARDED,
         'matched.rate' => RATE,
         'matched.rate.max' => RATE_MAX,
         'matched.rate.last5m' => RATE_5
     }
 ).
 
--define(metrics(
+-define(METRICS_VAL_ZERO, ?METRICS_VAL(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)).
+
+%% Metrics map match pattern
+-define(METRICS_PAT(
     MATCH,
     PASS,
     FAIL,
@@ -103,6 +111,7 @@ end).
     O_FAIL_OOS,
     O_FAIL_UNKNOWN,
     O_SUCC,
+    O_DISCARDED,
     RATE,
     RATE_MAX,
     RATE_5
@@ -118,6 +127,7 @@ end).
         'actions.failed.out_of_service' := O_FAIL_OOS,
         'actions.failed.unknown' := O_FAIL_UNKNOWN,
         'actions.success' := O_SUCC,
+        'actions.discarded' := O_DISCARDED,
         'matched.rate' := RATE,
         'matched.rate.max' := RATE_MAX,
         'matched.rate.last5m' := RATE_5
@@ -130,13 +140,17 @@ end).
     {<<"like_id">>, binary},
     {<<"like_from">>, binary},
     {<<"match_from">>, binary},
+    {<<"action">>, binary},
+    {<<"source">>, binary},
     {<<"like_description">>, binary}
 ]).
 
 namespace() -> "rule".
 
 api_spec() ->
-    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => false}).
+    emqx_dashboard_swagger:spec(?MODULE, #{
+        check_schema => fun emqx_dashboard_swagger:validate_content_type_json/2
+    }).
 
 paths() ->
     [
@@ -145,6 +159,7 @@ paths() ->
         "/rule_test",
         "/rules",
         "/rules/:id",
+        "/rules/:id/test",
         "/rules/:id/metrics",
         "/rules/:id/metrics/reset"
     ].
@@ -160,6 +175,9 @@ rule_creation_schema() ->
 
 rule_test_schema() ->
     ref(emqx_rule_api_schema, "rule_test").
+
+rule_apply_test_schema() ->
+    ref(emqx_rule_api_schema, "rule_apply_test").
 
 rule_info_schema() ->
     ref(emqx_rule_api_schema, "rule_info").
@@ -187,6 +205,10 @@ schema("/rules") ->
                     })},
                 {match_from,
                     mk(binary(), #{desc => ?DESC("api1_match_from"), in => query, required => false})},
+                {action,
+                    mk(hoconsc:array(binary()), #{in => query, desc => ?DESC("api1_qs_action")})},
+                {source,
+                    mk(hoconsc:array(binary()), #{in => query, desc => ?DESC("api1_qs_source")})},
                 ref(emqx_dashboard_swagger, page),
                 ref(emqx_dashboard_swagger, limit)
             ],
@@ -255,6 +277,23 @@ schema("/rules/:id") ->
             responses => #{
                 404 => error_schema('NOT_FOUND', "Rule not found"),
                 204 => <<"Delete rule successfully">>
+            }
+        }
+    };
+schema("/rules/:id/test") ->
+    #{
+        'operationId' => '/rules/:id/test',
+        post => #{
+            tags => [<<"rules">>],
+            description => ?DESC("api11"),
+            summary => <<"Apply a rule for testing">>,
+            parameters => param_path_id(),
+            'requestBody' => rule_apply_test_schema(),
+            responses => #{
+                400 => error_schema('BAD_REQUEST', "Invalid Parameters"),
+                412 => error_schema('NOT_MATCH', "SQL Not Match"),
+                404 => error_schema('RULE_NOT_FOUND', "The rule could not be found"),
+                200 => <<"Rule Applied">>
             }
         }
     };
@@ -355,25 +394,31 @@ param_path_id() ->
     case maps:get(<<"id">>, Params0, list_to_binary(emqx_utils:gen_id(8))) of
         <<>> ->
             {400, #{code => 'BAD_REQUEST', message => <<"empty rule id is not allowed">>}};
-        Id ->
+        Id when is_binary(Id) ->
             Params = filter_out_request_body(add_metadata(Params0)),
             case emqx_rule_engine:get_rule(Id) of
                 {ok, _Rule} ->
-                    {400, #{code => 'BAD_REQUEST', message => <<"rule id already exists">>}};
+                    ?BAD_REQUEST(<<"rule id already exists">>);
                 not_found ->
                     ConfPath = ?RULE_PATH(Id),
                     case emqx_conf:update(ConfPath, Params, #{override_to => cluster}) of
                         {ok, #{post_config_update := #{emqx_rule_engine := Rule}}} ->
-                            {201, format_rule_info_resp(Rule)};
+                            ?CREATED(format_rule_info_resp(Rule));
                         {error, Reason} ->
-                            ?SLOG(error, #{
-                                msg => "create_rule_failed",
-                                id => Id,
-                                reason => Reason
-                            }),
-                            {400, #{code => 'BAD_REQUEST', message => ?ERR_BADARGS(Reason)}}
+                            ?SLOG(
+                                info,
+                                #{
+                                    msg => "create_rule_failed",
+                                    rule_id => Id,
+                                    reason => Reason
+                                },
+                                #{tag => ?TAG}
+                            ),
+                            ?BAD_REQUEST(?ERR_BADARGS(Reason))
                     end
-            end
+            end;
+        _BadId ->
+            ?BAD_REQUEST(<<"rule id must be a string">>)
     end.
 
 '/rule_test'(post, #{body := Params}) ->
@@ -392,6 +437,26 @@ param_path_id() ->
         end
     ).
 
+'/rules/:id/test'(post, #{body := Params, bindings := #{id := RuleId}}) ->
+    ?CHECK_PARAMS(
+        Params,
+        rule_apply_test,
+        begin
+            case emqx_rule_sqltester:apply_rule(RuleId, CheckedParams) of
+                {ok, Result} ->
+                    {200, emqx_logger_jsonfmt:best_effort_json_obj(Result)};
+                {error, {parse_error, Reason}} ->
+                    {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}};
+                {error, nomatch} ->
+                    {412, #{code => 'NOT_MATCH', message => <<"SQL Not Match">>}};
+                {error, rule_not_found} ->
+                    {404, #{code => 'RULE_NOT_FOUND', message => <<"The rule could not be found">>}};
+                {error, Reason} ->
+                    {400, #{code => 'BAD_REQUEST', message => err_msg(Reason)}}
+            end
+        end
+    ).
+
 '/rules/:id'(get, #{bindings := #{id := Id}}) ->
     case emqx_rule_engine:get_rule(Id) of
         {ok, Rule} ->
@@ -406,11 +471,15 @@ param_path_id() ->
         {ok, #{post_config_update := #{emqx_rule_engine := Rule}}} ->
             {200, format_rule_info_resp(Rule)};
         {error, Reason} ->
-            ?SLOG(error, #{
-                msg => "update_rule_failed",
-                id => Id,
-                reason => Reason
-            }),
+            ?SLOG(
+                info,
+                #{
+                    msg => "update_rule_failed",
+                    rule_id => Id,
+                    reason => Reason
+                },
+                #{tag => ?TAG}
+            ),
             {400, #{code => 'BAD_REQUEST', message => ?ERR_BADARGS(Reason)}}
     end;
 '/rules/:id'(delete, #{bindings := #{id := Id}}) ->
@@ -421,11 +490,15 @@ param_path_id() ->
                 {ok, _} ->
                     {204};
                 {error, Reason} ->
-                    ?SLOG(error, #{
-                        msg => "delete_rule_failed",
-                        id => Id,
-                        reason => Reason
-                    }),
+                    ?SLOG(
+                        error,
+                        #{
+                            msg => "delete_rule_failed",
+                            rule_id => Id,
+                            reason => Reason
+                        },
+                        #{tag => ?TAG}
+                    ),
                     {500, #{code => 'INTERNAL_ERROR', message => ?ERR_BADARGS(Reason)}}
             end;
         not_found ->
@@ -514,17 +587,23 @@ format_rule_engine_resp(Config) ->
     maps:remove(rules, Config).
 
 format_datetime(Timestamp, Unit) ->
-    list_to_binary(calendar:system_time_to_rfc3339(Timestamp, [{unit, Unit}])).
+    emqx_utils_calendar:epoch_to_rfc3339(Timestamp, Unit).
 
 format_action(Actions) ->
     [do_format_action(Act) || Act <- Actions].
 
 do_format_action({bridge, BridgeType, BridgeName, _ResId}) ->
     emqx_bridge_resource:bridge_id(BridgeType, BridgeName);
+do_format_action({bridge_v2, BridgeType, BridgeName}) ->
+    emqx_bridge_resource:bridge_id(BridgeType, BridgeName);
 do_format_action(#{mod := Mod, func := Func, args := Args}) ->
     #{
         function => printable_function_name(Mod, Func),
         args => maps:remove(preprocessed_tmpl, Args)
+    };
+do_format_action(#{mod := Mod, func := Func}) ->
+    #{
+        function => printable_function_name(Mod, Func)
     }.
 
 printable_function_name(emqx_rule_actions, Func) ->
@@ -534,15 +613,20 @@ printable_function_name(Mod, Func) ->
 
 get_rule_metrics(Id) ->
     Nodes = emqx:running_nodes(),
-    Results = emqx_metrics_proto_v1:get_metrics(Nodes, rule_metrics, Id, ?RPC_GET_METRICS_TIMEOUT),
+    Results = emqx_metrics_proto_v2:get_metrics(Nodes, rule_metrics, Id, ?RPC_GET_METRICS_TIMEOUT),
     NodeResults = lists:zip(Nodes, Results),
     NodeMetrics = [format_metrics(Node, Metrics) || {Node, {ok, Metrics}} <- NodeResults],
     NodeErrors = [Result || Result = {_Node, {NOk, _}} <- NodeResults, NOk =/= ok],
     NodeErrors == [] orelse
-        ?SLOG(warning, #{
-            msg => "rpc_get_rule_metrics_errors",
-            errors => NodeErrors
-        }),
+        ?SLOG(
+            warning,
+            #{
+                msg => "rpc_get_rule_metrics_errors",
+                rule_id => Id,
+                errors => NodeErrors
+            },
+            #{tag => ?TAG}
+        ),
     NodeMetrics.
 
 format_metrics(Node, #{
@@ -557,7 +641,8 @@ format_metrics(Node, #{
             'actions.failed' := OFailed,
             'actions.failed.out_of_service' := OFailedOOS,
             'actions.failed.unknown' := OFailedUnknown,
-            'actions.success' := OFailedSucc
+            'actions.success' := OSucc,
+            'actions.discarded' := ODiscard
         },
     rate :=
         #{
@@ -566,7 +651,7 @@ format_metrics(Node, #{
         }
 }) ->
     #{
-        metrics => ?METRICS(
+        metrics => ?METRICS_VAL(
             Matched,
             Passed,
             Failed,
@@ -576,7 +661,8 @@ format_metrics(Node, #{
             OFailed,
             OFailedOOS,
             OFailedUnknown,
-            OFailedSucc,
+            OSucc,
+            ODiscard,
             Current,
             Max,
             Last5M
@@ -587,79 +673,49 @@ format_metrics(Node, _Metrics) ->
     %% Empty metrics: can happen when a node joins another and a bridge is not yet
     %% replicated to it, so the counters map is empty.
     #{
-        metrics => ?METRICS(
-            _Matched = 0,
-            _Passed = 0,
-            _Failed = 0,
-            _FailedEx = 0,
-            _FailedNoRes = 0,
-            _OTotal = 0,
-            _OFailed = 0,
-            _OFailedOOS = 0,
-            _OFailedUnknown = 0,
-            _OFailedSucc = 0,
-            _Current = 0,
-            _Max = 0,
-            _Last5M = 0
-        ),
+        metrics => ?METRICS_VAL_ZERO,
         node => Node
     }.
 
 aggregate_metrics(AllMetrics) ->
-    InitMetrics = ?METRICS(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-    lists:foldl(
-        fun(
-            #{
-                metrics := ?metrics(
-                    Match1,
-                    Passed1,
-                    Failed1,
-                    FailedEx1,
-                    FailedNoRes1,
-                    OTotal1,
-                    OFailed1,
-                    OFailedOOS1,
-                    OFailedUnknown1,
-                    OFailedSucc1,
-                    Rate1,
-                    RateMax1,
-                    Rate5m1
-                )
-            },
-            ?metrics(
-                Match0,
-                Passed0,
-                Failed0,
-                FailedEx0,
-                FailedNoRes0,
-                OTotal0,
-                OFailed0,
-                OFailedOOS0,
-                OFailedUnknown0,
-                OFailedSucc0,
-                Rate0,
-                RateMax0,
-                Rate5m0
-            )
-        ) ->
-            ?METRICS(
-                Match1 + Match0,
-                Passed1 + Passed0,
-                Failed1 + Failed0,
-                FailedEx1 + FailedEx0,
-                FailedNoRes1 + FailedNoRes0,
-                OTotal1 + OTotal0,
-                OFailed1 + OFailed0,
-                OFailedOOS1 + OFailedOOS0,
-                OFailedUnknown1 + OFailedUnknown0,
-                OFailedSucc1 + OFailedSucc0,
-                Rate1 + Rate0,
-                RateMax1 + RateMax0,
-                Rate5m1 + Rate5m0
-            )
+    InitMetrics = ?METRICS_VAL_ZERO,
+    lists:foldl(fun do_aggregate_metrics/2, InitMetrics, AllMetrics).
+
+do_aggregate_metrics(#{metrics := Mt1}, Mt0) when map_size(Mt1) =:= map_size(Mt0) ->
+    ?METRICS_PAT(A1, B1, C1, D1, E1, F1, G1, H1, I1, J1, K1, L1, M1, N1) = Mt1,
+    ?METRICS_PAT(A0, B0, C0, D0, E0, F0, G0, H0, I0, J0, K0, L0, M0, N0) = Mt0,
+    ?METRICS_VAL(
+        A0 + A1,
+        B0 + B1,
+        C0 + C1,
+        D0 + D1,
+        E0 + E1,
+        F0 + F1,
+        G0 + G1,
+        H0 + H1,
+        I0 + I1,
+        J0 + J1,
+        K0 + K1,
+        L0 + L1,
+        M0 + M1,
+        N0 + N1
+    );
+do_aggregate_metrics(#{metrics := M1}, M0) ->
+    %% this happens during rolling upgrade
+    %% fallback to per-map-key iteration
+    maps:fold(
+        fun(Name, V1, Acc) ->
+            case maps:get(Name, Acc, false) of
+                false ->
+                    %% this is an unknown metric name for this node
+                    %% discard
+                    Acc;
+                V0 ->
+                    Acc#{Name => V0 + V1}
+            end
         end,
-        InitMetrics,
-        AllMetrics
+        M0,
+        M1
     ).
 
 add_metadata(Params) ->
@@ -681,7 +737,8 @@ filter_out_request_body(Conf) ->
     maps:without(ExtraConfs, Conf).
 
 -spec qs2ms(atom(), {list(), list()}) -> emqx_mgmt_api:match_spec_and_filter().
-qs2ms(_Tab, {Qs, Fuzzy}) ->
+qs2ms(_Tab, {Qs0, Fuzzy0}) ->
+    {Qs, Fuzzy} = adapt_custom_filters(Qs0, Fuzzy0),
     case lists:keytake(from, 1, Qs) of
         false ->
             #{match_spec => generate_match_spec(Qs), fuzzy_fun => fuzzy_match_fun(Fuzzy)};
@@ -692,6 +749,38 @@ qs2ms(_Tab, {Qs, Fuzzy}) ->
             }
     end.
 
+%% Some filters are run as fuzzy filters because they cannot be expressed as simple ETS
+%% match specs.
+-spec adapt_custom_filters(Qs, Fuzzy) -> {Qs, Fuzzy}.
+adapt_custom_filters(Qs, Fuzzy) ->
+    lists:foldl(
+        fun
+            ({action, '=:=', X}, {QsAcc, FuzzyAcc}) ->
+                ActionIds = wrap(X),
+                Parsed = lists:map(fun emqx_rule_actions:parse_action/1, ActionIds),
+                {QsAcc, [{action, in, Parsed} | FuzzyAcc]};
+            ({source, '=:=', X}, {QsAcc, FuzzyAcc}) ->
+                SourceIds = wrap(X),
+                Parsed = lists:flatmap(
+                    fun(SourceId) ->
+                        [
+                            emqx_bridge_resource:bridge_hookpoint(SourceId),
+                            emqx_bridge_v2:source_hookpoint(SourceId)
+                        ]
+                    end,
+                    SourceIds
+                ),
+                {QsAcc, [{source, in, Parsed} | FuzzyAcc]};
+            (Clause, {QsAcc, FuzzyAcc}) ->
+                {[Clause | QsAcc], FuzzyAcc}
+        end,
+        {[], Fuzzy},
+        Qs
+    ).
+
+wrap(Xs) when is_list(Xs) -> Xs;
+wrap(X) -> [X].
+
 generate_match_spec(Qs) ->
     {MtchHead, Conds} = generate_match_spec(Qs, 2, {#{}, []}),
     [{{'_', MtchHead}, Conds, ['$_']}].
@@ -699,7 +788,7 @@ generate_match_spec(Qs) ->
 generate_match_spec([], _, {MtchHead, Conds}) ->
     {MtchHead, lists:reverse(Conds)};
 generate_match_spec([Qs | Rest], N, {MtchHead, Conds}) ->
-    Holder = binary_to_atom(iolist_to_binary(["$", integer_to_list(N)]), utf8),
+    Holder = list_to_atom([$$ | integer_to_list(N)]),
     NMtchHead = emqx_mgmt_util:merge_maps(MtchHead, ms(element(1, Qs), Holder)),
     NConds = put_conds(Qs, Holder, Conds),
     generate_match_spec(Rest, N + 1, {NMtchHead, NConds}).
@@ -728,6 +817,12 @@ run_fuzzy_match(E = {_Id, #{from := Topics}}, [{from, match, Pattern} | Fuzzy]) 
         run_fuzzy_match(E, Fuzzy);
 run_fuzzy_match(E = {_Id, #{from := Topics}}, [{from, like, Pattern} | Fuzzy]) ->
     lists:any(fun(For) -> binary:match(For, Pattern) /= nomatch end, Topics) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_Id, #{actions := Actions}}, [{action, in, ActionIds} | Fuzzy]) ->
+    lists:any(fun(AId) -> lists:member(AId, Actions) end, ActionIds) andalso
+        run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_Id, #{from := Froms}}, [{source, in, SourceIds} | Fuzzy]) ->
+    lists:any(fun(SId) -> lists:member(SId, Froms) end, SourceIds) andalso
         run_fuzzy_match(E, Fuzzy);
 run_fuzzy_match(E, [_ | Fuzzy]) ->
     run_fuzzy_match(E, Fuzzy).

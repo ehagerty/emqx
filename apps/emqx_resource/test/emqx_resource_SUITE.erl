@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource_buffer_worker_internal.hrl").
 
 -define(TEST_RESOURCE, emqx_connector_demo).
 -define(ID, <<"id">>).
@@ -28,6 +29,11 @@
 -define(DEFAULT_RESOURCE_GROUP, <<"default">>).
 -define(RESOURCE_ERROR(REASON), {error, {resource_error, #{reason := REASON}}}).
 -define(TRACE_OPTS, #{timetrap => 10000, timeout => 1000}).
+-define(TELEMETRY_PREFIX, emqx, resource).
+-define(tpal(MSG), begin
+    ct:pal(MSG),
+    ?tp(notice, MSG, #{})
+end).
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -45,18 +51,26 @@ init_per_testcase(_, Config) ->
 
 end_per_testcase(_, _Config) ->
     snabbkaffe:stop(),
-    _ = emqx_resource:remove(?ID),
+    _ = emqx_resource:remove_local(?ID),
     emqx_common_test_helpers:call_janitor(),
     ok.
 
 init_per_suite(Config) ->
     code:ensure_loaded(?TEST_RESOURCE),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    {ok, _} = application:ensure_all_started(emqx_resource),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_resource
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_resource, emqx_conf]).
+end_per_suite(Config) ->
+    Apps = proplists:get_value(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Tests
@@ -87,7 +101,7 @@ t_create_remove(_) ->
 
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -97,7 +111,7 @@ t_create_remove(_) ->
 
             ?assertMatch(
                 {ok, _},
-                emqx_resource:recreate(
+                emqx_resource:recreate_local(
                     ?ID,
                     ?TEST_RESOURCE,
                     #{name => test_resource},
@@ -109,15 +123,12 @@ t_create_remove(_) ->
 
             ?assert(is_process_alive(Pid)),
 
-            ?assertEqual(ok, emqx_resource:remove(?ID)),
-            ?assertMatch({error, _}, emqx_resource:remove(?ID)),
+            ?assertEqual(ok, emqx_resource:remove_local(?ID)),
+            ?assertMatch(ok, emqx_resource:remove_local(?ID)),
 
             ?assertNot(is_process_alive(Pid))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_create_remove_local(_) ->
@@ -135,7 +146,7 @@ t_create_remove_local(_) ->
 
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create_local(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -164,19 +175,16 @@ t_create_remove_local(_) ->
             ),
 
             ?assertEqual(ok, emqx_resource:remove_local(?ID)),
-            ?assertMatch({error, _}, emqx_resource:remove_local(?ID)),
+            ?assertMatch(ok, emqx_resource:remove_local(?ID)),
 
             ?assertMatch(
-                ?RESOURCE_ERROR(not_found),
+                {error, not_found},
                 emqx_resource:query(?ID, get_state)
             ),
 
             ?assertNot(is_process_alive(Pid))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_do_not_start_after_created(_) ->
@@ -184,7 +192,7 @@ t_do_not_start_after_created(_) ->
         begin
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create_local(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -218,14 +226,11 @@ t_do_not_start_after_created(_) ->
 
             ?assertNot(is_process_alive(Pid2))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_query(_) ->
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -235,14 +240,14 @@ t_query(_) ->
     {ok, #{pid := _}} = emqx_resource:query(?ID, get_state),
 
     ?assertMatch(
-        ?RESOURCE_ERROR(not_found),
+        {error, not_found},
         emqx_resource:query(<<"unknown">>, get_state)
     ),
 
     ok = emqx_resource:remove_local(?ID).
 
 t_query_counter(_) ->
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -259,7 +264,7 @@ t_query_counter(_) ->
 
 t_batch_query_counter(_) ->
     BatchSize = 100,
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -277,10 +282,9 @@ t_batch_query_counter(_) ->
         fun(Result, Trace) ->
             ?assertMatch({ok, 0}, Result),
             QueryTrace = ?of_kind(call_batch_query, Trace),
-            ?assertMatch([#{batch := [{query, _, get_counter, _, _}]}], QueryTrace)
+            ?assertMatch([#{batch := [?QUERY(_, get_counter, _, _, _, _)]}], QueryTrace)
         end
     ),
-
     NMsgs = 1_000,
     ?check_trace(
         ?TRACE_OPTS,
@@ -312,7 +316,7 @@ t_batch_query_counter(_) ->
     ok = emqx_resource:remove_local(?ID).
 
 t_query_counter_async_query(_) ->
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -340,7 +344,7 @@ t_query_counter_async_query(_) ->
         fun(Trace) ->
             %% the callback_mode of 'emqx_connector_demo' is 'always_sync'.
             QueryTrace = ?of_kind(call_query, Trace),
-            ?assertMatch([#{query := {query, _, {inc_counter, 1}, _, _}} | _], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, {inc_counter, 1}, _, _, _, _)} | _], QueryTrace)
         end
     ),
     %% simple query ignores the query_mode and batching settings in the resource_worker
@@ -351,7 +355,7 @@ t_query_counter_async_query(_) ->
             ?assertMatch({ok, 1000}, Result),
             %% the callback_mode if 'emqx_connector_demo' is 'always_sync'.
             QueryTrace = ?of_kind(call_query, Trace),
-            ?assertMatch([#{query := {query, _, get_counter, _, _}}], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, get_counter, _, _, _, _)}], QueryTrace)
         end
     ),
     #{counters := C} = emqx_resource:get_metrics(?ID),
@@ -370,7 +374,7 @@ t_query_counter_async_callback(_) ->
         ets:insert(Tab, {make_ref(), Result})
     end,
     ReqOpts = #{async_reply_fun => {Insert, [Tab0]}},
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -397,7 +401,7 @@ t_query_counter_async_callback(_) ->
         end,
         fun(Trace) ->
             QueryTrace = ?of_kind(call_query_async, Trace),
-            ?assertMatch([#{query := {query, _, {inc_counter, 1}, _, _}} | _], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, {inc_counter, 1}, _, _, _, _)} | _], QueryTrace)
         end
     ),
 
@@ -408,7 +412,7 @@ t_query_counter_async_callback(_) ->
         fun(Result, Trace) ->
             ?assertMatch({ok, 1000}, Result),
             QueryTrace = ?of_kind(call_query, Trace),
-            ?assertMatch([#{query := {query, _, get_counter, _, _}}], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, get_counter, _, _, _, _)}], QueryTrace)
         end
     ),
     #{counters := C} = emqx_resource:get_metrics(?ID),
@@ -451,7 +455,7 @@ t_query_counter_async_inflight(_) ->
     end,
     ReqOpts = fun() -> #{async_reply_fun => {Insert0, [Tab0, make_ref()]}} end,
     WindowSize = 15,
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -480,7 +484,7 @@ t_query_counter_async_inflight(_) ->
             ),
         fun(Trace) ->
             QueryTrace = ?of_kind(call_query_async, Trace),
-            ?assertMatch([#{query := {query, _, {inc_counter, 1}, _, _}} | _], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, {inc_counter, 1}, _, _, _, _)} | _], QueryTrace)
         end
     ),
     tap_metrics(?LINE),
@@ -537,7 +541,7 @@ t_query_counter_async_inflight(_) ->
         end,
         fun(Trace) ->
             QueryTrace = ?of_kind(call_query_async, Trace),
-            ?assertMatch([#{query := {query, _, {inc_counter, _}, _, _}} | _], QueryTrace),
+            ?assertMatch([#{query := ?QUERY(_, {inc_counter, _}, _, _, _, _)} | _], QueryTrace),
             ?assertEqual(WindowSize + Num + 1, ets:info(Tab0, size), #{tab => ets:tab2list(Tab0)}),
             tap_metrics(?LINE),
             ok
@@ -557,7 +561,7 @@ t_query_counter_async_inflight(_) ->
             ),
         fun(Trace) ->
             QueryTrace = ?of_kind(call_query_async, Trace),
-            ?assertMatch([#{query := {query, _, {inc_counter, 1}, _, _}} | _], QueryTrace)
+            ?assertMatch([#{query := ?QUERY(_, {inc_counter, 1}, _, _, _, _)} | _], QueryTrace)
         end
     ),
 
@@ -634,7 +638,7 @@ t_query_counter_async_inflight_batch(_) ->
     ReqOpts = fun() -> #{async_reply_fun => {Insert0, [Tab0, make_ref()]}} end,
     BatchSize = 2,
     WindowSize = 15,
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -669,8 +673,8 @@ t_query_counter_async_inflight_batch(_) ->
              || Event = #{
                     ?snk_kind := call_batch_query_async,
                     batch := [
-                        {query, _, {inc_counter, 1}, _, _},
-                        {query, _, {inc_counter, 1}, _, _}
+                        ?QUERY(_, {inc_counter, 1}, _, _, _, _),
+                        ?QUERY(_, {inc_counter, 1}, _, _, _, _)
                     ]
                 } <-
                     Trace
@@ -754,7 +758,7 @@ t_query_counter_async_inflight_batch(_) ->
         fun(Trace) ->
             QueryTrace = ?of_kind(call_batch_query_async, Trace),
             ?assertMatch(
-                [#{batch := [{query, _, {inc_counter, _}, _, _} | _]} | _],
+                [#{batch := [?QUERY(_, {inc_counter, _}, _, _, _, _) | _]} | _],
                 QueryTrace
             )
         end
@@ -779,7 +783,7 @@ t_query_counter_async_inflight_batch(_) ->
         fun(Trace) ->
             QueryTrace = ?of_kind(call_batch_query_async, Trace),
             ?assertMatch(
-                [#{batch := [{query, _, {inc_counter, _}, _, _} | _]} | _],
+                [#{batch := [?QUERY(_, {inc_counter, _}, _, _, _, _) | _]} | _],
                 QueryTrace
             )
         end
@@ -836,7 +840,7 @@ t_healthy_timeout(_) ->
         begin
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create_local(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -854,28 +858,29 @@ t_healthy_timeout(_) ->
             ),
             ?assertEqual(ok, emqx_resource:remove_local(?ID))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_healthy(_) ->
     ?check_trace(
+        #{timetrap => 10_000},
         begin
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create_local(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
                     #{name => test_resource}
                 )
             ),
+            ct:pal("getting state"),
             {ok, #{pid := Pid}} = emqx_resource:query(?ID, get_state),
             timer:sleep(300),
+            ct:pal("setting state as `connecting`"),
             emqx_resource:set_resource_status_connecting(?ID),
 
+            ct:pal("health check"),
             ?assertEqual({ok, connected}, emqx_resource:health_check(?ID)),
             ?assertMatch(
                 [#{status := connected}],
@@ -893,18 +898,47 @@ t_healthy(_) ->
 
             ?assertEqual(ok, emqx_resource:remove_local(?ID))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
+
+t_unhealthy_target(_) ->
+    HealthCheckError = {unhealthy_target, "some message"},
+    ?assertMatch(
+        {ok, _},
+        create(
+            ?ID,
+            ?DEFAULT_RESOURCE_GROUP,
+            ?TEST_RESOURCE,
+            #{name => test_resource, health_check_error => {msg, HealthCheckError}}
+        )
+    ),
+    ?assertEqual(
+        {ok, disconnected},
+        emqx_resource:health_check(?ID)
+    ),
+    ?assertMatch(
+        {ok, _Group, #{error := HealthCheckError}},
+        emqx_resource_manager:lookup(?ID)
+    ),
+    %% messages are dropped when bridge is unhealthy
+    lists:foreach(
+        fun(_) ->
+            ?assertMatch(
+                {error, {resource_error, #{reason := unhealthy_target}}},
+                emqx_resource:query(?ID, message)
+            )
+        end,
+        lists:seq(1, 3)
+    ),
+    ?assertEqual(3, emqx_resource_metrics:matched_get(?ID)),
+    ?assertEqual(3, emqx_resource_metrics:dropped_resource_stopped_get(?ID)).
 
 t_stop_start(_) ->
     ?check_trace(
         begin
             ?assertMatch(
                 {error, _},
-                emqx_resource:check_and_create(
+                emqx_resource:check_and_create_local(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -914,7 +948,7 @@ t_stop_start(_) ->
 
             ?assertMatch(
                 {ok, _},
-                emqx_resource:check_and_create(
+                emqx_resource:check_and_create_local(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -931,7 +965,7 @@ t_stop_start(_) ->
 
             ?assertMatch(
                 {ok, _},
-                emqx_resource:check_and_recreate(
+                emqx_resource:check_and_recreate_local(
                     ?ID,
                     ?TEST_RESOURCE,
                     #{<<"name">> => <<"test_resource">>},
@@ -972,11 +1006,7 @@ t_stop_start(_) ->
             ?assertEqual(ok, emqx_resource:stop(?ID)),
             ?assertEqual(0, emqx_resource_metrics:inflight_get(?ID))
         end,
-
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_stop_start_local(_) ->
@@ -1031,20 +1061,17 @@ t_stop_start_local(_) ->
 
             ?assert(is_process_alive(Pid1))
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_list_filter(_) ->
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         emqx_resource:generate_id(<<"a">>),
         <<"group1">>,
         ?TEST_RESOURCE,
         #{name => a}
     ),
-    {ok, _} = emqx_resource:create_local(
+    {ok, _} = create(
         emqx_resource:generate_id(<<"a">>),
         <<"group2">>,
         ?TEST_RESOURCE,
@@ -1091,29 +1118,32 @@ create_dry_run_local_succ() ->
 
 t_create_dry_run_local_failed(_) ->
     ct:timetrap({seconds, 120}),
-    ct:pal("creating with creation error"),
-    Res1 = emqx_resource:create_dry_run_local(
-        ?TEST_RESOURCE,
-        #{create_error => true}
-    ),
-    ?assertMatch({error, _}, Res1),
+    emqx_utils:nolink_apply(fun() ->
+        ct:pal("creating with creation error"),
+        Res1 = emqx_resource:create_dry_run_local(
+            ?TEST_RESOURCE,
+            #{create_error => true}
+        ),
+        ?assertMatch({error, _}, Res1),
 
-    ct:pal("creating with health check error"),
-    Res2 = emqx_resource:create_dry_run_local(
-        ?TEST_RESOURCE,
-        #{name => test_resource, health_check_error => true}
-    ),
-    ?assertMatch({error, _}, Res2),
+        ct:pal("creating with health check error"),
+        Res2 = emqx_resource:create_dry_run_local(
+            ?TEST_RESOURCE,
+            #{name => test_resource, health_check_error => true}
+        ),
+        ?assertMatch({error, _}, Res2),
 
-    ct:pal("creating with stop error"),
-    Res3 = emqx_resource:create_dry_run_local(
-        ?TEST_RESOURCE,
-        #{name => test_resource, stop_error => true}
-    ),
-    ?assertEqual(ok, Res3),
+        ct:pal("creating with stop error"),
+        Res3 = emqx_resource:create_dry_run_local(
+            ?TEST_RESOURCE,
+            #{name => test_resource, stop_error => true}
+        ),
+        ?assertEqual(ok, Res3),
+        ok
+    end),
     ?retry(
         100,
-        5,
+        50,
         ?assertEqual(
             [],
             emqx_resource:list_instances_verbose()
@@ -1121,13 +1151,61 @@ t_create_dry_run_local_failed(_) ->
     ).
 
 t_test_func(_) ->
+    IsErrorMsgPlainString = fun({error, Msg}) -> io_lib:printable_list(Msg) end,
     ?assertEqual(ok, erlang:apply(emqx_resource_validator:not_empty("not_empty"), [<<"someval">>])),
     ?assertEqual(ok, erlang:apply(emqx_resource_validator:min(int, 3), [4])),
     ?assertEqual(ok, erlang:apply(emqx_resource_validator:max(array, 10), [[a, b, c, d]])),
-    ?assertEqual(ok, erlang:apply(emqx_resource_validator:max(string, 10), ["less10"])).
+    ?assertEqual(ok, erlang:apply(emqx_resource_validator:max(string, 10), ["less10"])),
+    ?assertEqual(
+        true, IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:min(int, 66), [42]))
+    ),
+    ?assertEqual(
+        true, IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:max(int, 42), [66]))
+    ),
+    ?assertEqual(
+        true, IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:min(array, 3), [[1, 2]]))
+    ),
+    ?assertEqual(
+        true,
+        IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:max(array, 3), [[1, 2, 3, 4]]))
+    ),
+    ?assertEqual(
+        true, IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:min(string, 3), ["1"]))
+    ),
+    ?assertEqual(
+        true, IsErrorMsgPlainString(erlang:apply(emqx_resource_validator:max(string, 3), ["1234"]))
+    ),
+    NestedMsg = io_lib:format("The answer: ~p", [42]),
+    ExpectedMsg = "The answer: 42",
+    BinMsg = <<"The answer: 42">>,
+    MapMsg = #{question => "The question", answer => 42},
+    ?assertEqual(
+        {error, ExpectedMsg},
+        erlang:apply(emqx_resource_validator:not_empty(NestedMsg), [""])
+    ),
+    ?assertEqual(
+        {error, ExpectedMsg},
+        erlang:apply(emqx_resource_validator:not_empty(NestedMsg), [<<>>])
+    ),
+    ?assertEqual(
+        {error, ExpectedMsg},
+        erlang:apply(emqx_resource_validator:not_empty(NestedMsg), [undefined])
+    ),
+    ?assertEqual(
+        {error, ExpectedMsg},
+        erlang:apply(emqx_resource_validator:not_empty(NestedMsg), [undefined])
+    ),
+    ?assertEqual(
+        {error, BinMsg},
+        erlang:apply(emqx_resource_validator:not_empty(BinMsg), [undefined])
+    ),
+    ?assertEqual(
+        {error, MapMsg},
+        erlang:apply(emqx_resource_validator:not_empty(MapMsg), [""])
+    ).
 
 t_reset_metrics(_) ->
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1137,11 +1215,11 @@ t_reset_metrics(_) ->
     {ok, #{pid := Pid}} = emqx_resource:query(?ID, get_state),
     emqx_resource:reset_metrics(?ID),
     ?assert(is_process_alive(Pid)),
-    ok = emqx_resource:remove(?ID),
+    ok = emqx_resource:remove_local(?ID),
     ?assertNot(is_process_alive(Pid)).
 
 t_auto_retry(_) ->
-    {Res, _} = emqx_resource:create_local(
+    {Res, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1158,7 +1236,7 @@ t_start_throw_error(_Config) ->
     ?assertMatch(
         {{ok, _}, {ok, _}},
         ?wait_async_action(
-            emqx_resource:create_local(
+            create(
                 ?ID,
                 ?DEFAULT_RESOURCE_GROUP,
                 ?TEST_RESOURCE,
@@ -1176,7 +1254,7 @@ t_start_throw_error(_Config) ->
 t_health_check_disconnected(_) ->
     ?check_trace(
         begin
-            _ = emqx_resource:create_local(
+            _ = create(
                 ?ID,
                 ?DEFAULT_RESOURCE_GROUP,
                 ?TEST_RESOURCE,
@@ -1188,14 +1266,11 @@ t_health_check_disconnected(_) ->
                 emqx_resource:health_check(?ID)
             )
         end,
-        fun(Trace) ->
-            ?assertEqual([], ?of_kind("inconsistent_state", Trace)),
-            ?assertEqual([], ?of_kind("inconsistent_cache", Trace))
-        end
+        [log_consistency_prop()]
     ).
 
 t_unblock_only_required_buffer_workers(_) ->
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1211,7 +1286,7 @@ t_unblock_only_required_buffer_workers(_) ->
         fun emqx_resource_buffer_worker:block/1,
         emqx_resource_buffer_worker_sup:worker_pids(?ID)
     ),
-    emqx_resource:create(
+    create(
         ?ID1,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1242,7 +1317,7 @@ t_unblock_only_required_buffer_workers(_) ->
     ).
 
 t_retry_batch(_Config) ->
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1341,7 +1416,7 @@ t_retry_batch(_Config) ->
 
 t_delete_and_re_create_with_same_name(_Config) ->
     NumBufferWorkers = 2,
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1358,8 +1433,10 @@ t_delete_and_re_create_with_same_name(_Config) ->
     ),
     %% pre-condition: we should have just created a new queue
     Queuing0 = emqx_resource_metrics:queuing_get(?ID),
+    QueuingBytes0 = emqx_resource_metrics:queuing_bytes_get(?ID),
     Inflight0 = emqx_resource_metrics:inflight_get(?ID),
     ?assertEqual(0, Queuing0),
+    ?assertEqual(0, QueuingBytes0),
     ?assertEqual(0, Inflight0),
     ?check_trace(
         begin
@@ -1371,7 +1448,8 @@ t_delete_and_re_create_with_same_name(_Config) ->
                 _Timeout = 5_000
             ),
             %% ensure replayq offloads to disk
-            Payload = binary:copy(<<"a">>, 119),
+            NumBytes = 119,
+            Payload = binary:copy(<<"a">>, NumBytes),
             lists:foreach(
                 fun(N) ->
                     spawn_link(fun() ->
@@ -1397,6 +1475,13 @@ t_delete_and_re_create_with_same_name(_Config) ->
             ?retry(
                 _Sleep = 300,
                 _Attempts0 = 20,
+                %% `> NumBytes' because replayq reports total usage, not just payload, so
+                %% headers and metadata are included.
+                ?assert(emqx_resource_metrics:queuing_bytes_get(?ID) > NumBytes)
+            ),
+            ?retry(
+                _Sleep = 300,
+                _Attempts0 = 20,
                 ?assertEqual(2, emqx_resource_metrics:inflight_get(?ID))
             ),
 
@@ -1408,7 +1493,7 @@ t_delete_and_re_create_with_same_name(_Config) ->
             %% re-create the resource with the *same name*
             {{ok, _}, {ok, _Events}} =
                 ?wait_async_action(
-                    emqx_resource:create(
+                    create(
                         ?ID,
                         ?DEFAULT_RESOURCE_GROUP,
                         ?TEST_RESOURCE,
@@ -1427,8 +1512,10 @@ t_delete_and_re_create_with_same_name(_Config) ->
 
             %% it shouldn't have anything enqueued, as it's a fresh resource
             Queuing2 = emqx_resource_metrics:queuing_get(?ID),
-            Inflight2 = emqx_resource_metrics:queuing_get(?ID),
+            QueuingBytes2 = emqx_resource_metrics:queuing_bytes_get(?ID),
+            Inflight2 = emqx_resource_metrics:inflight_get(?ID),
             ?assertEqual(0, Queuing2),
+            ?assertEqual(0, QueuingBytes2),
             ?assertEqual(0, Inflight2),
 
             ok
@@ -1440,7 +1527,7 @@ t_delete_and_re_create_with_same_name(_Config) ->
 %% check that, if we configure a max queue size too small, then we
 %% never send requests and always overflow.
 t_always_overflow(_Config) ->
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1479,7 +1566,7 @@ t_always_overflow(_Config) ->
 t_retry_sync_inflight(_Config) ->
     ResumeInterval = 1_000,
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1529,7 +1616,7 @@ t_retry_sync_inflight(_Config) ->
 t_retry_sync_inflight_batch(_Config) ->
     ResumeInterval = 1_000,
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1581,7 +1668,7 @@ t_retry_sync_inflight_batch(_Config) ->
 t_retry_async_inflight(_Config) ->
     ResumeInterval = 1_000,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1625,7 +1712,7 @@ t_retry_async_inflight_full(_Config) ->
     ResumeInterval = 1_000,
     AsyncInflightWindow = 5,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1688,7 +1775,7 @@ t_async_reply_multi_eval(_Config) ->
     AsyncInflightWindow = 3,
     TotalQueries = AsyncInflightWindow * 5,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1737,7 +1824,7 @@ t_async_reply_multi_eval(_Config) ->
 t_retry_async_inflight_batch(_Config) ->
     ResumeInterval = 1_000,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1784,7 +1871,7 @@ t_async_pool_worker_death(_Config) ->
     ResumeInterval = 1_000,
     NumBufferWorkers = 2,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1875,7 +1962,7 @@ t_async_pool_worker_death(_Config) ->
 
 t_expiration_sync_before_sending(_Config) ->
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1892,7 +1979,7 @@ t_expiration_sync_before_sending(_Config) ->
 
 t_expiration_sync_batch_before_sending(_Config) ->
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1910,7 +1997,7 @@ t_expiration_sync_batch_before_sending(_Config) ->
 
 t_expiration_async_before_sending(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1927,7 +2014,7 @@ t_expiration_async_before_sending(_Config) ->
 
 t_expiration_async_batch_before_sending(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -1983,7 +2070,7 @@ do_t_expiration_before_sending(QueryMode) ->
         end,
         fun(Trace) ->
             ?assertMatch(
-                [#{batch := [{query, _, {inc_counter, 99}, _, _}]}],
+                [#{batch := [?QUERY(_, {inc_counter, 99}, _, _, _, _)]}],
                 ?of_kind(buffer_worker_flush_all_expired, Trace)
             ),
             Metrics = tap_metrics(?LINE),
@@ -2008,7 +2095,7 @@ do_t_expiration_before_sending(QueryMode) ->
 
 t_expiration_sync_before_sending_partial_batch(_Config) ->
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2027,7 +2114,7 @@ t_expiration_sync_before_sending_partial_batch(_Config) ->
 
 t_expiration_async_before_sending_partial_batch(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2099,7 +2186,7 @@ do_t_expiration_before_sending_partial_batch(QueryMode) ->
                         #{
                             ?snk_kind := handle_async_reply,
                             action := ack,
-                            batch_or_query := [{query, _, {inc_counter, 99}, _, _}]
+                            batch_or_query := [?QUERY(_, {inc_counter, 99}, _, _, _, _)]
                         },
                         10 * TimeoutMS
                     );
@@ -2121,8 +2208,8 @@ do_t_expiration_before_sending_partial_batch(QueryMode) ->
             ?assertMatch(
                 [
                     #{
-                        expired := [{query, _, {inc_counter, 199}, _, _}],
-                        not_expired := [{query, _, {inc_counter, 99}, _, _}]
+                        expired := [?QUERY(_, {inc_counter, 199}, _, _, _, _)],
+                        not_expired := [?QUERY(_, {inc_counter, 99}, _, _, _, _)]
                     }
                 ],
                 ?of_kind(buffer_worker_flush_potentially_partial, Trace)
@@ -2184,7 +2271,7 @@ do_t_expiration_before_sending_partial_batch(QueryMode) ->
 
 t_expiration_async_after_reply(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2201,7 +2288,7 @@ t_expiration_async_after_reply(_Config) ->
 
 t_expiration_async_batch_after_reply(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2235,7 +2322,7 @@ do_t_expiration_async_after_reply(IsBatch) ->
                 #{?snk_kind := delay},
                 #{
                     ?snk_kind := handle_async_reply_enter,
-                    batch_or_query := [{query, _, {inc_counter, 199}, _, _} | _]
+                    batch_or_query := [?QUERY(_, {inc_counter, 199}, _, _, _, _) | _]
                 }
             ),
 
@@ -2278,8 +2365,8 @@ do_t_expiration_async_after_reply(IsBatch) ->
                         [
                             #{
                                 expired := [
-                                    {query, _, {inc_counter, 199}, _, _},
-                                    {query, _, {inc_counter, 299}, _, _}
+                                    ?QUERY(_, {inc_counter, 199}, _, _, _, _),
+                                    ?QUERY(_, {inc_counter, 299}, _, _, _, _)
                                 ]
                             }
                         ],
@@ -2297,8 +2384,8 @@ do_t_expiration_async_after_reply(IsBatch) ->
                 single ->
                     ?assertMatch(
                         [
-                            #{expired := [{query, _, {inc_counter, 199}, _, _}]},
-                            #{expired := [{query, _, {inc_counter, 299}, _, _}]}
+                            #{expired := [?QUERY(_, {inc_counter, 199}, _, _, _, _)]},
+                            #{expired := [?QUERY(_, {inc_counter, 299}, _, _, _, _)]}
                         ],
                         ?of_kind(handle_async_reply_expired, Trace)
                     )
@@ -2326,7 +2413,7 @@ do_t_expiration_async_after_reply(IsBatch) ->
 t_expiration_batch_all_expired_after_reply(_Config) ->
     ResumeInterval = 300,
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2349,7 +2436,7 @@ t_expiration_batch_all_expired_after_reply(_Config) ->
                 #{?snk_kind := delay},
                 #{
                     ?snk_kind := handle_async_reply_enter,
-                    batch_or_query := [{query, _, {inc_counter, 199}, _, _} | _]
+                    batch_or_query := [?QUERY(_, {inc_counter, 199}, _, _, _, _) | _]
                 }
             ),
 
@@ -2383,8 +2470,8 @@ t_expiration_batch_all_expired_after_reply(_Config) ->
                 [
                     #{
                         expired := [
-                            {query, _, {inc_counter, 199}, _, _},
-                            {query, _, {inc_counter, 299}, _, _}
+                            ?QUERY(_, {inc_counter, 199}, _, _, _, _),
+                            ?QUERY(_, {inc_counter, 299}, _, _, _, _)
                         ]
                     }
                 ],
@@ -2415,7 +2502,7 @@ t_expiration_batch_all_expired_after_reply(_Config) ->
 
 t_expiration_retry(_Config) ->
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2427,11 +2514,11 @@ t_expiration_retry(_Config) ->
             resume_interval => 300
         }
     ),
-    do_t_expiration_retry().
+    do_t_expiration_retry(#{is_batch => false}).
 
 t_expiration_retry_batch(_Config) ->
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2444,20 +2531,17 @@ t_expiration_retry_batch(_Config) ->
             resume_interval => 300
         }
     ),
-    do_t_expiration_retry().
+    do_t_expiration_retry(#{is_batch => true}).
 
-do_t_expiration_retry() ->
+do_t_expiration_retry(Context) ->
+    IsBatch = maps:get(is_batch, Context),
     ResumeInterval = 300,
     ?check_trace(
+        #{timetrap => 10_000},
         begin
             ok = emqx_resource:simple_sync_query(?ID, block),
 
-            {ok, SRef0} = snabbkaffe:subscribe(
-                ?match_event(#{?snk_kind := buffer_worker_flush_nack}),
-                1,
-                200
-            ),
-            TimeoutMS = 100,
+            TimeoutMS = 200,
             %% the request that expires must be first, so it's the
             %% head of the inflight table (and retriable).
             {ok, SRef1} = snabbkaffe:subscribe(
@@ -2475,6 +2559,8 @@ do_t_expiration_retry() ->
                     )
                 )
             end),
+            %% This second message must be enqueued while the resource is blocked by the
+            %% previous message.
             Pid1 =
                 spawn_link(fun() ->
                     receive
@@ -2489,28 +2575,39 @@ do_t_expiration_retry() ->
                         )
                     )
                 end),
+            ?tp("waiting for first message to be appended to the queue", #{}),
             {ok, _} = snabbkaffe:receive_events(SRef1),
+
+            ?tp("waiting for first message to expire during blocked retries", #{}),
+            {ok, _} = ?block_until(#{?snk_kind := buffer_worker_retry_expired}),
+
+            %% Now we wait until the worker tries the second message at least once before
+            %% unblocking it.
             Pid1 ! go,
-            {ok, _} = snabbkaffe:receive_events(SRef0),
+            ?tp("waiting for second message to be retried and be nacked while blocked", #{}),
+            case IsBatch of
+                false ->
+                    {ok, _} = ?block_until(#{
+                        ?snk_kind := buffer_worker_flush_nack,
+                        batch_or_query := ?QUERY(_, {inc_counter, 2}, _, _, _, _)
+                    });
+                true ->
+                    {ok, _} = ?block_until(#{
+                        ?snk_kind := buffer_worker_flush_nack,
+                        batch_or_query := [?QUERY(_, {inc_counter, 2}, _, _, _, _) | _]
+                    })
+            end,
 
-            {ok, _} =
-                ?block_until(
-                    #{?snk_kind := buffer_worker_retry_expired},
-                    ResumeInterval * 10
-                ),
-
-            {ok, {ok, _}} =
-                ?wait_async_action(
-                    emqx_resource:simple_sync_query(?ID, resume),
-                    #{?snk_kind := buffer_worker_retry_inflight_succeeded},
-                    ResumeInterval * 5
-                ),
+            %% Bypass the buffer worker and unblock the resource.
+            ok = emqx_resource:simple_sync_query(?ID, resume),
+            ?tp("waiting for second message to be retried and be acked, unblocking", #{}),
+            {ok, _} = ?block_until(#{?snk_kind := buffer_worker_retry_inflight_succeeded}),
 
             ok
         end,
         fun(Trace) ->
             ?assertMatch(
-                [#{expired := [{query, _, {inc_counter, 1}, _, _}]}],
+                [#{expired := [?QUERY(_, {inc_counter, 1}, _, _, _, _)]}],
                 ?of_kind(buffer_worker_retry_expired, Trace)
             ),
             Metrics = tap_metrics(?LINE),
@@ -2531,7 +2628,7 @@ do_t_expiration_retry() ->
 t_expiration_retry_batch_multiple_times(_Config) ->
     ResumeInterval = 300,
     emqx_connector_demo:set_callback_mode(always_sync),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2587,8 +2684,8 @@ t_expiration_retry_batch_multiple_times(_Config) ->
         fun(Trace) ->
             ?assertMatch(
                 [
-                    #{expired := [{query, _, {inc_counter, 1}, _, _}]},
-                    #{expired := [{query, _, {inc_counter, 2}, _, _}]}
+                    #{expired := [?QUERY(_, {inc_counter, 1}, _, _, _, _)]},
+                    #{expired := [?QUERY(_, {inc_counter, 2}, _, _, _, _)]}
                 ],
                 ?of_kind(buffer_worker_retry_expired, Trace)
             ),
@@ -2597,9 +2694,88 @@ t_expiration_retry_batch_multiple_times(_Config) ->
     ),
     ok.
 
+t_batch_individual_reply_sync(_Config) ->
+    ResumeInterval = 300,
+    emqx_connector_demo:set_callback_mode(always_sync),
+    {ok, _} = create(
+        ?ID,
+        ?DEFAULT_RESOURCE_GROUP,
+        ?TEST_RESOURCE,
+        #{name => test_resource},
+        #{
+            query_mode => sync,
+            batch_size => 5,
+            batch_time => 100,
+            worker_pool_size => 1,
+            metrics_flush_interval => 50,
+            resume_interval => ResumeInterval
+        }
+    ),
+    do_t_batch_individual_reply().
+
+t_batch_individual_reply_async(_Config) ->
+    ResumeInterval = 300,
+    emqx_connector_demo:set_callback_mode(async_if_possible),
+    {ok, _} = create(
+        ?ID,
+        ?DEFAULT_RESOURCE_GROUP,
+        ?TEST_RESOURCE,
+        #{name => test_resource},
+        #{
+            query_mode => sync,
+            batch_size => 5,
+            batch_time => 100,
+            worker_pool_size => 1,
+            metrics_flush_interval => 50,
+            resume_interval => ResumeInterval
+        }
+    ),
+    on_exit(fun() -> emqx_resource:remove_local(?ID) end),
+    do_t_batch_individual_reply().
+
+do_t_batch_individual_reply() ->
+    ?check_trace(
+        begin
+            {Results, {ok, _}} =
+                ?wait_async_action(
+                    emqx_utils:pmap(
+                        fun(N) ->
+                            emqx_resource:query(?ID, {individual_reply, N rem 2 =:= 0})
+                        end,
+                        lists:seq(1, 5)
+                    ),
+                    #{?snk_kind := buffer_worker_flush_ack, batch_or_query := [_, _ | _]},
+                    5_000
+                ),
+
+            Ok = ok,
+            Error = {error, {unrecoverable_error, bad_request}},
+            ?assertEqual([Error, Ok, Error, Ok, Error], Results),
+
+            ?retry(
+                200,
+                10,
+                ?assertMatch(
+                    #{
+                        counters := #{
+                            matched := 5,
+                            failed := 3,
+                            success := 2
+                        }
+                    },
+                    tap_metrics(?LINE)
+                )
+            ),
+
+            ok
+        end,
+        []
+    ),
+    ok.
+
 t_recursive_flush(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2614,7 +2790,7 @@ t_recursive_flush(_Config) ->
 
 t_recursive_flush_batch(_Config) ->
     emqx_connector_demo:set_callback_mode(async_if_possible),
-    {ok, _} = emqx_resource:create(
+    {ok, _} = create(
         ?ID,
         ?DEFAULT_RESOURCE_GROUP,
         ?TEST_RESOURCE,
@@ -2669,7 +2845,7 @@ t_call_mode_uncoupled_from_query_mode(_Config) ->
             %% calls, even if the underlying connector itself only
             %% supports sync calls.
             emqx_connector_demo:set_callback_mode(always_sync),
-            {ok, _} = emqx_resource:create(
+            {ok, _} = create(
                 ?ID,
                 ?DEFAULT_RESOURCE_GROUP,
                 ?TEST_RESOURCE,
@@ -2694,7 +2870,7 @@ t_call_mode_uncoupled_from_query_mode(_Config) ->
             %% calls can be called synchronously, but the underlying
             %% call should be async.
             emqx_connector_demo:set_callback_mode(async_if_possible),
-            {ok, _} = emqx_resource:create(
+            {ok, _} = create(
                 ?ID,
                 ?DEFAULT_RESOURCE_GROUP,
                 ?TEST_RESOURCE,
@@ -2748,7 +2924,7 @@ t_volatile_offload_mode(_Config) ->
             %% default to equal max bytes.
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -2761,7 +2937,7 @@ t_volatile_offload_mode(_Config) ->
             %% Create with segment bytes < max bytes
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -2776,7 +2952,7 @@ t_volatile_offload_mode(_Config) ->
             %% Create with segment bytes = max bytes
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -2793,7 +2969,7 @@ t_volatile_offload_mode(_Config) ->
             %% to max bytes.
             ?assertMatch(
                 {ok, _},
-                emqx_resource:create(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -2850,7 +3026,7 @@ t_late_call_reply(_Config) ->
     RequestTTL = 500,
     ?assertMatch(
         {ok, _},
-        emqx_resource:create(
+        create(
             ?ID,
             ?DEFAULT_RESOURCE_GROUP,
             ?TEST_RESOURCE,
@@ -2906,7 +3082,7 @@ do_t_resource_activate_alarm_once(ResourceConfig, SubscribeEvent) ->
     ?check_trace(
         begin
             ?wait_async_action(
-                emqx_resource:create_local(
+                create(
                     ?ID,
                     ?DEFAULT_RESOURCE_GROUP,
                     ?TEST_RESOURCE,
@@ -2925,6 +3101,342 @@ do_t_resource_activate_alarm_once(ResourceConfig, SubscribeEvent) ->
             ?assertMatch([_], ?of_kind(resource_activate_alarm, Trace))
         end
     ).
+
+t_telemetry_handler_crash(_Config) ->
+    %% Check that a crash while handling a telemetry event, such as when a busy resource
+    %% is restarted and its metrics are not recreated while handling an increment, does
+    %% not lead to the handler being uninstalled.
+    ?check_trace(
+        begin
+            NonExistentId = <<"I-dont-exist">>,
+            WorkerId = 1,
+            HandlersBefore = telemetry:list_handlers([?TELEMETRY_PREFIX]),
+            ?assertMatch([_ | _], HandlersBefore),
+            lists:foreach(fun(Fn) -> Fn(NonExistentId) end, counter_metric_inc_fns()),
+            emqx_common_test_helpers:with_mock(
+                emqx_metrics_worker,
+                set_gauge,
+                fun(_Name, _Id, _WorkerId, _Metric, _Val) ->
+                    error(random_crash)
+                end,
+                fun() ->
+                    lists:foreach(
+                        fun(Fn) -> Fn(NonExistentId, WorkerId, 1) end, gauge_metric_set_fns()
+                    )
+                end
+            ),
+            ?assertEqual(HandlersBefore, telemetry:list_handlers([?TELEMETRY_PREFIX])),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_non_blocking_resource_health_check(_Config) ->
+    ?check_trace(
+        begin
+            {ok, _} =
+                create(
+                    ?ID,
+                    ?DEFAULT_RESOURCE_GROUP,
+                    ?TEST_RESOURCE,
+                    #{name => test_resource, health_check_error => {delay, 1_000}},
+                    #{health_check_interval => 100}
+                ),
+            %% concurrently attempt to health check the resource; should do it only once
+            %% for all callers
+            NumCallers = 20,
+            Expected = lists:duplicate(NumCallers, {ok, connected}),
+            ?assertEqual(
+                Expected,
+                emqx_utils:pmap(
+                    fun(_) -> emqx_resource:health_check(?ID) end,
+                    lists:seq(1, NumCallers)
+                )
+            ),
+
+            NumCallers
+        end,
+        [
+            log_consistency_prop(),
+            fun(NumCallers, Trace) ->
+                %% shouldn't have one health check per caller
+                SubTrace = ?of_kind(connector_demo_health_check_delay, Trace),
+                ?assertMatch([_ | _], SubTrace),
+                ?assert(length(SubTrace) < (NumCallers div 2), #{trace => Trace}),
+                ok
+            end
+        ]
+    ),
+    ok.
+
+t_non_blocking_channel_health_check(_Config) ->
+    ?check_trace(
+        begin
+            {ok, _} =
+                create(
+                    ?ID,
+                    ?DEFAULT_RESOURCE_GROUP,
+                    ?TEST_RESOURCE,
+                    #{name => test_resource, health_check_error => {delay, 500}},
+                    #{health_check_interval => 100}
+                ),
+            ChanId = <<"chan">>,
+            ok =
+                emqx_resource_manager:add_channel(
+                    ?ID,
+                    ChanId,
+                    #{health_check_delay => 500}
+                ),
+
+            %% concurrently attempt to health check the resource; should do it only once
+            %% for all callers
+            NumCallers = 20,
+            Expected = lists:duplicate(
+                NumCallers,
+                #{error => undefined, status => connected}
+            ),
+            ?assertEqual(
+                Expected,
+                emqx_utils:pmap(
+                    fun(_) -> emqx_resource_manager:channel_health_check(?ID, ChanId) end,
+                    lists:seq(1, NumCallers)
+                )
+            ),
+
+            NumCallers
+        end,
+        [
+            log_consistency_prop(),
+            fun(NumCallers, Trace) ->
+                %% shouldn't have one health check per caller
+                SubTrace = ?of_kind(connector_demo_channel_health_check_delay, Trace),
+                ?assertMatch([_ | _], SubTrace),
+                ?assert(length(SubTrace) < (NumCallers div 2), #{trace => Trace}),
+                ok
+            end
+        ]
+    ),
+    ok.
+
+%% Test that `stop' forcefully stops the resource manager even if it's stuck on a sync
+%% call such as `on_start', and that the claimed resources, if any, are freed.
+t_force_stop(_Config) ->
+    ?check_trace(
+        #{timetrap => 5_000},
+        begin
+            {ok, Agent} = emqx_utils_agent:start_link(not_called),
+            {ok, _} =
+                create(
+                    ?ID,
+                    ?DEFAULT_RESOURCE_GROUP,
+                    ?TEST_RESOURCE,
+                    #{
+                        name => test_resource,
+                        create_error => {delay, 30_000, Agent}
+                    },
+                    #{
+                        health_check_interval => 100,
+                        start_timeout => 100
+                    }
+                ),
+            ?assertEqual(ok, emqx_resource_manager:stop(?ID, _Timeout = 100)),
+            ?block_until(#{?snk_kind := connector_demo_free_resources_without_state}),
+            ok
+        end,
+        [
+            log_consistency_prop(),
+            fun(Trace) ->
+                ?assertMatch([_ | _], ?of_kind(connector_demo_start_delay, Trace)),
+                ?assertMatch(
+                    [_ | _], ?of_kind("forcefully_stopping_resource_due_to_timeout", Trace)
+                ),
+                ?assertMatch([_ | _], ?of_kind(connector_demo_free_resources_without_state, Trace)),
+                ok
+            end
+        ]
+    ),
+    ok.
+
+%% https://emqx.atlassian.net/browse/EEC-1101
+t_resource_and_channel_health_check_race(_Config) ->
+    ?check_trace(
+        #{timetrap => 5_000},
+        begin
+            %% 0) Connector and channel are initially healthy and in resource manager
+            %%    state.
+            AgentState0 = #{
+                resource_health_check => connected,
+                channel_health_check => connected
+            },
+            {ok, Agent} = emqx_utils_agent:start_link(AgentState0),
+            ConnName = <<"cname">>,
+            %% Needs to have this form to satifisfy internal, implicit requirements of
+            %% `emqx_resource_cache'.
+            ConnResId = <<"connector:ctype:", ConnName/binary>>,
+            {ok, _} =
+                create(
+                    ConnResId,
+                    ?DEFAULT_RESOURCE_GROUP,
+                    ?TEST_RESOURCE,
+                    #{
+                        name => test_resource,
+                        health_check_agent => Agent
+                    },
+                    #{
+                        health_check_interval => 100,
+                        start_timeout => 100
+                    }
+                ),
+            %% Needs to have this form to satifisfy internal, implicit requirements of
+            %% `emqx_resource_cache'.
+            ChanId = <<"action:atype:aname:", ConnResId/binary>>,
+            ok =
+                emqx_resource_manager:add_channel(
+                    ConnResId,
+                    ChanId,
+                    #{resource_opts => #{health_check_interval => 100}}
+                ),
+            ?assertMatch({ok, connected}, emqx_resource:health_check(ConnResId)),
+            ?assertMatch(
+                #{status := connected}, emqx_resource:channel_health_check(ConnResId, ChanId)
+            ),
+
+            %% 1) Connector and channel HCs fire concurrently
+            ?tpal("1) Connector and channel HCs fire concurrently"),
+            Me = self(),
+            _ = emqx_utils_agent:get_and_update(Agent, fun(Old) ->
+                {Old, Old#{
+                    resource_health_check := {ask, Me},
+                    channel_health_check := [{ask, Me}, connected]
+                }}
+            end),
+            receive
+                {waiting_health_check_result, ConnHCAlias1, resource, _ConnResId1} ->
+                    ?tpal("received connector hc request"),
+                    ok
+            end,
+            receive
+                {waiting_health_check_result, ChanHCAlias1, channel, _ConnResId2, _ChanId} ->
+                    ?tpal("received channel hc request"),
+                    ok
+            end,
+            %% 2) Connector HC returns `disconnected'.  This makes manager call
+            %%    `on_remove_channel' for each channel, removing them from the connector
+            %%    state.
+            ?tpal("2) Connector HC returns `disconnected'"),
+            _ = emqx_utils_agent:get_and_update(Agent, fun(Old) ->
+                {Old, Old#{resource_health_check := connected}}
+            end),
+            {_, {ok, _}} =
+                ?wait_async_action(
+                    ConnHCAlias1 ! {ConnHCAlias1, disconnected},
+                    #{?snk_kind := resource_disconnected_enter}
+                ),
+            %% 3) Channel HC returns `connected'.
+            ?tpal("3) Channel HC returns `connected'"),
+            ChanHCAlias1 ! {ChanHCAlias1, connected},
+            %% 4) A new connector HC returns `connected'.
+            ?tpal("4) A new connector HC returns `connected'"),
+            ?assertMatch({ok, connected}, emqx_resource:health_check(ConnResId)),
+            ?assertMatch(
+                #{status := connected}, emqx_resource:channel_health_check(ConnResId, ChanId)
+            ),
+            %% 5) Should contain action both in connector state and in resource manager's
+            %% `added_channels'.  Original bug: connector state didn't contain the channel
+            %% state, but `added_channels' did.
+            ?assertMatch(
+                [
+                    {?DEFAULT_RESOURCE_GROUP, #{
+                        status := connected,
+                        state := #{channels := #{ChanId := _}},
+                        added_channels := #{ChanId := _}
+                    }}
+                ],
+                emqx_resource_cache:read(ConnResId)
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Simulates the race condition where a dry run request takes too long, and the HTTP API
+%% request process is then forcefully killed before it has the chance to properly cleanup
+%% and remove the dry run/probe resource.
+t_dryrun_timeout_then_force_kill_during_stop(_Config) ->
+    ?check_trace(
+        #{timetrap => 30_000},
+        begin
+            ?force_ordering(
+                #{?snk_kind := connector_demo_on_stop_will_delay},
+                #{?snk_kind := will_kill_request}
+            ),
+
+            %% Simulates a cowboy request process.
+            {ok, StartAgent} = emqx_utils_agent:start_link(not_called),
+            {ok, StopAgent} = emqx_utils_agent:start_link({delay, 1_000}),
+            HowToStop = fun() ->
+                %% Delay only the first time, so test cleanup is faster.
+                Action = emqx_utils_agent:get_and_update(StopAgent, fun
+                    (continue) ->
+                        {continue, continue};
+                    ({delay, _} = Delay) ->
+                        {Delay, continue}
+                end),
+                case Action of
+                    {delay, Delay} ->
+                        ?tp(connector_demo_on_stop_will_delay, #{}),
+                        timer:sleep(Delay),
+                        continue;
+                    continue ->
+                        continue
+                end
+            end,
+            {Pid, MRef} = spawn_monitor(fun() ->
+                Res = dryrun(
+                    ?ID,
+                    ?TEST_RESOURCE,
+                    #{
+                        name => test_resource,
+                        create_error => {delay, 1_000, StartAgent},
+                        stop_error => {ask, HowToStop},
+                        resource_opts => #{
+                            health_check_interval => 100,
+                            start_timeout => 100
+                        }
+                    }
+                ),
+                exit(Res)
+            end),
+            on_exit(fun() -> exit(Pid, kill) end),
+
+            %% Simulates cowboy forcefully killing the request after it takes too long and the caller
+            %% has already closed the connection.
+            spawn_link(fun() ->
+                ?tp(will_kill_request, #{}),
+                exit(Pid, kill)
+            end),
+
+            receive
+                {'DOWN', MRef, process, Pid, Reason} ->
+                    ct:pal("request ~p died: ~p", [Pid, Reason]),
+                    ?assertEqual(killed, Reason),
+                    ok
+            end,
+
+            ?block_until(#{?snk_kind := "resource_cache_cleaner_deleted_child"}),
+
+            %% No children should be lingering
+            ?assertEqual([], supervisor:which_children(emqx_resource_manager_sup)),
+            %% Cache should be clean too
+            ?assertEqual([], emqx_resource:list_instances()),
+
+            ok
+        end,
+        []
+    ),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Helpers
@@ -3082,7 +3594,6 @@ wait_n_events(NEvents, Timeout, EventName) ->
     end.
 
 assert_sync_retry_fail_then_succeed_inflight(Trace) ->
-    ct:pal("  ~p", [Trace]),
     ?assert(
         ?strict_causality(
             #{?snk_kind := buffer_worker_flush_nack, ref := _Ref},
@@ -3102,7 +3613,6 @@ assert_sync_retry_fail_then_succeed_inflight(Trace) ->
     ok.
 
 assert_async_retry_fail_then_succeed_inflight(Trace) ->
-    ct:pal("  ~p", [Trace]),
     ?assert(
         ?strict_causality(
             #{?snk_kind := handle_async_reply, action := nack},
@@ -3155,3 +3665,45 @@ do_wait_until_all_marked_as_retriable(NumExpected, Seen) ->
                     })
             end
     end.
+
+counter_metric_inc_fns() ->
+    Mod = emqx_resource_metrics,
+    [
+        fun Mod:Fn/1
+     || {Fn, 1} <- Mod:module_info(functions),
+        case string:find(atom_to_list(Fn), "_inc", trailing) of
+            "_inc" -> true;
+            _ -> false
+        end
+    ].
+
+gauge_metric_set_fns() ->
+    Mod = emqx_resource_metrics,
+    [
+        fun Mod:Fn/3
+     || {Fn, 3} <- Mod:module_info(functions),
+        case string:find(atom_to_list(Fn), "_set", trailing) of
+            "_set" -> true;
+            _ -> false
+        end
+    ].
+
+create(Id, Group, Type, Config) ->
+    emqx_resource:create_local(Id, Group, Type, Config, #{}).
+
+create(Id, Group, Type, Config, Opts) ->
+    Res = emqx_resource:create_local(Id, Group, Type, Config, Opts),
+    on_exit(fun() -> emqx_resource:remove_local(Id) end),
+    Res.
+
+dryrun(Id, Type, Config) ->
+    TestPid = self(),
+    OnReady = fun(ResId) -> TestPid ! {resource_ready, ResId} end,
+    emqx_resource:create_dry_run_local(Id, Type, Config, OnReady).
+
+log_consistency_prop() ->
+    {"check state and cache consistency", fun ?MODULE:log_consistency_prop/1}.
+log_consistency_prop(Trace) ->
+    ?assertEqual([], ?of_kind("inconsistent_status", Trace)),
+    ?assertEqual([], ?of_kind("inconsistent_cache", Trace)),
+    ok.

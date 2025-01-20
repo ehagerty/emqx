@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_greptimedb_SUITE).
 
@@ -25,12 +25,19 @@ groups() ->
     TCs = emqx_common_test_helpers:all(?MODULE),
     [
         {with_batch, [
-            {group, sync_query}
+            {group, sync_query},
+            {group, async_query}
         ]},
         {without_batch, [
-            {group, sync_query}
+            {group, sync_query},
+            {group, async_query}
         ]},
         {sync_query, [
+            {group, grpcv1_tcp}
+            %% uncomment tls when we are ready
+            %% {group, grpcv1_tls}
+        ]},
+        {async_query, [
             {group, grpcv1_tcp}
             %% uncomment tls when we are ready
             %% {group, grpcv1_tls}
@@ -43,18 +50,15 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
-    delete_all_bridges(),
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_connector_test_helpers:stop_apps([
-        emqx_conf, emqx_bridge, emqx_resource, emqx_rule_engine
-    ]),
-    _ = application:stop(emqx_connector),
     ok.
 
 init_per_group(GreptimedbType, Config0) when
     GreptimedbType =:= grpcv1_tcp;
     GreptimedbType =:= grpcv1_tls
 ->
+    ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
+    ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     #{
         host := GreptimedbHost,
         port := GreptimedbPort,
@@ -82,13 +86,18 @@ init_per_group(GreptimedbType, Config0) when
         end,
     case emqx_common_test_helpers:is_tcp_server_available(GreptimedbHost, GreptimedbHttpPort) of
         true ->
-            ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
-            ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
-            emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            ok = start_apps(),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            {ok, _} = application:ensure_all_started(greptimedb),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_greptimedb,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
             Config = [{use_tls, UseTLS} | Config0],
             {Name, ConfigString, GreptimedbConfig} = greptimedb_config(
                 grpcv1, GreptimedbHost, GreptimedbPort, Config
@@ -109,9 +118,13 @@ init_per_group(GreptimedbType, Config0) when
             ],
             {ok, _} = ehttpc_sup:start_pool(EHttpcPoolName, EHttpcPoolOpts),
             [
+                {group_apps, Apps},
                 {proxy_host, ProxyHost},
                 {proxy_port, ProxyPort},
                 {proxy_name, ProxyName},
+                {bridge_type, greptimedb},
+                {bridge_name, Name},
+                {bridge_config, GreptimedbConfig},
                 {greptimedb_host, GreptimedbHost},
                 {greptimedb_port, GreptimedbPort},
                 {greptimedb_http_port, GreptimedbHttpPort},
@@ -127,6 +140,8 @@ init_per_group(GreptimedbType, Config0) when
     end;
 init_per_group(sync_query, Config) ->
     [{query_mode, sync} | Config];
+init_per_group(async_query, Config) ->
+    [{query_mode, async} | Config];
 init_per_group(with_batch, Config) ->
     [{batch_size, 100} | Config];
 init_per_group(without_batch, Config) ->
@@ -138,18 +153,21 @@ end_per_group(Group, Config) when
     Group =:= grpcv1_tcp;
     Group =:= grpcv1_tls
 ->
+    Apps = ?config(group_apps, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     EHttpcPoolName = ?config(ehttpc_pool_name, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     ehttpc_sup:stop_pool(EHttpcPoolName),
-    delete_bridge(Config),
-    _ = application:stop(greptimedb),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(_Testcase, Config) ->
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     delete_all_rules(),
     delete_all_bridges(),
     Config.
@@ -166,14 +184,6 @@ end_per_testcase(_Testcase, Config) ->
 %%------------------------------------------------------------------------------
 %% Helper fns
 %%------------------------------------------------------------------------------
-
-start_apps() ->
-    %% some configs in emqx_conf app are mandatory
-    %% we want to make sure they are loaded before
-    %% ekka start in emqx_common_test_helpers:start_apps/1
-    emqx_common_test_helpers:render_and_load_app_config(emqx_conf),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:start_apps([emqx_resource, emqx_bridge, emqx_rule_engine]).
 
 example_write_syntax() ->
     %% N.B.: this single space character is relevant
@@ -203,6 +213,7 @@ greptimedb_config(grpcv1 = Type, GreptimedbHost, GreptimedbPort, Config) ->
             "    request_ttl = 1s\n"
             "    query_mode = ~s\n"
             "    batch_size = ~b\n"
+            "    health_check_interval = 5s\n"
             "  }\n"
             "  ssl {\n"
             "    enable = ~p\n"
@@ -247,6 +258,7 @@ delete_bridge(Config) ->
     emqx_bridge:remove(Type, Name).
 
 delete_all_bridges() ->
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     lists:foreach(
         fun(#{name := Name, type := Type}) ->
             emqx_bridge:remove(Type, Name)
@@ -312,7 +324,7 @@ query_by_clientid(Topic, ClientId, Config) ->
         {"Content-Type", "application/x-www-form-urlencoded"}
     ],
     Body = <<"sql=select * from \"", Topic/binary, "\" where clientid='", ClientId/binary, "'">>,
-    {ok, 200, _Headers, RawBody0} =
+    {ok, StatusCode, _Headers, RawBody0} =
         ehttpc:request(
             EHttpcPoolName,
             post,
@@ -323,7 +335,6 @@ query_by_clientid(Topic, ClientId, Config) ->
 
     case emqx_utils_json:decode(RawBody0, [return_maps]) of
         #{
-            <<"code">> := 0,
             <<"output">> := [
                 #{
                     <<"records">> := #{
@@ -332,18 +343,19 @@ query_by_clientid(Topic, ClientId, Config) ->
                     }
                 }
             ]
-        } ->
+        } when StatusCode >= 200 andalso StatusCode =< 300 ->
             make_row(Schema, Rows);
         #{
             <<"code">> := Code,
             <<"error">> := Error
-        } ->
+        } when StatusCode > 300 ->
             GreptimedbName = ?config(greptimedb_name, Config),
             Type = greptimedb_type_bin(?config(greptimedb_type, Config)),
             BridgeId = emqx_bridge_resource:bridge_id(Type, GreptimedbName),
 
             ?SLOG(error, #{
-                msg => io_lib:format("Failed to query: ~p, ~p", [Code, Error]),
+                msg => "failed_to_query",
+                code => Code,
                 connector => BridgeId,
                 reason => Error
             }),
@@ -354,7 +366,9 @@ query_by_clientid(Topic, ClientId, Config) ->
                 _ ->
                     %% Table not found
                     #{}
-            end
+            end;
+        Error ->
+            {error, Error}
     end.
 
 make_row(null, _Rows) ->
@@ -416,6 +430,9 @@ t_start_ok(Config) ->
     ?check_trace(
         begin
             case QueryMode of
+                async ->
+                    ?assertMatch(ok, send_message(Config, SentData)),
+                    ct:sleep(500);
                 sync ->
                     ?assertMatch({ok, _}, send_message(Config, SentData))
             end,
@@ -436,10 +453,7 @@ t_start_ok(Config) ->
             [#{points := [Point0]}] = Trace,
             {Measurement, [Point]} = Point0,
             ct:pal("sent point: ~p", [Point]),
-            ?assertMatch(
-                <<_/binary>>,
-                Measurement
-            ),
+            ?assertMatch(#{dbname := _, table := _, timeunit := _}, Measurement),
             ?assertMatch(
                 #{
                     fields := #{},
@@ -457,14 +471,103 @@ t_start_ok(Config) ->
     ),
     ok.
 
+t_start_stop(Config) ->
+    %% we can't use this test case directly because `greptimedb_worker' apparently leaks
+    %% atoms...
+    %% ok = emqx_bridge_testlib:t_start_stop(Config, greptimedb_client_stopped),
+    BridgeType = ?config(bridge_type, Config),
+    BridgeName = ?config(bridge_name, Config),
+    BridgeConfig = ?config(bridge_config, Config),
+    StopTracePoint = greptimedb_client_stopped,
+    ?check_trace(
+        begin
+            ProbeRes0 = emqx_bridge_testlib:probe_bridge_api(
+                BridgeType,
+                BridgeName,
+                BridgeConfig
+            ),
+            ?assertMatch({ok, {{_, 204, _}, _Headers, _Body}}, ProbeRes0),
+            ?assertMatch({ok, _}, emqx_bridge:create(BridgeType, BridgeName, BridgeConfig)),
+            ResourceId = emqx_bridge_resource:resource_id(BridgeType, BridgeName),
+
+            %% Since the connection process is async, we give it some time to
+            %% stabilize and avoid flakiness.
+            ?retry(
+                _Sleep = 1_000,
+                _Attempts = 20,
+                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+            ),
+
+            %% `start` bridge to trigger `already_started`
+            ?assertMatch(
+                {ok, {{_, 204, _}, _Headers, []}},
+                emqx_bridge_testlib:op_bridge_api("start", BridgeType, BridgeName)
+            ),
+
+            ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId)),
+
+            ?assertMatch(
+                {{ok, _}, {ok, _}},
+                ?wait_async_action(
+                    emqx_bridge_testlib:op_bridge_api("stop", BridgeType, BridgeName),
+                    #{?snk_kind := StopTracePoint},
+                    5_000
+                )
+            ),
+
+            ?assertEqual(
+                {error, resource_is_stopped}, emqx_resource_manager:health_check(ResourceId)
+            ),
+
+            ?assertMatch(
+                {ok, {{_, 204, _}, _Headers, []}},
+                emqx_bridge_testlib:op_bridge_api("stop", BridgeType, BridgeName)
+            ),
+
+            ?assertEqual(
+                {error, resource_is_stopped}, emqx_resource_manager:health_check(ResourceId)
+            ),
+
+            ?assertMatch(
+                {ok, {{_, 204, _}, _Headers, []}},
+                emqx_bridge_testlib:op_bridge_api("start", BridgeType, BridgeName)
+            ),
+
+            ?retry(
+                _Sleep = 1_000,
+                _Attempts = 20,
+                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+            ),
+
+            %% Disable the bridge, which will also stop it.
+            ?assertMatch(
+                {{ok, _}, {ok, _}},
+                ?wait_async_action(
+                    emqx_bridge:disable_enable(disable, BridgeType, BridgeName),
+                    #{?snk_kind := StopTracePoint},
+                    5_000
+                )
+            ),
+
+            ok
+        end,
+        fun(Trace) ->
+            ResourceId = emqx_bridge_resource:resource_id(BridgeType, BridgeName),
+            %% one for probe, two for real
+            ?assertMatch(
+                [_, #{instance_id := ResourceId}, #{instance_id := ResourceId}],
+                ?of_kind(StopTracePoint, Trace)
+            ),
+            ok
+        end
+    ),
+    ok.
+
 t_start_already_started(Config) ->
     Type = greptimedb_type_bin(?config(greptimedb_type, Config)),
     Name = ?config(greptimedb_name, Config),
     GreptimedbConfigString = ?config(greptimedb_config_string, Config),
-    ?assertMatch(
-        {ok, _},
-        create_bridge(Config)
-    ),
+    ?assertMatch({ok, _}, create_bridge(Config)),
     ResourceId = resource_id(Config),
     TypeAtom = binary_to_atom(Type),
     NameAtom = binary_to_atom(Name),
@@ -571,6 +674,9 @@ t_const_timestamp(Config) ->
         <<"timestamp">> => erlang:system_time(millisecond)
     },
     case QueryMode of
+        async ->
+            ?assertMatch(ok, send_message(Config, SentData)),
+            ct:sleep(500);
         sync ->
             ?assertMatch({ok, _}, send_message(Config, SentData))
     end,
@@ -585,6 +691,12 @@ t_boolean_variants(Config) ->
     ?assertMatch(
         {ok, _},
         create_bridge(Config)
+    ),
+    ResourceId = resource_id(Config),
+    ?retry(
+        _Sleep1 = 1_000,
+        _Attempts1 = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
     ),
     BoolVariants = #{
         true => true,
@@ -614,19 +726,30 @@ t_boolean_variants(Config) ->
             },
             case QueryMode of
                 sync ->
-                    ?assertMatch({ok, _}, send_message(Config, SentData))
+                    ?assertMatch({ok, _}, send_message(Config, SentData));
+                async ->
+                    ?assertMatch(ok, send_message(Config, SentData))
             end,
             case QueryMode of
+                async -> ct:sleep(500);
                 sync -> ok
             end,
-            PersistedData = query_by_clientid(atom_to_binary(?FUNCTION_NAME), ClientId, Config),
-            Expected = #{
-                bool => Translation,
-                int_value => -123,
-                uint_value => 123,
-                payload => emqx_utils_json:encode(Payload)
-            },
-            assert_persisted_data(ClientId, Expected, PersistedData),
+            ?retry(
+                _Sleep2 = 500,
+                _Attempts2 = 20,
+                begin
+                    PersistedData = query_by_clientid(
+                        atom_to_binary(?FUNCTION_NAME), ClientId, Config
+                    ),
+                    Expected = #{
+                        bool => Translation,
+                        int_value => -123,
+                        uint_value => 123,
+                        payload => emqx_utils_json:encode(Payload)
+                    },
+                    assert_persisted_data(ClientId, Expected, PersistedData)
+                end
+            ),
             ok
         end,
         BoolVariants
@@ -684,11 +807,29 @@ t_bad_timestamp(Config) ->
             #{?snk_kind := greptimedb_connector_send_query_error},
             10_000
         ),
-        fun(Result, _Trace) ->
+        fun(Result, Trace) ->
             ?assertMatch({_, {ok, _}}, Result),
             {Return, {ok, _}} = Result,
             IsBatch = BatchSize > 1,
             case {QueryMode, IsBatch} of
+                {async, true} ->
+                    ?assertEqual(ok, Return),
+                    ?assertMatch(
+                        [#{error := points_trans_failed}],
+                        ?of_kind(greptimedb_connector_send_query_error, Trace)
+                    );
+                {async, false} ->
+                    ?assertEqual(ok, Return),
+                    ?assertMatch(
+                        [
+                            #{
+                                error := [
+                                    {error, {bad_timestamp, <<"bad_timestamp">>}}
+                                ]
+                            }
+                        ],
+                        ?of_kind(greptimedb_connector_send_query_error, Trace)
+                    );
                 {sync, false} ->
                     ?assertEqual(
                         {error, [
@@ -714,6 +855,11 @@ t_get_status(Config) ->
     emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
         ?assertEqual({ok, disconnected}, emqx_resource_manager:health_check(ResourceId))
     end),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+    ),
     ok.
 
 t_create_disconnected(Config) ->
@@ -731,6 +877,12 @@ t_create_disconnected(Config) ->
             ),
             ok
         end
+    ),
+    ResourceId = resource_id(Config),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
     ),
     ok.
 
@@ -779,52 +931,6 @@ t_start_exception(Config) ->
                 [#{error := {error, boom}}],
                 ?of_kind(greptimedb_connector_start_exception, Trace)
             ),
-            ok
-        end
-    ),
-    ok.
-
-t_write_failure(Config) ->
-    ProxyName = ?config(proxy_name, Config),
-    ProxyPort = ?config(proxy_port, Config),
-    ProxyHost = ?config(proxy_host, Config),
-    QueryMode = ?config(query_mode, Config),
-    {ok, _} = create_bridge(Config),
-    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
-    Payload = #{
-        int_key => -123,
-        bool => true,
-        float_key => 24.5,
-        uint_key => 123
-    },
-    SentData = #{
-        <<"clientid">> => ClientId,
-        <<"topic">> => atom_to_binary(?FUNCTION_NAME),
-        <<"timestamp">> => erlang:system_time(millisecond),
-        <<"payload">> => Payload
-    },
-    ?check_trace(
-        emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
-            case QueryMode of
-                sync ->
-                    ?wait_async_action(
-                        ?assertMatch(
-                            {error, {resource_error, #{reason := timeout}}},
-                            send_message(Config, SentData)
-                        ),
-                        #{?snk_kind := greptimedb_connector_do_query_failure, action := nack},
-                        16_000
-                    )
-            end
-        end),
-        fun(Trace) ->
-            case QueryMode of
-                sync ->
-                    ?assertMatch(
-                        [#{error := _} | _],
-                        ?of_kind(greptimedb_connector_do_query_failure, Trace)
-                    )
-            end,
             ok
         end
     ),
@@ -888,7 +994,6 @@ t_missing_field(Config) ->
     ok.
 
 t_authentication_error_on_send_message(Config0) ->
-    ResourceId = resource_id(Config0),
     QueryMode = proplists:get_value(query_mode, Config0, sync),
     GreptimedbType = ?config(greptimedb_type, Config0),
     GreptimeConfig0 = proplists:get_value(greptimedb_config, Config0),
@@ -898,24 +1003,8 @@ t_authentication_error_on_send_message(Config0) ->
         end,
     Config = lists:keyreplace(greptimedb_config, 1, Config0, {greptimedb_config, GreptimeConfig}),
 
-    % Fake initialization to simulate credential update after bridge was created.
-    emqx_common_test_helpers:with_mock(
-        greptimedb,
-        check_auth,
-        fun(_) ->
-            ok
-        end,
-        fun() ->
-            {ok, _} = create_bridge(Config),
-            ?retry(
-                _Sleep = 1_000,
-                _Attempts = 10,
-                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
-            )
-        end
-    ),
+    {ok, _} = create_bridge(Config),
 
-    % Now back to wrong credentials
     ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
     Payload = #{
         int_key => -123,
@@ -934,6 +1023,23 @@ t_authentication_error_on_send_message(Config0) ->
             ?assertMatch(
                 {error, {unrecoverable_error, <<"authorization failure">>}},
                 send_message(Config, SentData)
+            );
+        async ->
+            ?check_trace(
+                begin
+                    ?wait_async_action(
+                        ?assertEqual(ok, send_message(Config, SentData)),
+                        #{?snk_kind := handle_async_reply},
+                        1_000
+                    )
+                end,
+                fun(Trace) ->
+                    ?assertMatch(
+                        [#{error := <<"authorization failure">>} | _],
+                        ?of_kind(greptimedb_connector_do_query_failure, Trace)
+                    ),
+                    ok
+                end
             )
     end,
     ok.

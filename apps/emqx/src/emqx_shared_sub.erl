@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,13 +21,12 @@
 -include("emqx_schema.hrl").
 -include("emqx.hrl").
 -include("emqx_mqtt.hrl").
+-include("emqx_shared_sub.hrl").
 -include("logger.hrl").
 -include("types.hrl").
 
 %% Mnesia bootstrap
--export([mnesia/1]).
-
--boot_mnesia({mnesia, [boot]}).
+-export([create_tables/0]).
 
 %% APIs
 -export([start_link/0]).
@@ -55,7 +54,8 @@
 -ifdef(TEST).
 -export([
     subscribers/2,
-    strategy/1
+    strategy/1,
+    initial_sticky_pick/1
 ]).
 -endif.
 
@@ -85,37 +85,41 @@
     | hash_clientid
     | hash_topic.
 
+-export_type([initial_sticky_pick/0]).
+
+-type initial_sticky_pick() ::
+    random
+    | local
+    | hash_clientid
+    | hash_topic.
+
 -define(SERVER, ?MODULE).
--define(TAB, emqx_shared_subscription).
--define(SHARED_SUBS_ROUND_ROBIN_COUNTER, emqx_shared_subscriber_round_robin_counter).
--define(SHARED_SUBS, emqx_shared_subscriber).
--define(ALIVE_SUBS, emqx_alive_shared_subscribers).
+
 -define(SHARED_SUB_QOS1_DISPATCH_TIMEOUT_SECONDS, 5).
--define(IS_LOCAL_PID(Pid), (is_pid(Pid) andalso node(Pid) =:= node())).
 -define(ACK, shared_sub_ack).
 -define(NACK(Reason), {shared_sub_nack, Reason}).
 -define(NO_ACK, no_ack).
--define(REDISPATCH_TO(GROUP, TOPIC), {GROUP, TOPIC}).
 -define(SUBSCRIBER_DOWN, noproc).
 
 -type redispatch_to() :: ?REDISPATCH_TO(emqx_types:group(), emqx_types:topic()).
 
 -record(state, {pmon}).
 
--record(emqx_shared_subscription, {group, topic, subpid}).
+-record(?SHARED_SUBSCRIPTION, {group, topic, subpid}).
 
 %%--------------------------------------------------------------------
 %% Mnesia bootstrap
 %%--------------------------------------------------------------------
 
-mnesia(boot) ->
-    ok = mria:create_table(?TAB, [
+create_tables() ->
+    ok = mria:create_table(?SHARED_SUBSCRIPTION, [
         {type, bag},
         {rlog_shard, ?SHARED_SUB_SHARD},
         {storage, ram_copies},
-        {record_name, emqx_shared_subscription},
-        {attributes, record_info(fields, emqx_shared_subscription)}
-    ]).
+        {record_name, ?SHARED_SUBSCRIPTION},
+        {attributes, record_info(fields, ?SHARED_SUBSCRIPTION)}
+    ]),
+    [?SHARED_SUBSCRIPTION].
 
 %%--------------------------------------------------------------------
 %% API
@@ -134,7 +138,7 @@ unsubscribe(Group, Topic, SubPid) when is_pid(SubPid) ->
     gen_server:call(?SERVER, {unsubscribe, Group, Topic, SubPid}).
 
 record(Group, Topic, SubPid) ->
-    #emqx_shared_subscription{group = Group, topic = Topic, subpid = SubPid}.
+    #?SHARED_SUBSCRIPTION{group = Group, topic = Topic, subpid = SubPid}.
 
 -spec dispatch(emqx_types:group(), emqx_types:topic(), emqx_types:delivery()) ->
     emqx_types:deliver_result().
@@ -169,6 +173,20 @@ strategy(Group) ->
     catch
         error:badarg ->
             get_default_shared_subscription_strategy()
+    end.
+
+-spec initial_sticky_pick(emqx_types:group()) -> initial_sticky_pick().
+initial_sticky_pick(Group) ->
+    try binary_to_existing_atom(Group) of
+        GroupAtom ->
+            Key = [broker, shared_subscription_group, GroupAtom, initial_sticky_pick],
+            case emqx:get_config(Key, ?CONFIG_NOT_FOUND_MAGIC) of
+                ?CONFIG_NOT_FOUND_MAGIC -> get_default_shared_subscription_initial_sticky_pick();
+                InitialStickyPick -> InitialStickyPick
+            end
+    catch
+        error:badarg ->
+            get_default_shared_subscription_initial_sticky_pick()
     end.
 
 -spec ack_enabled() -> boolean().
@@ -234,19 +252,18 @@ without_group_ack(Msg) ->
 get_group_ack(Msg) ->
     emqx_message:get_header(shared_dispatch_ack, Msg, ?NO_ACK).
 
-with_redispatch_to(#message{qos = ?QOS_0} = Msg, _Group, _Topic) ->
-    Msg;
+%% always add `redispatch_to` header to the message
+%% for QOS_0 msgs, redispatch_to is not needed and filtered out in is_redispatch_needed/1
 with_redispatch_to(Msg, Group, Topic) ->
     emqx_message:set_headers(#{redispatch_to => ?REDISPATCH_TO(Group, Topic)}, Msg).
 
-%% @hidden Redispatch is needed only for the messages with redispatch_to header added.
-is_redispatch_needed(#message{} = Msg) ->
-    case get_redispatch_to(Msg) of
-        ?REDISPATCH_TO(_, _) ->
-            true;
-        _ ->
-            false
-    end.
+%% @hidden Redispatch is needed only for the messages which not QOS_0
+is_redispatch_needed(#message{qos = ?QOS_0}) ->
+    false;
+is_redispatch_needed(#message{headers = #{redispatch_to := ?REDISPATCH_TO(_, _)}}) ->
+    true;
+is_redispatch_needed(#message{}) ->
+    false.
 
 %% @doc Redispatch shared deliveries to other members in the group.
 redispatch(Messages0) ->
@@ -323,9 +340,10 @@ pick(sticky, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
             %% keep using it for sticky strategy
             {fresh, Sub0};
         false ->
-            %% randomly pick one for the first message
+            %% pick the initial subscriber by the configured strategy
+            InitialStrategy = initial_sticky_pick(Group),
             FailedSubs1 = FailedSubs#{Sub0 => ?SUBSCRIBER_DOWN},
-            Res = do_pick(All, random, ClientId, SourceTopic, Group, Topic, FailedSubs1),
+            Res = do_pick(All, InitialStrategy, ClientId, SourceTopic, Group, Topic, FailedSubs1),
             case Res of
                 {_, Sub} ->
                     %% stick to whatever pick result
@@ -397,18 +415,17 @@ subscribers(Group, Topic, FailedSubs) ->
 
 %% Select ETS table to get all subscriber pids.
 subscribers(Group, Topic) ->
-    ets:select(?TAB, [{{emqx_shared_subscription, Group, Topic, '$1'}, [], ['$1']}]).
+    ets:select(?SHARED_SUBSCRIPTION, [{{?SHARED_SUBSCRIPTION, Group, Topic, '$1'}, [], ['$1']}]).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
 init([]) ->
-    ok = mria:wait_for_tables([?TAB]),
-    {ok, _} = mnesia:subscribe({table, ?TAB, simple}),
+    ok = mria:wait_for_tables([?SHARED_SUBSCRIPTION]),
+    {ok, _} = mnesia:subscribe({table, ?SHARED_SUBSCRIPTION, simple}),
     {atomic, PMon} = mria:transaction(?SHARED_SUB_SHARD, fun ?MODULE:init_monitors/0),
-    ok = emqx_utils_ets:new(?SHARED_SUBS, [protected, bag]),
-    ok = emqx_utils_ets:new(?ALIVE_SUBS, [protected, set, {read_concurrency, true}]),
+    ok = emqx_utils_ets:new(?SHARED_SUBSCRIBER, [protected, bag]),
     ok = emqx_utils_ets:new(?SHARED_SUBS_ROUND_ROBIN_COUNTER, [
         public, set, {write_concurrency, true}
     ]),
@@ -416,29 +433,32 @@ init([]) ->
 
 init_monitors() ->
     mnesia:foldl(
-        fun(#emqx_shared_subscription{subpid = SubPid}, Mon) ->
+        fun(#?SHARED_SUBSCRIPTION{subpid = SubPid}, Mon) ->
             emqx_pmon:monitor(SubPid, Mon)
         end,
         emqx_pmon:new(),
-        ?TAB
+        ?SHARED_SUBSCRIPTION
     ).
 
 handle_call({subscribe, Group, Topic, SubPid}, _From, State = #state{pmon = PMon}) ->
-    mria:dirty_write(?TAB, record(Group, Topic, SubPid)),
-    case ets:member(?SHARED_SUBS, {Group, Topic}) of
-        true -> ok;
-        false -> ok = emqx_router:do_add_route(Topic, {Group, node()})
+    mria:dirty_write(?SHARED_SUBSCRIPTION, record(Group, Topic, SubPid)),
+    case ets:member(?SHARED_SUBSCRIBER, {Group, Topic}) of
+        true ->
+            ok;
+        false ->
+            ok = emqx_router:do_add_route(Topic, {Group, node()}),
+            _ = emqx_external_broker:add_shared_route(Topic, Group),
+            ok
     end,
-    ok = maybe_insert_alive_tab(SubPid),
     ok = maybe_insert_round_robin_count({Group, Topic}),
-    true = ets:insert(?SHARED_SUBS, {{Group, Topic}, SubPid}),
+    true = ets:insert(?SHARED_SUBSCRIBER, {{Group, Topic}, SubPid}),
     {reply, ok, update_stats(State#state{pmon = emqx_pmon:monitor(SubPid, PMon)})};
 handle_call({unsubscribe, Group, Topic, SubPid}, _From, State) ->
-    mria:dirty_delete_object(?TAB, record(Group, Topic, SubPid)),
-    true = ets:delete_object(?SHARED_SUBS, {{Group, Topic}, SubPid}),
+    mria:dirty_delete_object(?SHARED_SUBSCRIPTION, record(Group, Topic, SubPid)),
+    true = ets:delete_object(?SHARED_SUBSCRIBER, {{Group, Topic}, SubPid}),
     delete_route_if_needed({Group, Topic}),
     maybe_delete_round_robin_count({Group, Topic}),
-    {reply, ok, State};
+    {reply, ok, update_stats(State)};
 handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", req => Req}),
     {reply, ignored, State}.
@@ -448,17 +468,16 @@ handle_cast(Msg, State) ->
     {noreply, State}.
 
 handle_info(
-    {mnesia_table_event, {write, #emqx_shared_subscription{subpid = SubPid}, _}},
+    {mnesia_table_event, {write, #?SHARED_SUBSCRIPTION{subpid = SubPid}, _}},
     State = #state{pmon = PMon}
 ) ->
-    ok = maybe_insert_alive_tab(SubPid),
     {noreply, update_stats(State#state{pmon = emqx_pmon:monitor(SubPid, PMon)})};
 %% The subscriber may have subscribed multiple topics, so we need to keep monitoring the PID until
 %% it `unsubscribed` the last topic.
 %% The trick is we don't demonitor the subscriber here, and (after a long time) it will eventually
 %% be disconnected.
 % handle_info({mnesia_table_event, {delete_object, OldRecord, _}}, State = #state{pmon = PMon}) ->
-%     #emqx_shared_subscription{subpid = SubPid} = OldRecord,
+%     #?SHARED_SUBSCRIPTION{subpid = SubPid} = OldRecord,
 %     {noreply, update_stats(State#state{pmon = emqx_pmon:demonitor(SubPid, PMon)})};
 
 handle_info({mnesia_table_event, _Event}, State) ->
@@ -471,7 +490,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    mnesia:unsubscribe({table, ?TAB, simple}).
+    mnesia:unsubscribe({table, ?SHARED_SUBSCRIPTION, simple}).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -504,35 +523,28 @@ maybe_delete_round_robin_count({Group, _Topic} = GroupTopic) ->
     ok.
 
 if_no_more_subscribers(GroupTopic, Fn) ->
-    case ets:member(?SHARED_SUBS, GroupTopic) of
+    case ets:member(?SHARED_SUBSCRIBER, GroupTopic) of
         true -> ok;
         false -> Fn()
     end,
     ok.
 
-%% keep track of alive remote pids
-maybe_insert_alive_tab(Pid) when ?IS_LOCAL_PID(Pid) -> ok;
-maybe_insert_alive_tab(Pid) when is_pid(Pid) ->
-    ets:insert(?ALIVE_SUBS, {Pid}),
-    ok.
-
 cleanup_down(SubPid) ->
-    ?IS_LOCAL_PID(SubPid) orelse ets:delete(?ALIVE_SUBS, SubPid),
     lists:foreach(
-        fun(Record = #emqx_shared_subscription{topic = Topic, group = Group}) ->
-            ok = mria:dirty_delete_object(?TAB, Record),
-            true = ets:delete_object(?SHARED_SUBS, {{Group, Topic}, SubPid}),
+        fun(Record = #?SHARED_SUBSCRIPTION{topic = Topic, group = Group}) ->
+            ok = mria:dirty_delete_object(?SHARED_SUBSCRIPTION, Record),
+            true = ets:delete_object(?SHARED_SUBSCRIBER, {{Group, Topic}, SubPid}),
             maybe_delete_round_robin_count({Group, Topic}),
             delete_route_if_needed({Group, Topic})
         end,
-        mnesia:dirty_match_object(#emqx_shared_subscription{_ = '_', subpid = SubPid})
+        mnesia:dirty_match_object(#?SHARED_SUBSCRIPTION{_ = '_', subpid = SubPid})
     ).
 
 update_stats(State) ->
     emqx_stats:setstat(
         'subscriptions.shared.count',
         'subscriptions.shared.max',
-        ets:info(?TAB, size)
+        ets:info(?SHARED_SUBSCRIPTION, size)
     ),
     State.
 
@@ -543,15 +555,22 @@ is_active_sub(Pid, FailedSubs, All) ->
         is_alive_sub(Pid).
 
 %% erlang:is_process_alive/1 does not work with remote pid.
-is_alive_sub(Pid) when ?IS_LOCAL_PID(Pid) ->
+is_alive_sub(Pid) when node(Pid) == node() ->
+    %% The race is when the pid is actually down cleanup_down is not evaluated yet.
     erlang:is_process_alive(Pid);
 is_alive_sub(Pid) ->
-    [] =/= ets:lookup(?ALIVE_SUBS, Pid).
+    %% When process is not local, the best guess is it's alive.
+    emqx_router_helper:is_routable(node(Pid)).
 
 delete_route_if_needed({Group, Topic} = GroupTopic) ->
     if_no_more_subscribers(GroupTopic, fun() ->
-        ok = emqx_router:do_delete_route(Topic, {Group, node()})
+        ok = emqx_router:do_delete_route(Topic, {Group, node()}),
+        _ = emqx_external_broker:delete_shared_route(Topic, Group),
+        ok
     end).
 
 get_default_shared_subscription_strategy() ->
     emqx:get_config([mqtt, shared_subscription_strategy]).
+
+get_default_shared_subscription_initial_sticky_pick() ->
+    emqx:get_config([mqtt, shared_subscription_initial_sticky_pick]).

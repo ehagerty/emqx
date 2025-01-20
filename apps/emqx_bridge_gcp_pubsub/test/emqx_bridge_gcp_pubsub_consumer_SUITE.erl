@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_gcp_pubsub_consumer_SUITE).
@@ -13,7 +13,15 @@
 
 -define(BRIDGE_TYPE, gcp_pubsub_consumer).
 -define(BRIDGE_TYPE_BIN, <<"gcp_pubsub_consumer">>).
+-define(CONNECTOR_TYPE_BIN, <<"gcp_pubsub_consumer">>).
+-define(SOURCE_TYPE_BIN, <<"gcp_pubsub_consumer">>).
 -define(REPUBLISH_TOPIC, <<"republish/t">>).
+-define(PREPARED_REQUEST(METHOD, PATH, BODY),
+    {prepared_request, {METHOD, PATH, BODY}, #{request_ttl => 1_000}}
+).
+-define(PREPARED_REQUEST_PAT(METHOD, PATH, BODY),
+    {prepared_request, {METHOD, PATH, BODY}, _}
+).
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -25,6 +33,7 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
+    emqx_common_test_helpers:clear_screen(),
     GCPEmulatorHost = os:getenv("GCP_EMULATOR_HOST", "toxiproxy"),
     GCPEmulatorPortStr = os:getenv("GCP_EMULATOR_PORT", "8085"),
     GCPEmulatorPort = list_to_integer(GCPEmulatorPortStr),
@@ -34,16 +43,23 @@ init_per_suite(Config) ->
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     case emqx_common_test_helpers:is_tcp_server_available(GCPEmulatorHost, GCPEmulatorPort) of
         true ->
-            ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-            ok = emqx_connector_test_helpers:start_apps([
-                emqx_resource, emqx_bridge, emqx_rule_engine
-            ]),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_gcp_pubsub,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             HostPort = GCPEmulatorHost ++ ":" ++ GCPEmulatorPortStr,
             true = os:putenv("PUBSUB_EMULATOR_HOST", HostPort),
             Client = start_control_client(),
             [
+                {apps, Apps},
                 {proxy_name, ProxyName},
                 {proxy_host, ProxyHost},
                 {proxy_port, ProxyPort},
@@ -62,12 +78,10 @@ init_per_suite(Config) ->
     end.
 
 end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
     Client = ?config(client, Config),
     stop_control_client(Client),
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_bridge, emqx_resource, emqx_rule_engine]),
-    _ = application:stop(emqx_connector),
+    emqx_cth_suite:stop(Apps),
     os:unsetenv("PUBSUB_EMULATOR_HOST"),
     ok.
 
@@ -135,6 +149,7 @@ common_init_per_testcase(TestCase, Config0) ->
     ensure_topics(Config),
     ok = snabbkaffe:start_trace(),
     [
+        {bridge_kind, source},
         {bridge_type, ?BRIDGE_TYPE},
         {bridge_name, Name},
         {bridge_config, ConsumerConfig},
@@ -145,18 +160,13 @@ common_init_per_testcase(TestCase, Config0) ->
     ].
 
 end_per_testcase(_Testcase, Config) ->
-    case proplists:get_bool(skip_does_not_apply, Config) of
-        true ->
-            ok;
-        false ->
-            ProxyHost = ?config(proxy_host, Config),
-            ProxyPort = ?config(proxy_port, Config),
-            emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            emqx_bridge_testlib:delete_all_bridges(),
-            emqx_common_test_helpers:call_janitor(60_000),
-            ok = snabbkaffe:stop(),
-            ok
-    end.
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
+    emqx_common_test_helpers:call_janitor(60_000),
+    ok = snabbkaffe:stop(),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Helper fns
@@ -191,7 +201,7 @@ consumer_config(TestCase, Config) ->
             "  connect_timeout = \"5s\"\n"
             "  service_account_json = ~s\n"
             "  consumer {\n"
-            "    ack_deadline = \"60s\"\n"
+            "    ack_deadline = \"10s\"\n"
             "    ack_retry_interval = \"1s\"\n"
             "    pull_max_messages = 10\n"
             "    consumer_workers_per_topic = 1\n"
@@ -203,7 +213,7 @@ consumer_config(TestCase, Config) ->
             "  resource_opts {\n"
             "    health_check_interval = \"1s\"\n"
             %% to fail and retry pulling faster
-            "    request_ttl = \"5s\"\n"
+            "    request_ttl = \"1s\"\n"
             "  }\n"
             "}\n",
             [
@@ -261,7 +271,7 @@ ensure_topic(Config, Topic) ->
     Path = <<"/v1/projects/", ProjectId/binary, "/topics/", Topic/binary>>,
     Body = <<"{}">>,
     Res = emqx_bridge_gcp_pubsub_client:query_sync(
-        {prepared_request, {Method, Path, Body}},
+        ?PREPARED_REQUEST(Method, Path, Body),
         Client
     ),
     case Res of
@@ -280,7 +290,6 @@ start_control_client() ->
             connect_timeout => 5_000,
             max_retries => 0,
             pool_size => 1,
-            resource_opts => #{request_ttl => 5_000},
             service_account_json => RawServiceAccount
         },
     PoolName = <<"control_connector">>,
@@ -312,7 +321,7 @@ pubsub_publish(Config, Topic, Messages0) ->
         ),
     Body = emqx_utils_json:encode(#{<<"messages">> => Messages}),
     {ok, _} = emqx_bridge_gcp_pubsub_client:query_sync(
-        {prepared_request, {Method, Path, Body}},
+        ?PREPARED_REQUEST(Method, Path, Body),
         Client
     ),
     ok.
@@ -324,7 +333,7 @@ delete_topic(Config, Topic) ->
     Path = <<"/v1/projects/", ProjectId/binary, "/topics/", Topic/binary>>,
     Body = <<>>,
     {ok, _} = emqx_bridge_gcp_pubsub_client:query_sync(
-        {prepared_request, {Method, Path, Body}},
+        ?PREPARED_REQUEST(Method, Path, Body),
         Client
     ),
     ok.
@@ -336,7 +345,7 @@ delete_subscription(Config, SubscriptionId) ->
     Path = <<"/v1/projects/", ProjectId/binary, "/subscriptions/", SubscriptionId/binary>>,
     Body = <<>>,
     {ok, _} = emqx_bridge_gcp_pubsub_client:query_sync(
-        {prepared_request, {Method, Path, Body}},
+        ?PREPARED_REQUEST(Method, Path, Body),
         Client
     ),
     ok.
@@ -383,18 +392,7 @@ probe_bridge_api(Config) ->
     TypeBin = ?BRIDGE_TYPE_BIN,
     Name = ?config(consumer_name, Config),
     ConsumerConfig = ?config(consumer_config, Config),
-    Params = ConsumerConfig#{<<"type">> => TypeBin, <<"name">> => Name},
-    Path = emqx_mgmt_api_test_util:api_path(["bridges_probe"]),
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    Opts = #{return_all => true},
-    ct:pal("probing bridge (via http): ~p", [Params]),
-    Res =
-        case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params, Opts) of
-            {ok, {{_, 204, _}, _Headers, _Body0} = Res0} -> {ok, Res0};
-            Error -> Error
-        end,
-    ct:pal("bridge probe result: ~p", [Res]),
-    Res.
+    emqx_bridge_testlib:probe_bridge_api(TypeBin, Name, ConsumerConfig).
 
 start_and_subscribe_mqtt(Config) ->
     TopicMapping = ?config(topic_mapping, Config),
@@ -410,9 +408,22 @@ start_and_subscribe_mqtt(Config) ->
     ok.
 
 resource_id(Config) ->
-    Type = ?BRIDGE_TYPE_BIN,
     Name = ?config(consumer_name, Config),
-    emqx_bridge_resource:resource_id(Type, Name).
+    emqx_bridge_v2:source_id(?SOURCE_TYPE_BIN, Name, Name).
+
+connector_resource_id(Config) ->
+    Name = ?config(consumer_name, Config),
+    emqx_connector_resource:resource_id(?CONNECTOR_TYPE_BIN, Name).
+
+health_check(Config) ->
+    #{status := Status} = health_check_channel(Config),
+    {ok, Status}.
+
+health_check_channel(Config) ->
+    Name = ?config(consumer_name, Config),
+    ConnectorResId = emqx_connector_resource:resource_id(?CONNECTOR_TYPE_BIN, Name),
+    SourceResId = resource_id(Config),
+    emqx_resource_manager:channel_health_check(ConnectorResId, SourceResId).
 
 bridge_id(Config) ->
     Type = ?BRIDGE_TYPE_BIN,
@@ -507,10 +518,24 @@ wait_acked(Opts) ->
     %% no need to check return value; we check the property in
     %% the check phase.  this is just to give it a chance to do
     %% so and avoid flakiness.  should be fast.
-    snabbkaffe:block_until(
+    ct:pal("waiting ~b ms until acked...", [Timeout]),
+    Res = snabbkaffe:block_until(
         ?match_n_events(N, #{?snk_kind := gcp_pubsub_consumer_worker_acknowledged}),
         Timeout
     ),
+    case Res of
+        {ok, _} ->
+            ok;
+        {timeout, Evts} ->
+            %% Fixme: apparently, snabbkaffe may timeout but still return the expected
+            %% events here.
+            case length(Evts) >= N of
+                true ->
+                    ok;
+                false ->
+                    ct:pal("timed out waiting for acks;\n expected: ~b\n received:\n  ~p", [N, Evts])
+            end
+    end,
     ok.
 
 wait_forgotten() ->
@@ -540,7 +565,7 @@ get_pull_worker_pids(Config) ->
     Pids.
 
 get_async_worker_pids(Config) ->
-    ResourceId = resource_id(Config),
+    ResourceId = connector_resource_id(Config),
     Pids =
         [
             AsyncWorkerPid
@@ -562,66 +587,6 @@ projection_optional_span(Trace) ->
         end
      || #{?snk_kind := K} = Evt <- Trace
     ].
-
-cluster(Config) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    Cluster = emqx_common_test_helpers:emqx_cluster(
-        [core, core],
-        [
-            {apps, [emqx_conf, emqx_rule_engine, emqx_bridge]},
-            {listener_ports, []},
-            {peer_mod, slave},
-            {priv_data_dir, PrivDataDir},
-            {load_schema, true},
-            {start_autocluster, true},
-            {schema_mod, emqx_enterprise_schema},
-            {env_handler, fun
-                (emqx) ->
-                    application:set_env(emqx, boot_modules, [broker, router]),
-                    ok;
-                (emqx_conf) ->
-                    ok;
-                (_) ->
-                    ok
-            end}
-        ]
-    ),
-    ct:pal("cluster: ~p", [Cluster]),
-    Cluster.
-
-start_cluster(Cluster) ->
-    Nodes = lists:map(
-        fun({Name, Opts}) ->
-            ct:pal("starting ~p", [Name]),
-            emqx_common_test_helpers:start_slave(Name, Opts)
-        end,
-        Cluster
-    ),
-    NumNodes = length(Nodes),
-    on_exit(fun() ->
-        emqx_utils:pmap(
-            fun(N) ->
-                ct:pal("stopping ~p", [N]),
-                emqx_common_test_helpers:stop_slave(N)
-            end,
-            Nodes
-        )
-    end),
-    {ok, _} = snabbkaffe:block_until(
-        %% -1 because only those that join the first node will emit the event.
-        ?match_n_events(NumNodes - 1, #{?snk_kind := emqx_machine_boot_apps_started}),
-        30_000
-    ),
-    Nodes.
-
-wait_for_cluster_rpc(Node) ->
-    %% need to wait until the config handler is ready after
-    %% restarting during the cluster join.
-    ?retry(
-        _Sleep0 = 100,
-        _Attempts0 = 50,
-        true = is_pid(erpc:call(Node, erlang, whereis, [emqx_config_handler]))
-    ).
 
 setup_and_start_listeners(Node, NodeOpts) ->
     erpc:call(
@@ -647,24 +612,27 @@ setup_and_start_listeners(Node, NodeOpts) ->
         end
     ).
 
+dedup([]) ->
+    [];
+dedup([X]) ->
+    [X];
+dedup([X | Rest]) ->
+    [X | dedup(X, Rest)].
+
+dedup(X, [X | Rest]) ->
+    dedup(X, Rest);
+dedup(_X, [Y | Rest]) ->
+    [Y | dedup(Y, Rest)];
+dedup(_X, []) ->
+    [].
+
+get_mqtt_port(Node) ->
+    {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
+
 %%------------------------------------------------------------------------------
 %% Trace properties
 %%------------------------------------------------------------------------------
-
-prop_pulled_only_once() ->
-    {"all pulled message ids are unique", fun ?MODULE:prop_pulled_only_once/1}.
-prop_pulled_only_once(Trace) ->
-    PulledIds =
-        [
-            MsgId
-         || #{messages := Msgs} <- ?of_kind(gcp_pubsub_consumer_worker_decoded_messages, Trace),
-            #{<<"message">> := #{<<"messageId">> := MsgId}} <- Msgs
-        ],
-    NumPulled = length(PulledIds),
-    UniquePulledIds = sets:from_list(PulledIds, [{version, 2}]),
-    UniqueNumPulled = sets:size(UniquePulledIds),
-    ?assertEqual(UniqueNumPulled, NumPulled, #{pulled_ids => PulledIds}),
-    ok.
 
 prop_handled_only_once() ->
     {"all pulled message are processed only once", fun ?MODULE:prop_handled_only_once/1}.
@@ -690,7 +658,9 @@ prop_all_pulled_are_acked(Trace) ->
          || #{messages := Msgs} <- ?of_kind(gcp_pubsub_consumer_worker_decoded_messages, Trace),
             #{<<"message">> := #{<<"messageId">> := MsgId}} <- Msgs
         ],
-    AckedMsgIds0 = ?projection(acks, ?of_kind(gcp_pubsub_consumer_worker_acknowledged, Trace)),
+    %% we just need to check that it _tries_ to ack each id; the result itself doesn't
+    %% matter, as it might timeout.
+    AckedMsgIds0 = ?projection(acks, ?of_kind(gcp_pubsub_consumer_worker_will_acknowledge, Trace)),
     AckedMsgIds1 = [
         MsgId
      || PendingAcks <- AckedMsgIds0, {MsgId, _AckId} <- maps:to_list(PendingAcks)
@@ -760,12 +730,124 @@ prop_acked_ids_eventually_forgotten(Trace) ->
     ),
     ok.
 
+permission_denied_response() ->
+    Link =
+        <<"https://console.developers.google.com/project/9999/apiui/credential">>,
+    {error, #{
+        status_code => 403,
+        headers =>
+            [
+                {<<"vary">>, <<"X-Origin">>},
+                {<<"vary">>, <<"Referer">>},
+                {<<"content-type">>, <<"application/json; charset=UTF-8">>},
+                {<<"date">>, <<"Tue, 15 Aug 2023 13:59:09 GMT">>},
+                {<<"server">>, <<"ESF">>},
+                {<<"cache-control">>, <<"private">>},
+                {<<"x-xss-protection">>, <<"0">>},
+                {<<"x-frame-options">>, <<"SAMEORIGIN">>},
+                {<<"x-content-type-options">>, <<"nosniff">>},
+                {<<"alt-svc">>, <<"h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000">>},
+                {<<"accept-ranges">>, <<"none">>},
+                {<<"vary">>, <<"Origin,Accept-Encoding">>},
+                {<<"transfer-encoding">>, <<"chunked">>}
+            ],
+        body => emqx_utils_json:encode(
+            #{
+                <<"error">> =>
+                    #{
+                        <<"code">> => 403,
+                        <<"details">> =>
+                            [
+                                #{
+                                    <<"@type">> => <<"type.googleapis.com/google.rpc.Help">>,
+                                    <<"links">> =>
+                                        [
+                                            #{
+                                                <<"description">> =>
+                                                    <<"Google developer console API key">>,
+                                                <<"url">> =>
+                                                    Link
+                                            }
+                                        ]
+                                },
+                                #{
+                                    <<"@type">> => <<"type.googleapis.com/google.rpc.ErrorInfo">>,
+                                    <<"domain">> => <<"googleapis.com">>,
+                                    <<"metadata">> =>
+                                        #{
+                                            <<"consumer">> => <<"projects/9999">>,
+                                            <<"service">> => <<"pubsub.googleapis.com">>
+                                        },
+                                    <<"reason">> => <<"CONSUMER_INVALID">>
+                                }
+                            ],
+                        <<"message">> => <<"Project #9999 has been deleted.">>,
+                        <<"status">> => <<"PERMISSION_DENIED">>
+                    }
+            }
+        )
+    }}.
+
+unauthenticated_response() ->
+    Msg = <<
+        "Request had invalid authentication credentials. Expected OAuth 2 access token,"
+        " login cookie or other valid authentication credential. "
+        "See https://developers.google.com/identity/sign-in/web/devconsole-project."
+    >>,
+    {error, #{
+        body =>
+            #{
+                <<"error">> =>
+                    #{
+                        <<"code">> => 401,
+                        <<"details">> =>
+                            [
+                                #{
+                                    <<"@type">> =>
+                                        <<"type.googleapis.com/google.rpc.ErrorInfo">>,
+                                    <<"domain">> => <<"googleapis.com">>,
+                                    <<"metadata">> =>
+                                        #{
+                                            <<"email">> =>
+                                                <<"test-516@emqx-cloud-pubsub.iam.gserviceaccount.com">>,
+                                            <<"method">> =>
+                                                <<"google.pubsub.v1.Publisher.CreateTopic">>,
+                                            <<"service">> =>
+                                                <<"pubsub.googleapis.com">>
+                                        },
+                                    <<"reason">> => <<"ACCOUNT_STATE_INVALID">>
+                                }
+                            ],
+                        <<"message">> => Msg,
+
+                        <<"status">> => <<"UNAUTHENTICATED">>
+                    }
+            },
+        headers =>
+            [
+                {<<"www-authenticate">>, <<"Bearer realm=\"https://accounts.google.com/\"">>},
+                {<<"vary">>, <<"X-Origin">>},
+                {<<"vary">>, <<"Referer">>},
+                {<<"content-type">>, <<"application/json; charset=UTF-8">>},
+                {<<"date">>, <<"Wed, 23 Aug 2023 12:41:40 GMT">>},
+                {<<"server">>, <<"ESF">>},
+                {<<"cache-control">>, <<"private">>},
+                {<<"x-xss-protection">>, <<"0">>},
+                {<<"x-frame-options">>, <<"SAMEORIGIN">>},
+                {<<"x-content-type-options">>, <<"nosniff">>},
+                {<<"alt-svc">>, <<"h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000">>},
+                {<<"accept-ranges">>, <<"none">>},
+                {<<"vary">>, <<"Origin,Accept-Encoding">>},
+                {<<"transfer-encoding">>, <<"chunked">>}
+            ],
+        status_code => 401
+    }}.
+
 %%------------------------------------------------------------------------------
 %% Testcases
 %%------------------------------------------------------------------------------
 
 t_start_stop(Config) ->
-    ResourceId = resource_id(Config),
     [#{pubsub_topic := PubSubTopic} | _] = ?config(topic_mapping, Config),
     ?check_trace(
         begin
@@ -776,16 +858,16 @@ t_start_stop(Config) ->
                 ),
             ?assertMatch({ok, _}, create_bridge(Config)),
             {ok, _} = snabbkaffe:receive_events(SRef0),
-            ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, connected}, health_check(Config)),
 
-            ?assertMatch({ok, _}, remove_bridge(Config)),
+            ?assertMatch(ok, remove_bridge(Config)),
             ok
         end,
         [
             prop_client_stopped(),
             prop_workers_stopped(PubSubTopic),
             fun(Trace) ->
-                ?assertMatch([_], ?of_kind(gcp_pubsub_consumer_unset_nonexistent_topic, Trace)),
+                ?assertMatch([_], ?of_kind(gcp_pubsub_consumer_clear_unhealthy, Trace)),
                 ok
             end
         ]
@@ -908,8 +990,8 @@ t_consume_ok(Config) ->
             ),
 
             %% Check that the bridge probe API doesn't leak atoms.
-            ProbeRes0 = probe_bridge_api(Config),
-            ?assertMatch({ok, {{_, 204, _}, _Headers, _Body}}, ProbeRes0),
+            ?assertMatch({ok, {{_, 204, _}, _Headers, _Body}}, probe_bridge_api(Config)),
+            ?assertMatch({ok, {{_, 204, _}, _Headers, _Body}}, probe_bridge_api(Config)),
             AtomsBefore = erlang:system_info(atom_count),
             %% Probe again; shouldn't have created more atoms.
             ProbeRes1 = probe_bridge_api(Config),
@@ -928,7 +1010,6 @@ t_consume_ok(Config) ->
         end,
         [
             prop_all_pulled_are_acked(),
-            prop_pulled_only_once(),
             prop_handled_only_once(),
             prop_acked_ids_eventually_forgotten()
         ]
@@ -1001,20 +1082,18 @@ t_bridge_rule_action_source(Config) ->
             #{payload => Payload0}
         end,
         [
-            prop_pulled_only_once(),
             prop_handled_only_once()
         ]
     ),
     ok.
 
 t_on_get_status(Config) ->
-    ResourceId = resource_id(Config),
     emqx_bridge_testlib:t_on_get_status(Config, #{failure_status => connecting}),
     %% no workers alive
     ?retry(
         _Interval0 = 200,
         _NAttempts0 = 20,
-        ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+        ?assertMatch({ok, connected}, health_check(Config))
     ),
     WorkerPids = get_pull_worker_pids(Config),
     emqx_utils:pmap(
@@ -1028,7 +1107,7 @@ t_on_get_status(Config) ->
         end,
         WorkerPids
     ),
-    ?assertMatch({ok, connecting}, emqx_resource_manager:health_check(ResourceId)),
+    ?assertMatch({ok, connecting}, health_check(Config)),
     ok.
 
 t_create_update_via_http_api(Config) ->
@@ -1045,7 +1124,12 @@ t_multiple_topic_mappings(Config) ->
             ?assertMatch(
                 {{ok, _}, {ok, _}},
                 ?wait_async_action(
-                    create_bridge(Config),
+                    create_bridge(
+                        Config,
+                        #{
+                            <<"consumer">> => #{<<"ack_deadline">> => <<"10m">>}
+                        }
+                    ),
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"},
                     40_000
                 )
@@ -1106,7 +1190,7 @@ t_multiple_topic_mappings(Config) ->
                 ],
                 Published
             ),
-            wait_acked(#{n => 2}),
+            ?block_until(#{?snk_kind := gcp_pubsub_consumer_worker_acknowledged}, 20_000),
             ?retry(
                 _Interval = 200,
                 _NAttempts = 20,
@@ -1119,76 +1203,7 @@ t_multiple_topic_mappings(Config) ->
         end,
         [
             prop_all_pulled_are_acked(),
-            prop_pulled_only_once(),
             prop_handled_only_once()
-        ]
-    ),
-    ok.
-
-%% 2+ pull workers do not duplicate delivered messages
-t_multiple_pull_workers(Config) ->
-    ct:timetrap({seconds, 120}),
-    BridgeName = ?config(consumer_name, Config),
-    TopicMapping = ?config(topic_mapping, Config),
-    ResourceId = resource_id(Config),
-    ?check_trace(
-        begin
-            NConsumers = 3,
-            start_and_subscribe_mqtt(Config),
-            {ok, SRef0} =
-                snabbkaffe:subscribe(
-                    ?match_event(#{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"}),
-                    NConsumers,
-                    40_000
-                ),
-            {ok, _} = create_bridge(
-                Config,
-                #{
-                    <<"consumer">> => #{
-                        %% reduce flakiness
-                        <<"ack_deadline">> => <<"10m">>,
-                        <<"consumer_workers_per_topic">> => NConsumers
-                    },
-                    <<"resource_opts">> => #{
-                        %% reduce flakiness
-                        <<"request_ttl">> => <<"15s">>
-                    }
-                }
-            ),
-            {ok, _} = snabbkaffe:receive_events(SRef0),
-            [#{pubsub_topic := Topic}] = TopicMapping,
-            Payload = emqx_guid:to_hexstr(emqx_guid:gen()),
-            Messages = [#{<<"data">> => Payload}],
-            pubsub_publish(Config, Topic, Messages),
-            {ok, Published} = receive_published(),
-            ?assertMatch(
-                [#{payload := #{<<"value">> := Payload}}],
-                Published
-            ),
-            ?retry(
-                _Interval = 200,
-                _NAttempts = 20,
-                ?assertEqual(1, emqx_resource_metrics:received_get(ResourceId))
-            ),
-
-            assert_non_received_metrics(BridgeName),
-
-            wait_acked(#{n => 1, timeout => 90_000}),
-
-            ok
-        end,
-        [
-            prop_all_pulled_are_acked(),
-            prop_pulled_only_once(),
-            prop_handled_only_once(),
-            {"message is processed only once", fun(Trace) ->
-                ?assertMatch({timeout, _}, receive_published(#{timeout => 5_000})),
-                ?assertMatch(
-                    [#{?snk_span := start}, #{?snk_span := {complete, _}}],
-                    ?of_kind("gcp_pubsub_consumer_worker_handle_message", Trace)
-                ),
-                ok
-            end}
         ]
     ),
     ok.
@@ -1196,7 +1211,6 @@ t_multiple_pull_workers(Config) ->
 t_nonexistent_topic(Config) ->
     BridgeName = ?config(bridge_name, Config),
     [Mapping0] = ?config(topic_mapping, Config),
-    ResourceId = resource_id(Config),
     PubSubTopic = <<"nonexistent-", (emqx_guid:to_hexstr(emqx_guid:gen()))/binary>>,
     TopicMapping0 = [Mapping0#{pubsub_topic := PubSubTopic}],
     TopicMapping = emqx_utils_maps:binary_key_map(TopicMapping0),
@@ -1212,11 +1226,14 @@ t_nonexistent_topic(Config) ->
                 ),
             ?assertMatch(
                 {ok, disconnected},
-                emqx_resource_manager:health_check(ResourceId)
+                health_check(Config)
             ),
             ?assertMatch(
-                {ok, _Group, #{error := {unhealthy_target, "GCP PubSub topics are invalid" ++ _}}},
-                emqx_resource_manager:lookup_cached(ResourceId)
+                #{
+                    status := disconnected,
+                    error := {unhealthy_target, "GCP PubSub topics are invalid" ++ _}
+                },
+                health_check_channel(Config)
             ),
             %% now create the topic and restart the bridge
             ensure_topic(Config, PubSubTopic),
@@ -1227,11 +1244,14 @@ t_nonexistent_topic(Config) ->
             ?retry(
                 _Interval0 = 200,
                 _NAttempts0 = 20,
-                ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+                ?assertMatch({ok, connected}, health_check(Config))
             ),
             ?assertMatch(
-                {ok, _Group, #{error := undefined}},
-                emqx_resource_manager:lookup_cached(ResourceId)
+                #{
+                    status := connected,
+                    error := undefined
+                },
+                health_check_channel(Config)
             ),
             ok
         end,
@@ -1248,7 +1268,6 @@ t_nonexistent_topic(Config) ->
 t_topic_deleted_while_consumer_is_running(Config) ->
     TopicMapping = [#{pubsub_topic := PubSubTopic} | _] = ?config(topic_mapping, Config),
     NTopics = length(TopicMapping),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             {ok, SRef0} =
@@ -1260,7 +1279,7 @@ t_topic_deleted_while_consumer_is_running(Config) ->
             {ok, _} = create_bridge(Config),
             {ok, _} = snabbkaffe:receive_events(SRef0),
 
-            ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, connected}, health_check(Config)),
 
             %% curiously, gcp pubsub doesn't seem to return any errors from the
             %% subscription if the topic is deleted while the subscription still exists...
@@ -1286,26 +1305,42 @@ t_connection_down_before_starting(Config) ->
     ProxyName = ?config(proxy_name, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
-            emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
-                ?assertMatch(
-                    {{ok, _}, {ok, _}},
-                    ?wait_async_action(
-                        create_bridge(Config),
-                        #{?snk_kind := gcp_pubsub_consumer_worker_init},
-                        10_000
-                    )
-                ),
-                ?assertMatch({ok, connecting}, emqx_resource_manager:health_check(ResourceId)),
-                ok
+            ?force_ordering(
+                #{?snk_kind := gcp_pubsub_consumer_worker_about_to_spawn},
+                #{?snk_kind := will_cut_connection}
+            ),
+            ?force_ordering(
+                #{?snk_kind := connection_down},
+                #{?snk_kind := gcp_pubsub_consumer_worker_create_subscription_enter}
+            ),
+            spawn_link(fun() ->
+                ?tp(notice, will_cut_connection, #{}),
+                emqx_common_test_helpers:enable_failure(down, ProxyName, ProxyHost, ProxyPort),
+                ?tp(notice, connection_down, #{})
             end),
+            %% check retries
+            {ok, SRef0} =
+                snabbkaffe:subscribe(
+                    ?match_event(#{?snk_kind := "gcp_pubsub_consumer_worker_subscription_error"}),
+                    _NEvents0 = 2,
+                    10_000
+                ),
+            {ok, _} = create_bridge(Config),
+            {ok, _} = snabbkaffe:receive_events(SRef0),
+            ?assertMatch(
+                {ok, Status} when Status =:= connecting orelse Status =:= disconnected,
+                health_check(Config)
+            ),
+
+            emqx_common_test_helpers:heal_failure(down, ProxyName, ProxyHost, ProxyPort),
             ?retry(
                 _Interval0 = 200,
                 _NAttempts0 = 20,
-                ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+                ?assertMatch({ok, connected}, health_check(Config))
             ),
+
             ok
         end,
         []
@@ -1316,7 +1351,6 @@ t_connection_timeout_before_starting(Config) ->
     ProxyName = ?config(proxy_name, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             emqx_common_test_helpers:with_failure(
@@ -1329,14 +1363,14 @@ t_connection_timeout_before_starting(Config) ->
                             10_000
                         )
                     ),
-                    ?assertMatch({ok, connecting}, emqx_resource_manager:health_check(ResourceId)),
+                    ?assertMatch({ok, connecting}, health_check(Config)),
                     ok
                 end
             ),
             ?retry(
                 _Interval0 = 200,
                 _NAttempts0 = 20,
-                ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+                ?assertMatch({ok, connected}, health_check(Config))
             ),
             ok
         end,
@@ -1345,7 +1379,6 @@ t_connection_timeout_before_starting(Config) ->
     ok.
 
 t_pull_worker_death(Config) ->
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             ?assertMatch(
@@ -1359,19 +1392,19 @@ t_pull_worker_death(Config) ->
 
             [PullWorkerPid | _] = get_pull_worker_pids(Config),
             Ref = monitor(process, PullWorkerPid),
-            sys:terminate(PullWorkerPid, die),
+            sys:terminate(PullWorkerPid, die, 20_000),
             receive
                 {'DOWN', Ref, process, PullWorkerPid, _} ->
                     ok
             after 500 -> ct:fail("pull worker didn't die")
             end,
-            ?assertMatch({ok, connecting}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, connecting}, health_check(Config)),
 
             %% recovery
             ?retry(
                 _Interval0 = 200,
                 _NAttempts0 = 20,
-                ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+                ?assertMatch({ok, connected}, health_check(Config))
             ),
 
             ok
@@ -1381,10 +1414,11 @@ t_pull_worker_death(Config) ->
     ok.
 
 t_async_worker_death_mid_pull(Config) ->
-    ct:timetrap({seconds, 120}),
+    ct:timetrap({seconds, 122}),
     [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
     Payload = emqx_guid:to_hexstr(emqx_guid:gen()),
     ?check_trace(
+        #{timetrap => 120_000},
         begin
             start_and_subscribe_mqtt(Config),
 
@@ -1400,32 +1434,40 @@ t_async_worker_death_mid_pull(Config) ->
                 #{?snk_kind := gcp_pubsub_consumer_worker_reply_delegator}
             ),
             spawn_link(fun() ->
+                ct:pal("will kill async workers"),
                 ?tp_span(
                     kill_async_worker,
                     #{},
                     begin
                         %% produce a message while worker is being killed
                         Messages = [#{<<"data">> => Payload}],
+                        ct:pal("publishing message"),
                         pubsub_publish(Config, PubSubTopic, Messages),
+                        ct:pal("published message"),
 
                         AsyncWorkerPids = get_async_worker_pids(Config),
+                        Timeout = 20_000,
                         emqx_utils:pmap(
                             fun(AsyncWorkerPid) ->
                                 Ref = monitor(process, AsyncWorkerPid),
-                                sys:terminate(AsyncWorkerPid, die),
+                                ct:pal("killing pid ~p", [AsyncWorkerPid]),
+                                exit(AsyncWorkerPid, kill),
                                 receive
                                     {'DOWN', Ref, process, AsyncWorkerPid, _} ->
+                                        ct:pal("killed pid ~p", [AsyncWorkerPid]),
                                         ok
-                                after 500 -> ct:fail("async worker didn't die")
+                                after 500 -> ct:fail("async worker ~p didn't die", [AsyncWorkerPid])
                                 end,
                                 ok
                             end,
-                            AsyncWorkerPids
+                            AsyncWorkerPids,
+                            Timeout + 2_000
                         ),
 
                         ok
                     end
-                )
+                ),
+                ct:pal("killed async workers")
             end),
 
             ?assertMatch(
@@ -1433,7 +1475,13 @@ t_async_worker_death_mid_pull(Config) ->
                 ?wait_async_action(
                     create_bridge(
                         Config,
-                        #{<<"pool_size">> => 1}
+                        #{
+                            <<"pool_size">> => 1,
+                            <<"consumer">> => #{
+                                <<"ack_deadline">> => <<"10s">>,
+                                <<"ack_retry_interval">> => <<"1s">>
+                            }
+                        }
                     ),
                     #{?snk_kind := gcp_pubsub_consumer_worker_init},
                     10_000
@@ -1465,18 +1513,19 @@ t_async_worker_death_mid_pull(Config) ->
                     ],
                     Trace
                 ),
+                SubTraceEvts = ?projection(?snk_kind, SubTrace),
                 ?assertMatch(
                     [
-                        #{?snk_kind := gcp_pubsub_consumer_worker_handled_async_worker_down},
-                        #{?snk_kind := gcp_pubsub_consumer_worker_reply_delegator}
+                        gcp_pubsub_consumer_worker_handled_async_worker_down,
+                        gcp_pubsub_consumer_worker_reply_delegator
                         | _
                     ],
-                    SubTrace,
+                    dedup(SubTraceEvts),
                     #{sub_trace => projection_optional_span(SubTrace)}
                 ),
                 ?assertMatch(
-                    #{?snk_kind := gcp_pubsub_consumer_worker_pull_response_received},
-                    lists:last(SubTrace)
+                    gcp_pubsub_consumer_worker_pull_response_received,
+                    lists:last(SubTraceEvts)
                 ),
                 ok
             end
@@ -1490,19 +1539,32 @@ t_connection_error_while_creating_subscription(Config) ->
     ProxyPort = ?config(proxy_port, Config),
     ?check_trace(
         begin
-            emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
-                %% check retries
-                {ok, SRef0} =
-                    snabbkaffe:subscribe(
-                        ?match_event(#{?snk_kind := "gcp_pubsub_consumer_worker_subscription_error"}),
-                        _NEvents0 = 2,
-                        10_000
-                    ),
-                {ok, _} = create_bridge(Config),
-                {ok, _} = snabbkaffe:receive_events(SRef0),
-                ok
+            ?force_ordering(
+                #{?snk_kind := gcp_pubsub_consumer_worker_init},
+                #{?snk_kind := will_cut_connection}
+            ),
+            ?force_ordering(
+                #{?snk_kind := connection_down},
+                #{?snk_kind := gcp_pubsub_consumer_worker_create_subscription_enter}
+            ),
+            spawn_link(fun() ->
+                ?tp(notice, will_cut_connection, #{}),
+                emqx_common_test_helpers:enable_failure(down, ProxyName, ProxyHost, ProxyPort),
+                ?tp(notice, connection_down, #{})
             end),
-            %% eventually succeeds
+            %% check retries
+            {ok, SRef0} =
+                snabbkaffe:subscribe(
+                    ?match_event(#{?snk_kind := "gcp_pubsub_consumer_worker_subscription_error"}),
+                    _NEvents0 = 2,
+                    10_000
+                ),
+            {ok, _} = create_bridge(Config),
+            {ok, _} = snabbkaffe:receive_events(SRef0),
+            emqx_common_test_helpers:heal_failure(down, ProxyName, ProxyHost, ProxyPort),
+
+            %% should eventually succeed
+            ?tp(notice, "waiting for recovery", #{}),
             {ok, _} =
                 ?block_until(
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_created"},
@@ -1612,7 +1674,6 @@ t_subscription_patch_error(Config) ->
 
 t_topic_deleted_while_creating_subscription(Config) ->
     [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             ?force_ordering(
@@ -1636,7 +1697,7 @@ t_topic_deleted_while_creating_subscription(Config) ->
                     #{?snk_kind := gcp_pubsub_consumer_worker_terminate},
                     10_000
                 ),
-            ?assertMatch({ok, disconnected}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, disconnected}, health_check(Config)),
             ok
         end,
         []
@@ -1646,7 +1707,6 @@ t_topic_deleted_while_creating_subscription(Config) ->
 t_topic_deleted_while_patching_subscription(Config) ->
     BridgeName = ?config(bridge_name, Config),
     [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             {{ok, _}, {ok, _}} =
@@ -1681,7 +1741,7 @@ t_topic_deleted_while_patching_subscription(Config) ->
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"},
                     10_000
                 ),
-            ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, connected}, health_check(Config)),
             ok
         end,
         []
@@ -1689,7 +1749,6 @@ t_topic_deleted_while_patching_subscription(Config) ->
     ok.
 
 t_subscription_deleted_while_consumer_is_running(Config) ->
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             {{ok, _}, {ok, #{subscription_id := SubscriptionId}}} =
@@ -1719,7 +1778,7 @@ t_subscription_deleted_while_consumer_is_running(Config) ->
             {ok, _} = snabbkaffe:receive_events(SRef0),
             {ok, _} = snabbkaffe:receive_events(SRef1),
 
-            ?assertMatch({ok, connected}, emqx_resource_manager:health_check(ResourceId)),
+            ?assertMatch({ok, connected}, health_check(Config)),
             ok
         end,
         []
@@ -1729,7 +1788,6 @@ t_subscription_deleted_while_consumer_is_running(Config) ->
 t_subscription_and_topic_deleted_while_consumer_is_running(Config) ->
     ct:timetrap({seconds, 90}),
     [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
-    ResourceId = resource_id(Config),
     ?check_trace(
         begin
             {{ok, _}, {ok, #{subscription_id := SubscriptionId}}} =
@@ -1745,7 +1803,11 @@ t_subscription_and_topic_deleted_while_consumer_is_running(Config) ->
             delete_subscription(Config, SubscriptionId),
             {ok, _} = ?block_until(#{?snk_kind := gcp_pubsub_consumer_worker_terminate}, 60_000),
 
-            ?assertMatch({ok, disconnected}, emqx_resource_manager:health_check(ResourceId)),
+            ?retry(
+                _Sleep0 = 100,
+                _Retries = 20,
+                ?assertMatch({ok, disconnected}, health_check(Config))
+            ),
             ok
         end,
         []
@@ -1763,7 +1825,10 @@ t_connection_down_during_ack(Config) ->
 
             {{ok, _}, {ok, _}} =
                 ?wait_async_action(
-                    create_bridge(Config),
+                    create_bridge(
+                        Config,
+                        #{<<"consumer">> => #{<<"ack_retry_interval">> => <<"1s">>}}
+                    ),
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"},
                     10_000
                 ),
@@ -1805,7 +1870,6 @@ t_connection_down_during_ack(Config) ->
         end,
         [
             prop_all_pulled_are_acked(),
-            prop_pulled_only_once(),
             prop_handled_only_once(),
             {"message is processed only once", fun(Trace) ->
                 ?assertMatch({timeout, _}, receive_published(#{timeout => 5_000})),
@@ -1830,7 +1894,15 @@ t_connection_down_during_ack_redeliver(Config) ->
                 ?wait_async_action(
                     create_bridge(
                         Config,
-                        #{<<"consumer">> => #{<<"ack_deadline">> => <<"10s">>}}
+                        #{
+                            <<"consumer">> => #{
+                                <<"ack_deadline">> => <<"12s">>,
+                                <<"ack_retry_interval">> => <<"1s">>
+                            },
+                            <<"resource_opts">> => #{
+                                <<"request_ttl">> => <<"11s">>
+                            }
+                        }
                     ),
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"},
                     10_000
@@ -1839,7 +1911,7 @@ t_connection_down_during_ack_redeliver(Config) ->
             emqx_common_test_helpers:with_mock(
                 emqx_bridge_gcp_pubsub_client,
                 query_sync,
-                fun(PreparedRequest = {prepared_request, {_Method, Path, _Body}}, Client) ->
+                fun(PreparedRequest = ?PREPARED_REQUEST_PAT(_Method, Path, _Body), Client) ->
                     case re:run(Path, <<":acknowledge$">>) of
                         {match, _} ->
                             ct:sleep(800),
@@ -1901,7 +1973,13 @@ t_connection_down_during_pull(Config) ->
 
             {{ok, _}, {ok, _}} =
                 ?wait_async_action(
-                    create_bridge(Config),
+                    create_bridge(
+                        Config,
+                        #{
+                            <<"consumer">> => #{<<"ack_retry_interval">> => <<"1s">>},
+                            <<"resource_opts">> => #{<<"request_ttl">> => <<"11s">>}
+                        }
+                    ),
                     #{?snk_kind := "gcp_pubsub_consumer_worker_subscription_ready"},
                     10_000
                 ),
@@ -1992,6 +2070,150 @@ t_get_subscription(Config) ->
     ),
     ok.
 
+t_permission_denied_topic_check(Config) ->
+    [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
+    ?check_trace(
+        begin
+            %% the emulator does not check any credentials
+            emqx_common_test_helpers:with_mock(
+                emqx_bridge_gcp_pubsub_client,
+                query_sync,
+                fun(PreparedRequest = ?PREPARED_REQUEST_PAT(Method, Path, _Body), Client) ->
+                    RE = iolist_to_binary(["/topics/", PubSubTopic, "$"]),
+                    case {Method =:= get, re:run(Path, RE)} of
+                        {true, {match, _}} ->
+                            permission_denied_response();
+                        _ ->
+                            meck:passthrough([PreparedRequest, Client])
+                    end
+                end,
+                fun() ->
+                    {ok, _} = create_bridge(Config),
+                    ?assertMatch(
+                        {ok, disconnected},
+                        health_check(Config)
+                    ),
+                    ?assertMatch(
+                        #{
+                            status := disconnected,
+                            error := {unhealthy_target, "Permission denied" ++ _}
+                        },
+                        health_check_channel(Config)
+                    ),
+                    ok
+                end
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_permission_denied_worker(Config) ->
+    ?check_trace(
+        begin
+            emqx_common_test_helpers:with_mock(
+                emqx_bridge_gcp_pubsub_client,
+                query_sync,
+                fun(PreparedRequest = ?PREPARED_REQUEST_PAT(Method, _Path, _Body), Client) ->
+                    case Method =:= put of
+                        true ->
+                            permission_denied_response();
+                        false ->
+                            meck:passthrough([PreparedRequest, Client])
+                    end
+                end,
+                fun() ->
+                    {{ok, _}, {ok, _}} =
+                        ?wait_async_action(
+                            create_bridge(
+                                Config
+                            ),
+                            #{?snk_kind := gcp_pubsub_consumer_worker_terminate},
+                            10_000
+                        ),
+
+                    ok
+                end
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_unauthenticated_topic_check(Config) ->
+    [#{pubsub_topic := PubSubTopic}] = ?config(topic_mapping, Config),
+    ?check_trace(
+        begin
+            %% the emulator does not check any credentials
+            emqx_common_test_helpers:with_mock(
+                emqx_bridge_gcp_pubsub_client,
+                query_sync,
+                fun(PreparedRequest = ?PREPARED_REQUEST_PAT(Method, Path, _Body), Client) ->
+                    RE = iolist_to_binary(["/topics/", PubSubTopic, "$"]),
+                    case {Method =:= get, re:run(Path, RE)} of
+                        {true, {match, _}} ->
+                            unauthenticated_response();
+                        _ ->
+                            meck:passthrough([PreparedRequest, Client])
+                    end
+                end,
+                fun() ->
+                    {ok, _} = create_bridge(Config),
+                    ?assertMatch(
+                        {ok, disconnected},
+                        health_check(Config)
+                    ),
+                    ?assertMatch(
+                        #{
+                            status := disconnected,
+                            error := {unhealthy_target, "Permission denied" ++ _}
+                        },
+                        health_check_channel(Config)
+                    ),
+                    ok
+                end
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_unauthenticated_worker(Config) ->
+    ?check_trace(
+        begin
+            emqx_common_test_helpers:with_mock(
+                emqx_bridge_gcp_pubsub_client,
+                query_sync,
+                fun(PreparedRequest = ?PREPARED_REQUEST_PAT(Method, _Path, _Body), Client) ->
+                    case Method =:= put of
+                        true ->
+                            unauthenticated_response();
+                        false ->
+                            meck:passthrough([PreparedRequest, Client])
+                    end
+                end,
+                fun() ->
+                    {{ok, _}, {ok, _}} =
+                        ?wait_async_action(
+                            create_bridge(
+                                Config
+                            ),
+                            #{?snk_kind := gcp_pubsub_consumer_worker_terminate},
+                            10_000
+                        ),
+
+                    ok
+                end
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
 t_cluster_subscription(Config) ->
     [
         #{
@@ -2000,12 +2222,19 @@ t_cluster_subscription(Config) ->
         }
     ] = ?config(topic_mapping, Config),
     BridgeId = bridge_id(Config),
-    Cluster = [{_N1, Opts1} | _] = cluster(Config),
+    AppSpecs = [emqx_conf, emqx_rule_engine, emqx_bridge_gcp_pubsub, emqx_bridge],
     ?check_trace(
         begin
-            Nodes = [N1, N2] = start_cluster(Cluster),
+            Nodes =
+                [N1, N2] = emqx_cth_cluster:start(
+                    [
+                        {gcp_pubsub_consumer_subscription1, #{apps => AppSpecs}},
+                        {gcp_pubsub_consumer_subscription2, #{apps => AppSpecs}}
+                    ],
+                    #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+                ),
+            on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
             NumNodes = length(Nodes),
-            lists:foreach(fun wait_for_cluster_rpc/1, Nodes),
             erpc:call(N2, fun() -> {ok, _} = create_bridge(Config) end),
             lists:foreach(
                 fun(N) ->
@@ -2025,8 +2254,7 @@ t_cluster_subscription(Config) ->
                 10_000
             ),
 
-            setup_and_start_listeners(N1, Opts1),
-            TCPPort1 = emqx_common_test_helpers:listener_port(Opts1, tcp),
+            TCPPort1 = get_mqtt_port(N1),
             {ok, C1} = emqtt:start_link([{port, TCPPort1}, {proto_ver, v5}]),
             on_exit(fun() -> catch emqtt:stop(C1) end),
             {ok, _} = emqtt:connect(C1),

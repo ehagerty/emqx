@@ -15,8 +15,8 @@ do(Dir, CONFIG) ->
     end.
 
 assert_otp() ->
-    Oldest = 24,
-    Latest = 25,
+    Oldest = 25,
+    Latest = 26,
     OtpRelease = list_to_integer(erlang:system_info(otp_release)),
     case OtpRelease < Oldest orelse OtpRelease > Latest of
         true ->
@@ -35,25 +35,23 @@ assert_otp() ->
             ok
     end.
 
-bcrypt() ->
-    {bcrypt, {git, "https://github.com/emqx/erlang-bcrypt.git", {tag, "0.6.0"}}}.
-
 quicer() ->
-    {quicer, {git, "https://github.com/emqx/quic.git", {tag, "0.0.114"}}}.
+    {quicer, {git, "https://github.com/emqx/quic.git", {tag, "0.1.11"}}}.
 
 jq() ->
-    {jq, {git, "https://github.com/emqx/jq", {tag, "v0.3.10"}}}.
+    {jq, {git, "https://github.com/emqx/jq", {tag, "v0.3.12"}}}.
 
 deps(Config) ->
     {deps, OldDeps} = lists:keyfind(deps, 1, Config),
     MoreDeps =
-        [bcrypt() || provide_bcrypt_dep()] ++
-            [jq() || is_jq_supported()] ++
+        [jq() || is_jq_supported()] ++
             [quicer() || is_quicer_supported()],
     lists:keystore(deps, 1, Config, {deps, OldDeps ++ MoreDeps}).
 
 overrides() ->
-    [{add, [{extra_src_dirs, [{"etc", [{recursive, true}]}]}]}] ++ snabbkaffe_overrides().
+    [
+        {add, [{extra_src_dirs, [{"etc", [{recursive, true}]}]}]}
+    ] ++ snabbkaffe_overrides().
 
 %% Temporary workaround for a rebar3 erl_opts duplication
 %% bug. Ideally, we want to set this define globally
@@ -78,12 +76,16 @@ is_cover_enabled() ->
 is_enterprise(ce) -> false;
 is_enterprise(ee) -> true.
 
+is_community_umbrella_app("apps/emqx_connector_aggregator") -> false;
 is_community_umbrella_app("apps/emqx_bridge_kafka") -> false;
+is_community_umbrella_app("apps/emqx_bridge_confluent") -> false;
 is_community_umbrella_app("apps/emqx_bridge_gcp_pubsub") -> false;
 is_community_umbrella_app("apps/emqx_bridge_cassandra") -> false;
 is_community_umbrella_app("apps/emqx_bridge_opents") -> false;
 is_community_umbrella_app("apps/emqx_bridge_clickhouse") -> false;
 is_community_umbrella_app("apps/emqx_bridge_dynamo") -> false;
+is_community_umbrella_app("apps/emqx_bridge_es") -> false;
+is_community_umbrella_app("apps/emqx_bridge_greptimedb") -> false;
 is_community_umbrella_app("apps/emqx_bridge_hstreamdb") -> false;
 is_community_umbrella_app("apps/emqx_bridge_influxdb") -> false;
 is_community_umbrella_app("apps/emqx_bridge_iotdb") -> false;
@@ -98,76 +100,95 @@ is_community_umbrella_app("apps/emqx_bridge_tdengine") -> false;
 is_community_umbrella_app("apps/emqx_bridge_timescale") -> false;
 is_community_umbrella_app("apps/emqx_bridge_oracle") -> false;
 is_community_umbrella_app("apps/emqx_bridge_sqlserver") -> false;
+is_community_umbrella_app("apps/emqx_bridge_datalayers") -> false;
+is_community_umbrella_app("apps/emqx_bridge_tablestore") -> false;
 is_community_umbrella_app("apps/emqx_oracle") -> false;
 is_community_umbrella_app("apps/emqx_bridge_rabbitmq") -> false;
 is_community_umbrella_app("apps/emqx_ft") -> false;
 is_community_umbrella_app("apps/emqx_s3") -> false;
+is_community_umbrella_app("apps/emqx_license") -> false;
+is_community_umbrella_app("apps/emqx_opentelemetry") -> false;
+is_community_umbrella_app("apps/emqx_bridge_s3") -> false;
+is_community_umbrella_app("apps/emqx_bridge_azure_blob_storage") -> false;
+is_community_umbrella_app("apps/emqx_bridge_couchbase") -> false;
+is_community_umbrella_app("apps/emqx_bridge_snowflake") -> false;
 is_community_umbrella_app("apps/emqx_schema_registry") -> false;
 is_community_umbrella_app("apps/emqx_enterprise") -> false;
 is_community_umbrella_app("apps/emqx_bridge_kinesis") -> false;
 is_community_umbrella_app("apps/emqx_bridge_azure_event_hub") -> false;
-is_community_umbrella_app("apps/emqx_ldap") -> false;
+is_community_umbrella_app("apps/emqx_gcp_device") -> false;
+is_community_umbrella_app("apps/emqx_dashboard_rbac") -> false;
+is_community_umbrella_app("apps/emqx_dashboard_sso") -> false;
+is_community_umbrella_app("apps/emqx_audit") -> false;
+is_community_umbrella_app("apps/emqx_mt") -> false;
+is_community_umbrella_app("apps/emqx_gateway_gbt32960") -> false;
+is_community_umbrella_app("apps/emqx_gateway_ocpp") -> false;
+is_community_umbrella_app("apps/emqx_gateway_jt808") -> false;
+is_community_umbrella_app("apps/emqx_bridge_syskeeper") -> false;
+is_community_umbrella_app("apps/emqx_schema_validation") -> false;
+is_community_umbrella_app("apps/emqx_message_transformation") -> false;
+is_community_umbrella_app("apps/emqx_eviction_agent") -> false;
+is_community_umbrella_app("apps/emqx_node_rebalance") -> false;
+is_community_umbrella_app("apps/emqx_ds_shared_sub") -> false;
+is_community_umbrella_app("apps/emqx_auth_ext") -> false;
+is_community_umbrella_app("apps/emqx_cluster_link") -> false;
+is_community_umbrella_app("apps/emqx_ds_builtin_raft") -> false;
+is_community_umbrella_app("apps/emqx_auth_kerberos") -> false;
+is_community_umbrella_app("apps/emqx_auth_cinfo") -> false;
+is_community_umbrella_app("apps/emqx_ds_fdb_backend") -> false;
 is_community_umbrella_app(_) -> true.
 
+%% BUILD_WITHOUT_JQ
+%% BUILD_WITHOUT_QUIC
+%% BUILD_WITHOUT_ROCKSDB
+is_build_without(Name) ->
+    "1" =:= os:getenv("BUILD_WITHOUT_" ++ Name).
+
 is_jq_supported() ->
-    not (false =/= os:getenv("BUILD_WITHOUT_JQ") orelse
-        is_win32()) orelse
-        "1" == os:getenv("BUILD_WITH_JQ").
+    not is_build_without("JQ").
 
 is_quicer_supported() ->
-    not (false =/= os:getenv("BUILD_WITHOUT_QUIC") orelse
-        is_macos() orelse
-        is_win32() orelse is_centos_6()) orelse
-        "1" == os:getenv("BUILD_WITH_QUIC").
+    not is_build_without("QUIC").
 
 is_rocksdb_supported() ->
-    not (false =/= os:getenv("BUILD_WITHOUT_ROCKSDB") orelse
-        is_raspbian()) orelse
-        "1" == os:getenv("BUILD_WITH_ROCKSDB").
+    %% there is no way one can build rocksdb on raspbian
+    %% so no need to check is_build_with
+    Distro = os_cmd("./scripts/get-distro.sh"),
+    is_rocksdb_supported(Distro).
 
-is_macos() ->
-    {unix, darwin} =:= os:type().
+is_rocksdb_supported("respbian" ++ _) ->
+    false;
+is_rocksdb_supported(_) ->
+    not is_build_without("ROCKSDB").
 
-is_centos_6() ->
-    %% reason:
-    %% glibc is too old
-    case file:read_file("/etc/centos-release") of
-        {ok, <<"CentOS release 6", _/binary>>} ->
-            true;
-        _ ->
-            false
+get_emqx_flavor() ->
+    case os:getenv("EMQX_FLAVOR") of
+        X when X =:= false; X =:= "" -> official;
+        Flavor -> list_to_atom(Flavor)
     end.
-
-is_raspbian() ->
-    case os_cmd("./scripts/get-distro.sh") of
-        "raspbian" ++ _ ->
-            true;
-        _ ->
-            false
-    end.
-
-is_win32() ->
-    win32 =:= element(1, os:type()).
 
 project_app_dirs() ->
-    project_app_dirs(get_edition_from_profile_env()).
+    #{edition := Edition, reltype := RelType} = get_edition_from_profile_env(),
+    project_app_dirs(Edition, RelType).
 
-project_app_dirs(Edition) ->
+project_app_dirs(Edition, RelType) ->
     IsEnterprise = is_enterprise(Edition),
+    ExcludedApps = excluded_apps(RelType),
     UmbrellaApps = [
         Path
      || Path <- filelib:wildcard("apps/*"),
-        is_community_umbrella_app(Path) orelse IsEnterprise
+        not project_app_excluded(Path, ExcludedApps) andalso
+            (is_community_umbrella_app(Path) orelse IsEnterprise)
     ],
-    UmbrellaApps ++
-        case IsEnterprise of
-            true -> ["lib-ee/*"];
-            false -> []
-        end.
+    UmbrellaApps.
+
+project_app_excluded("apps/" ++ AppStr, ExcludedApps) ->
+    App = list_to_atom(AppStr),
+    lists:member(App, ExcludedApps).
 
 plugins() ->
     [
-        %{relup_helper, {git, "https://github.com/emqx/relup_helper", {tag, "2.1.0"}}},
+        {emqx_relup, {git, "https://github.com/emqx/emqx-relup.git", {tag, "0.2.2"}}},
         %% emqx main project does not require port-compiler
         %% pin at root level for deterministic
         {pc, "v1.14.0"}
@@ -179,7 +200,7 @@ plugins() ->
 test_plugins() ->
     [
         {rebar3_proper, "0.12.1"},
-        {coveralls, {git, "https://github.com/emqx/coveralls-erl", {tag, "v2.2.0-emqx-1"}}}
+        {coveralls, {git, "https://github.com/emqx/coveralls-erl", {tag, "v2.2.0-emqx-4"}}}
     ].
 
 test_deps() ->
@@ -188,13 +209,15 @@ test_deps() ->
         {meck, "0.9.2"},
         {proper, "1.4.0"},
         {er_coap_client, {git, "https://github.com/emqx/er_coap_client", {tag, "v1.0.5"}}},
-        {erl_csv, "0.2.0"}
+        {erl_csv, "0.2.0"},
+        {eministat, "0.10.1"}
     ].
 
 common_compile_opts() ->
-    common_compile_opts(get_edition_from_profile_env(), undefined).
+    #{edition := Edition, reltype := RelType} = get_edition_from_profile_env(),
+    common_compile_opts(Edition, RelType, undefined).
 
-common_compile_opts(Edition, Vsn) ->
+common_compile_opts(Edition, _RelType, Vsn) ->
     % always include debug_info
     [
         debug_info,
@@ -202,6 +225,8 @@ common_compile_opts(Edition, Vsn) ->
         {d, 'EMQX_RELEASE_EDITION', Edition}
     ] ++
         [{d, 'EMQX_BENCHMARK'} || os:getenv("EMQX_BENCHMARK") =:= "1"] ++
+        [{d, 'STORE_STATE_IN_DS'} || os:getenv("STORE_STATE_IN_DS") =:= "1"] ++
+        [{d, 'EMQX_FLAVOR', get_emqx_flavor()}] ++
         [{d, 'BUILD_WITHOUT_QUIC'} || not is_quicer_supported()].
 
 warn_profile_env() ->
@@ -220,71 +245,72 @@ warn_profile_env() ->
 get_edition_from_profile_env() ->
     case os:getenv("PROFILE") of
         "emqx-enterprise" ++ _ ->
-            ee;
+            #{edition => ee, reltype => standard};
         "emqx" ++ _ ->
-            ce;
+            #{edition => ce, reltype => standard};
         false ->
-            ee;
+            #{edition => ee, reltype => standard};
         V ->
             io:format(standard_error, "ERROR: bad_PROFILE ~p~n", [V]),
             exit(bad_PROFILE)
     end.
 
-prod_compile_opts(Edition, Vsn) ->
+prod_compile_opts(Edition, RelType, Vsn) ->
     [
         compressed,
         deterministic,
         warnings_as_errors
-        | common_compile_opts(Edition, Vsn)
+        | common_compile_opts(Edition, RelType, Vsn)
     ].
 
 prod_overrides() ->
     [{add, [{erl_opts, [deterministic]}]}].
 
 profiles() ->
-    case get_edition_from_profile_env() of
+    #{edition := Edition, reltype := RelType} = get_edition_from_profile_env(),
+    case Edition of
         ee ->
-            profiles_ee();
+            profiles_ee(RelType);
         ce ->
-            profiles_ce()
-    end ++ profiles_dev().
+            profiles_ce(RelType)
+    end ++ profiles_dev(RelType).
 
-profiles_ce() ->
+profiles_ce(RelType) ->
     Vsn = get_vsn(emqx),
     [
         {'emqx', [
-            {erl_opts, prod_compile_opts(ce, Vsn)},
-            {relx, relx(Vsn, cloud, bin, ce)},
+            {erl_opts, prod_compile_opts(ce, RelType, Vsn)},
+            {relx, relx(Vsn, RelType, bin, ce)},
             {overrides, prod_overrides()},
-            {project_app_dirs, project_app_dirs(ce)}
+            {project_app_dirs, project_app_dirs(ce, RelType)}
         ]},
         {'emqx-pkg', [
-            {erl_opts, prod_compile_opts(ce, Vsn)},
-            {relx, relx(Vsn, cloud, pkg, ce)},
+            {erl_opts, prod_compile_opts(ce, RelType, Vsn)},
+            {relx, relx(Vsn, RelType, pkg, ce)},
             {overrides, prod_overrides()},
-            {project_app_dirs, project_app_dirs(ce)}
+            {project_app_dirs, project_app_dirs(ce, RelType)}
         ]}
     ].
 
-profiles_ee() ->
+profiles_ee(RelType) ->
     Vsn = get_vsn('emqx-enterprise'),
     [
         {'emqx-enterprise', [
-            {erl_opts, prod_compile_opts(ee, Vsn)},
-            {relx, relx(Vsn, cloud, bin, ee)},
+            {erl_opts, prod_compile_opts(ee, RelType, Vsn)},
+            {relx, relx(Vsn, RelType, bin, ee)},
             {overrides, prod_overrides()},
-            {project_app_dirs, project_app_dirs(ee)}
+            {project_app_dirs, project_app_dirs(ee, RelType)}
         ]},
         {'emqx-enterprise-pkg', [
-            {erl_opts, prod_compile_opts(ee, Vsn)},
-            {relx, relx(Vsn, cloud, pkg, ee)},
+            {erl_opts, prod_compile_opts(ee, RelType, Vsn)},
+            {relx, relx(Vsn, RelType, pkg, ee)},
             {overrides, prod_overrides()},
-            {project_app_dirs, project_app_dirs(ee)}
+            {project_app_dirs, project_app_dirs(ee, RelType)}
         ]}
     ].
 
 %% EE has more files than CE, always test/check with EE options.
-profiles_dev() ->
+profiles_dev(_RelType) ->
     [
         {check, [
             {erl_opts, common_compile_opts()},
@@ -298,7 +324,7 @@ profiles_dev() ->
         ]}
     ].
 
-%% RelType: cloud (full size)
+%% RelType: standard
 %% PkgType: bin | pkg
 %% Edition: ce (opensource) | ee (enterprise)
 relx(Vsn, RelType, PkgType, Edition) ->
@@ -310,6 +336,11 @@ relx(Vsn, RelType, PkgType, Edition) ->
         {sys_config, false},
         {vm_args, false},
         {release, {emqx, Vsn}, relx_apps(RelType, Edition)},
+        {tar_hooks, [
+            "scripts/rel/cleanup-release-package.sh",
+            "scripts/rel/macos-sign-binaries.sh",
+            "scripts/rel/macos-notarize-package.sh"
+        ]},
         {overlay, relx_overlay(RelType, Edition)},
         {overlay_vars_values,
             build_info() ++
@@ -337,10 +368,15 @@ relform() ->
         Other -> Other
     end.
 
-emqx_description(cloud, ee) -> "EMQX Enterprise";
-emqx_description(cloud, ce) -> "EMQX".
+emqx_description(_, ce) ->
+    "EMQX";
+emqx_description(_, ee) ->
+    case get_emqx_flavor() of
+        official -> "EMQX Enterprise";
+        Flavor -> io_lib:format("EMQX Enterprise(~s)", [Flavor])
+    end.
 
-overlay_vars(cloud, PkgType, Edition) ->
+overlay_vars(_RelType, PkgType, Edition) ->
     [
         {emqx_default_erlang_cookie, "emqxsecretcookie"}
     ] ++
@@ -350,16 +386,19 @@ overlay_vars(cloud, PkgType, Edition) ->
 overlay_vars_edition(ce) ->
     [
         {emqx_schema_mod, emqx_conf_schema},
+        {is_enterprise, "no"},
         {emqx_configuration_doc,
-            "https://www.emqx.io/docs/en/v5.0/configuration/configuration.html"},
-        {is_enterprise, "no"}
+            "https://www.emqx.io/docs/en/latest/configuration/configuration.html"},
+        {emqx_configuration_doc_log, "https://www.emqx.io/docs/en/latest/configuration/logs.html"}
     ];
 overlay_vars_edition(ee) ->
     [
         {emqx_schema_mod, emqx_enterprise_schema},
+        {is_enterprise, "yes"},
         {emqx_configuration_doc,
-            "https://docs.emqx.com/en/enterprise/v5.0/configuration/configuration.html"},
-        {is_enterprise, "yes"}
+            "https://docs.emqx.com/en/enterprise/latest/configuration/configuration.html"},
+        {emqx_configuration_doc_log,
+            "https://docs.emqx.com/en/enterprise/latest/configuration/logs.html"}
     ].
 
 %% vars per packaging type, bin(zip/tar.gz/docker) or pkg(rpm/deb)
@@ -369,9 +408,9 @@ overlay_vars_pkg(bin) ->
         {platform_etc_dir, "etc"},
         {platform_plugins_dir, "plugins"},
         {runner_bin_dir, "$RUNNER_ROOT_DIR/bin"},
-        {emqx_etc_dir, "$RUNNER_ROOT_DIR/etc"},
+        {emqx_etc_dir, "$BASE_RUNNER_ROOT_DIR/etc"},
         {runner_lib_dir, "$RUNNER_ROOT_DIR/lib"},
-        {runner_log_dir, "$RUNNER_ROOT_DIR/log"},
+        {runner_log_dir, "$BASE_RUNNER_ROOT_DIR/log"},
         {runner_user, ""},
         {is_elixir, "no"}
     ];
@@ -405,16 +444,30 @@ relx_apps(ReleaseType, Edition) ->
         end,
     BusinessApps = CommonBusinessApps ++ EditionSpecificApps,
     ExcludedApps = excluded_apps(ReleaseType),
-    SystemApps ++
-        %% EMQX starts the DB and the business applications:
-        [{App, load} || App <- (DBApps -- ExcludedApps)] ++
-        [emqx_machine] ++
-        [{App, load} || App <- (BusinessApps -- ExcludedApps)].
+    Apps =
+        ([App || App <- SystemApps, not lists:member(App, ExcludedApps)] ++
+            %% EMQX starts the DB and the business applications:
+            [{App, load} || App <- DBApps, not lists:member(App, ExcludedApps)] ++
+            [emqx_machine] ++
+            [{App, load} || App <- BusinessApps, not lists:member(App, ExcludedApps)]),
+    Apps.
 
-excluded_apps(ReleaseType) ->
+excluded_apps(standard) ->
     OptionalApps = [
         {quicer, is_quicer_supported()},
-        {bcrypt, provide_bcrypt_release(ReleaseType)},
+        {jq, is_jq_supported()},
+        {observer, is_app(observer)},
+        {mnesia_rocksdb, is_rocksdb_supported()},
+        {emqx_fdb_ds, false},
+        {emqx_ds_fdb_backend, false},
+        {emqx_fdb_cli, false},
+        {emqx_fdb_management, false},
+        {emqx_event_history, false}
+    ],
+    [App || {App, false} <- OptionalApps];
+excluded_apps(platform) ->
+    OptionalApps = [
+        {quicer, is_quicer_supported()},
         {jq, is_jq_supported()},
         {observer, is_app(observer)},
         {mnesia_rocksdb, is_rocksdb_supported()}
@@ -442,13 +495,16 @@ relx_overlay(ReleaseType, Edition) ->
         {copy, "bin/emqx", "bin/emqx"},
         {copy, "bin/emqx_ctl", "bin/emqx_ctl"},
         {copy, "bin/emqx_cluster_rescue", "bin/emqx_cluster_rescue"},
+        {copy, "bin/emqx_fw", "bin/emqx_fw"},
         {copy, "bin/node_dump", "bin/node_dump"},
         {copy, "bin/install_upgrade.escript", "bin/install_upgrade.escript"},
         {copy, "bin/emqx", "bin/emqx-{{release_version}}"},
         {copy, "bin/emqx_ctl", "bin/emqx_ctl-{{release_version}}"},
         {copy, "bin/install_upgrade.escript", "bin/install_upgrade.escript-{{release_version}}"},
         {copy, "apps/emqx_gateway_lwm2m/lwm2m_xml", "etc/lwm2m_xml"},
-        {copy, "apps/emqx_authz/etc/acl.conf", "etc/acl.conf"},
+        {copy, "apps/emqx_auth/etc/acl.conf", "etc/acl.conf"},
+        {copy, "apps/emqx_auth/etc/auth-built-in-db-bootstrap.csv",
+            "etc/auth-built-in-db-bootstrap.csv"},
         {template, "bin/emqx.cmd", "bin/emqx.cmd"},
         {template, "bin/emqx_ctl.cmd", "bin/emqx_ctl.cmd"},
         {copy, "bin/nodetool", "bin/nodetool"},
@@ -482,13 +538,14 @@ emqx_etc_overlay(ReleaseType) ->
     emqx_etc_overlay_per_rel(ReleaseType) ++
         emqx_etc_overlay().
 
-emqx_etc_overlay_per_rel(cloud) ->
+emqx_etc_overlay_per_rel(_RelType) ->
     [{"{{base_dir}}/lib/emqx/etc/vm.args.cloud", "etc/vm.args"}].
 
 emqx_etc_overlay() ->
     [
         {"{{base_dir}}/lib/emqx/etc/ssl_dist.conf", "etc/ssl_dist.conf"},
-        {"{{base_dir}}/lib/emqx_conf/etc/emqx.conf.all", "etc/emqx.conf"}
+        {"{{base_dir}}/lib/emqx_conf/etc/emqx.conf.all", "etc/emqx.conf"},
+        {"{{base_dir}}/lib/emqx_conf/etc/base.hocon", "etc/base.hocon"}
     ].
 
 get_vsn(Profile) ->
@@ -520,16 +577,9 @@ is_debug(VarName) ->
         _ -> true
     end.
 
-provide_bcrypt_dep() ->
-    not is_win32().
-
-provide_bcrypt_release(ReleaseType) ->
-    provide_bcrypt_dep() andalso ReleaseType =:= cloud.
-
 erl_opts_i() ->
     [{i, "apps"}] ++
-        [{i, Dir} || Dir <- filelib:wildcard(filename:join(["apps", "*", "include"]))] ++
-        [{i, Dir} || Dir <- filelib:wildcard(filename:join(["lib-ee", "*", "include"]))].
+        [{i, Dir} || Dir <- filelib:wildcard(filename:join(["apps", "*", "include"]))].
 
 dialyzer(Config) ->
     {dialyzer, OldDialyzerConfig} = lists:keyfind(dialyzer, 1, Config),
@@ -543,13 +593,12 @@ dialyzer(Config) ->
         end,
 
     AppNames = app_names(),
-
     KnownApps = [Name || Name <- AppsToAnalyse, lists:member(Name, AppNames)],
-
-    AppsToExclude = AppNames -- KnownApps,
+    ExcludedApps = excluded_apps(standard),
+    AppsToExclude = ExcludedApps ++ (AppNames -- KnownApps),
 
     Extra =
-        [bcrypt || provide_bcrypt_dep()] ++
+        [system_monitor, tools] ++
             [jq || is_jq_supported()] ++
             [quicer || is_quicer_supported()],
     NewDialyzerConfig =
@@ -571,6 +620,7 @@ coveralls() ->
                 {coveralls_service_job_id, os:getenv("GITHUB_RUN_ID")},
                 {coveralls_commit_sha, os:getenv("GITHUB_SHA")},
                 {coveralls_coverdata, "_build/test/cover/*.coverdata"},
+                {coveralls_parallel, true},
                 {coveralls_service_name, "github"}
             ],
             case
@@ -586,7 +636,7 @@ coveralls() ->
             []
     end.
 
-app_names() -> list_dir("apps") ++ list_dir("lib-ee").
+app_names() -> list_dir("apps").
 
 list_dir(Dir) ->
     case filelib:is_dir(Dir) of

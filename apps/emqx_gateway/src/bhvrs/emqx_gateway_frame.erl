@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,6 +22,13 @@
 %%
 -module(emqx_gateway_frame).
 
+-export_type([
+    parse_state/0,
+    parse_result/0,
+    serialize_options/0,
+    frame/0
+]).
+
 -type parse_state() :: map().
 
 -type frame() :: any().
@@ -31,13 +38,6 @@
     | {more, NewState :: parse_state()}.
 
 -type serialize_options() :: map().
-
--export_type([
-    parse_state/0,
-    parse_result/0,
-    serialize_options/0,
-    frame/0
-]).
 
 %% Callbacks
 

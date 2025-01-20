@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,13 +32,16 @@
     api_spec/0,
     paths/0,
     schema/1,
-    fields/1
+    fields/1,
+    namespace/0
 ]).
 
 -export([
     publish/2,
     publish_batch/2
 ]).
+
+namespace() -> undefined.
 
 api_spec() ->
     emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true, translate_body => true}).
@@ -57,9 +60,10 @@ schema("/publish") ->
             responses => #{
                 ?ALL_IS_WELL => hoconsc:mk(hoconsc:ref(?MODULE, publish_ok)),
                 ?PARTIALLY_OK => hoconsc:mk(hoconsc:ref(?MODULE, publish_error)),
-                ?BAD_REQUEST => bad_request_schema(),
+                ?BAD_REQUEST => hoconsc:mk(hoconsc:ref(?MODULE, bad_request)),
                 ?DISPATCH_ERROR => hoconsc:mk(hoconsc:ref(?MODULE, publish_error))
-            }
+            },
+            log_meta => emqx_dashboard_audit:importance(low)
         }
     };
 schema("/publish/bulk") ->
@@ -79,7 +83,8 @@ schema("/publish/bulk") ->
                 ?DISPATCH_ERROR => hoconsc:mk(
                     hoconsc:array(hoconsc:ref(?MODULE, publish_error)), #{}
                 )
-            }
+            },
+            log_meta => emqx_dashboard_audit:importance(low)
         }
     }.
 
@@ -196,11 +201,13 @@ fields(bad_request) ->
     [
         {code,
             hoconsc:mk(string(), #{
-                desc => <<"BAD_REQUEST">>
+                desc => <<"BAD_REQUEST">>,
+                example => ?RC_TOPIC_NAME_INVALID
             })},
         {message,
             hoconsc:mk(binary(), #{
-                desc => ?DESC(error_message)
+                desc => ?DESC(error_message),
+                example => to_binary(emqx_reason_codes:name(?RC_TOPIC_NAME_INVALID))
             })}
     ].
 
@@ -240,6 +247,7 @@ make_bad_req_reply(Reason) ->
 -spec is_ok_deliver({_NodeOrShare, _MatchedTopic, emqx_types:deliver_result()}) -> boolean().
 is_ok_deliver({_NodeOrShare, _MatchedTopic, ok}) -> true;
 is_ok_deliver({_NodeOrShare, _MatchedTopic, {ok, _}}) -> true;
+is_ok_deliver(persisted) -> true;
 is_ok_deliver({_NodeOrShare, _MatchedTopic, {error, _}}) -> false.
 
 %% @hidden Map MQTT publish result reason code to HTTP status code.
@@ -264,6 +272,8 @@ is_ok_deliver({_NodeOrShare, _MatchedTopic, {error, _}}) -> false.
 %% No preceding payload format indicator to compare against.
 %% Content-Type check should be done at HTTP layer but not here.
 %% 153                Payload format invalid                  400
+publish_result_to_http_reply(#message{topic = <<"$delayed/", _/binary>>} = Message, []) ->
+    {?ALL_IS_WELL, make_publish_response(Message)};
 publish_result_to_http_reply(_Message, []) ->
     %% matched no subscriber
     {?PARTIALLY_OK, make_publish_error_response(?RC_NO_MATCHING_SUBSCRIBERS)};

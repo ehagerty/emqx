@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 
 -behaviour(gen_server).
 
--include("include/emqx_gateway.hrl").
+-include("emqx_gateway.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
@@ -96,8 +96,6 @@
 -record(state, {
     %% Gateway Name
     gwname :: gateway_name(),
-    %% ClientId Locker for CM
-    locker :: pid(),
     %% ClientId Registry server
     registry :: pid(),
     chan_pmon :: emqx_pmon:pmon()
@@ -388,8 +386,8 @@ open_session(
                     {ok, #{session => Session, present => false}}
                 end,
             case takeover_session(GwName, ClientId) of
-                {ok, ConnMod, ChanPid, Session} ->
-                    ok = SessionMod:resume(ClientInfo, Session),
+                {ok, ConnMod, ChanPid, SessionIn} ->
+                    Session = SessionMod:resume(ClientInfo, SessionIn),
                     case request_stepdown({takeover, 'end'}, ConnMod, ChanPid) of
                         {ok, Pendings} ->
                             register_channel(
@@ -503,7 +501,7 @@ kick_session(GwName, ClientId) ->
         [] ->
             {error, not_found};
         ChanPids ->
-            ChanPids > 1 andalso
+            length(ChanPids) > 1 andalso
                 begin
                     ?SLOG(
                         warning,
@@ -568,7 +566,7 @@ do_kick_session(GwName, Action, ClientId, ChanPid) ->
 %% benefits nobody.
 -spec request_stepdown(Action, module(), pid()) ->
     ok
-    | {ok, emqx_session:session() | list(emqx_type:deliver())}
+    | {ok, emqx_session:session() | list(emqx_types:deliver())}
     | {error, term()}
 when
     Action :: kick | discard | {takeover, 'begin'} | {takeover, 'end'}.
@@ -776,7 +774,7 @@ init(Options) ->
     {ok, Registry} = emqx_gateway_cm_registry:start_link(GwName),
 
     %% Start locker process
-    {ok, Locker} = ekka_locker:start_link(lockername(GwName)),
+    {ok, _LockerPid} = ekka_locker:start_link(lockername(GwName)),
 
     %% Interval update stats
     %% TODO: v0.2
@@ -784,7 +782,6 @@ init(Options) ->
 
     {ok, #state{
         gwname = GwName,
-        locker = Locker,
         registry = Registry,
         chan_pmon = emqx_pmon:new()
     }}.
@@ -812,9 +809,9 @@ handle_info(
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{registry = Registry, locker = Locker}) ->
+terminate(_Reason, #state{registry = Registry, gwname = GwName}) ->
     _ = gen_server:stop(Registry),
-    _ = ekka_locker:stop(Locker),
+    _ = ekka_locker:stop(lockername(GwName)),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

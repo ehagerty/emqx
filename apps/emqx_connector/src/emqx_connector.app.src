@@ -1,7 +1,7 @@
 %% -*- mode: erlang -*-
 {application, emqx_connector, [
     {description, "EMQX Data Integration Connectors"},
-    {vsn, "0.1.29"},
+    {vsn, "0.3.6"},
     {registered, []},
     {mod, {emqx_connector_app, []}},
     {applications, [
@@ -9,10 +9,6 @@
         stdlib,
         ecpool,
         emqx_resource,
-        eredis_cluster,
-        eredis,
-        epgsql,
-        eldap2,
         ehttpc,
         jose,
         emqx,
@@ -20,7 +16,6 @@
     ]},
     {env, []},
     {modules, []},
-
     {licenses, ["Apache 2.0"]},
     {links, []}
 ]}.

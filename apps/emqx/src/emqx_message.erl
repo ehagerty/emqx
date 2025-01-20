@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -38,7 +38,8 @@
     from/1,
     topic/1,
     payload/1,
-    timestamp/1
+    timestamp/1,
+    timestamp/2
 ]).
 
 %% Flags
@@ -65,8 +66,9 @@
 ]).
 
 -export([
-    is_expired/1,
-    update_expiry/1
+    is_expired/2,
+    update_expiry/1,
+    timestamp_now/0
 ]).
 
 -export([
@@ -78,7 +80,10 @@
     estimate_size/1
 ]).
 
--export_type([message_map/0]).
+-export_type([
+    timestamp/0,
+    message_map/0
+]).
 
 -type message_map() :: #{
     id := binary(),
@@ -88,9 +93,13 @@
     headers := emqx_types:headers(),
     topic := emqx_types:topic(),
     payload := emqx_types:payload(),
-    timestamp := integer(),
+    timestamp := timestamp(),
     extra := _
 }.
+
+%% Message timestamp
+%% Granularity: milliseconds.
+-type timestamp() :: non_neg_integer().
 
 -elvis([{elvis_style, god_modules, disable}]).
 
@@ -113,14 +122,13 @@ make(From, Topic, Payload) ->
     emqx_types:payload()
 ) -> emqx_types:message().
 make(From, QoS, Topic, Payload) when ?QOS_0 =< QoS, QoS =< ?QOS_2 ->
-    Now = erlang:system_time(millisecond),
     #message{
         id = emqx_guid:gen(),
         qos = QoS,
         from = From,
         topic = Topic,
         payload = Payload,
-        timestamp = Now
+        timestamp = timestamp_now()
     }.
 
 -spec make(
@@ -137,7 +145,6 @@ make(From, QoS, Topic, Payload, Flags, Headers) when
     is_map(Flags),
     is_map(Headers)
 ->
-    Now = erlang:system_time(millisecond),
     #message{
         id = emqx_guid:gen(),
         qos = QoS,
@@ -146,7 +153,7 @@ make(From, QoS, Topic, Payload, Flags, Headers) when
         headers = Headers,
         topic = Topic,
         payload = Payload,
-        timestamp = Now
+        timestamp = timestamp_now()
     }.
 
 -spec make(
@@ -164,7 +171,6 @@ make(MsgId, From, QoS, Topic, Payload, Flags, Headers) when
     is_map(Flags),
     is_map(Headers)
 ->
-    Now = erlang:system_time(millisecond),
     #message{
         id = MsgId,
         qos = QoS,
@@ -173,7 +179,7 @@ make(MsgId, From, QoS, Topic, Payload, Flags, Headers) when
         headers = Headers,
         topic = Topic,
         payload = Payload,
-        timestamp = Now
+        timestamp = timestamp_now()
     }.
 
 %% optimistic esitmation of a message size after serialization
@@ -188,7 +194,7 @@ estimate_size(#message{topic = Topic, payload = Payload}) ->
     TopicLengthSize = 2,
     FixedHeaderSize + VarLenSize + TopicLengthSize + TopicSize + PacketIdSize + PayloadSize.
 
--spec id(emqx_types:message()) -> maybe(binary()).
+-spec id(emqx_types:message()) -> option(binary()).
 id(#message{id = Id}) -> Id.
 
 -spec qos(emqx_types:message()) -> emqx_types:qos().
@@ -203,8 +209,13 @@ topic(#message{topic = Topic}) -> Topic.
 -spec payload(emqx_types:message()) -> emqx_types:payload().
 payload(#message{payload = Payload}) -> Payload.
 
--spec timestamp(emqx_types:message()) -> integer().
+-spec timestamp(emqx_types:message()) -> timestamp().
 timestamp(#message{timestamp = TS}) -> TS.
+
+-spec timestamp(emqx_types:message(), second | millisecond | microsecond) -> non_neg_integer().
+timestamp(#message{timestamp = TS}, second) -> TS div 1000;
+timestamp(#message{timestamp = TS}, millisecond) -> TS;
+timestamp(#message{timestamp = TS}, microsecond) -> TS * 1000.
 
 -spec is_sys(emqx_types:message()) -> boolean().
 is_sys(#message{flags = #{sys := true}}) ->
@@ -231,7 +242,7 @@ get_flag(Flag, Msg) ->
 get_flag(Flag, #message{flags = Flags}, Default) ->
     maps:get(Flag, Flags, Default).
 
--spec get_flags(emqx_types:message()) -> maybe(map()).
+-spec get_flags(emqx_types:message()) -> option(map()).
 get_flags(#message{flags = Flags}) -> Flags.
 
 -spec set_flag(emqx_types:flag(), emqx_types:message()) -> emqx_types:message().
@@ -254,7 +265,7 @@ unset_flag(Flag, Msg = #message{flags = Flags}) ->
 set_headers(New, Msg = #message{headers = Old}) when is_map(New) ->
     Msg#message{headers = maps:merge(Old, New)}.
 
--spec get_headers(emqx_types:message()) -> maybe(map()).
+-spec get_headers(emqx_types:message()) -> option(map()).
 get_headers(Msg) -> Msg#message.headers.
 
 -spec get_header(term(), emqx_types:message()) -> term().
@@ -275,14 +286,20 @@ remove_header(Hdr, Msg = #message{headers = Headers}) ->
         false -> Msg
     end.
 
--spec is_expired(emqx_types:message()) -> boolean().
-is_expired(#message{
-    headers = #{properties := #{'Message-Expiry-Interval' := Interval}},
-    timestamp = CreatedAt
-}) ->
+-spec is_expired(emqx_types:message(), atom()) -> boolean().
+is_expired(
+    #message{
+        headers = #{properties := #{'Message-Expiry-Interval' := Interval}},
+        timestamp = CreatedAt
+    },
+    _
+) ->
     elapsed(CreatedAt) > timer:seconds(Interval);
-is_expired(_Msg) ->
-    false.
+is_expired(#message{timestamp = CreatedAt}, Zone) ->
+    case emqx_config:get_zone_conf(Zone, [mqtt, message_expiry_interval], infinity) of
+        infinity -> false;
+        Interval -> elapsed(CreatedAt) > Interval
+    end.
 
 -spec update_expiry(emqx_types:message()) -> emqx_types:message().
 update_expiry(
@@ -303,7 +320,9 @@ update_expiry(Msg) ->
     Msg.
 
 %% @doc Message to PUBLISH Packet.
--spec to_packet(emqx_types:packet_id(), emqx_types:message()) ->
+%%
+%% When QoS=0 then packet id must be `undefined'
+-spec to_packet(emqx_types:packet_id() | undefined, emqx_types:message()) ->
     emqx_types:packet().
 to_packet(
     PacketId,
@@ -311,7 +330,8 @@ to_packet(
         qos = QoS,
         headers = Headers,
         topic = Topic,
-        payload = Payload
+        payload = Payload,
+        extra = Extra
     }
 ) ->
     #mqtt_packet{
@@ -324,8 +344,8 @@ to_packet(
         variable = #mqtt_packet_publish{
             topic_name = Topic,
             packet_id = PacketId,
-            properties = filter_pub_props(
-                maps:get(properties, Headers, #{})
+            properties = maybe_put_extra(
+                Extra, filter_pub_props(maps:get(properties, Headers, #{}))
             )
         },
         payload = Payload
@@ -344,6 +364,11 @@ filter_pub_props(Props) ->
         ],
         Props
     ).
+
+maybe_put_extra(Extra, Props) when map_size(Extra) > 0 ->
+    Props#{?MQTT_INTERNAL_EXTRA => Extra};
+maybe_put_extra(_Extra, Props) ->
+    Props.
 
 %% @doc Message to map
 -spec to_map(emqx_types:message()) -> message_map().
@@ -403,6 +428,11 @@ from_map(#{
         extra = Extra
     }.
 
+%% @doc Get current timestamp in milliseconds.
+-spec timestamp_now() -> timestamp().
+timestamp_now() ->
+    erlang:system_time(millisecond).
+
 %% MilliSeconds
 elapsed(Since) ->
-    max(0, erlang:system_time(millisecond) - Since).
+    max(0, timestamp_now() - Since).

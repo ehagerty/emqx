@@ -79,9 +79,9 @@ emqx_prepare(){
     if [ ! -d "${PAHO_MQTT_TESTING_PATH}" ]; then
         git clone -b develop-4.0 https://github.com/emqx/paho.mqtt.testing.git "${PAHO_MQTT_TESTING_PATH}"
     fi
-    # Debian 12 complains if we don't use venv
+    # Debian 12 and Ubuntu 24.04 complain if we don't use venv
     case "${SYSTEM:-}" in
-        debian12)
+        debian12|ubuntu24.04)
             apt-get update -y && apt-get install -y virtualenv
             virtualenv venv
             # https://www.shellcheck.net/wiki/SC1091
@@ -91,7 +91,7 @@ emqx_prepare(){
         *)
             ;;
     esac
-    pip3 install pytest
+    pip3 install -r "$CODE_PATH/scripts/pytest.requirements.txt"
 }
 
 emqx_test(){
@@ -131,6 +131,21 @@ emqx_test(){
                 exit 1
             fi
 
+            echo "try to install again and purge while the service is running"
+            dpkg -i "${PACKAGE_PATH}/${packagename}"
+            if [ "$(dpkg -l | grep ${EMQX_NAME} | awk '{print $1}')" != "ii" ]
+            then
+                echo "package install error"
+                exit 1
+            fi
+            if ! /usr/bin/emqx start
+            then
+                echo "ERROR: failed_to_start_emqx"
+                cat /var/log/emqx/erlang.log.1 || true
+                cat /var/log/emqx/emqx.log.1 || true
+                exit 1
+            fi
+            /usr/bin/emqx ping
             dpkg -P "${EMQX_NAME}"
             if dpkg -l |grep -q emqx
             then
@@ -195,6 +210,14 @@ EOF
 # EOF
     else
         echo "Error: cannot locate emqx_vars"
+        exit 1
+    fi
+    if ! "${bin_dir}/emqx" 'start' 'help'; then
+        echo "ERROR: failed_to_call_help_command"
+        exit 1
+    fi
+    if ! "${bin_dir}/emqx" 'help'; then
+        echo "ERROR: failed_to_call_help_command"
         exit 1
     fi
     echo "running ${packagename} start"

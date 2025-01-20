@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     terminate/2
@@ -85,8 +86,8 @@
 
 -define(INFO_KEYS, [conninfo, conn_state, clientinfo, session]).
 
--define(DEF_IDLE_TIME, timer:seconds(30)).
--define(GET_IDLE_TIME(Cfg), maps:get(idle_timeout, Cfg, ?DEF_IDLE_TIME)).
+-define(DEF_IDLE_SECONDS, 30).
+-define(RAND_CLIENTID_BYTES, 16).
 
 -import(emqx_coap_medium, [reply/2, reply/3, reply/4, iter/3, iter/4]).
 
@@ -121,7 +122,7 @@ stats(#channel{session = Session}) ->
 -spec init(map(), map()) -> channel().
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     #{ctx := Ctx} = Config
@@ -141,8 +142,9 @@ init(
             listener => ListenerId,
             protocol => 'coap',
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
-            clientid => emqx_guid:to_base62(emqx_guid:gen()),
+            clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYTES),
             username => undefined,
             is_bridge => false,
             is_superuser => false,
@@ -150,8 +152,7 @@ init(
             mountpoint => Mountpoint
         }
     ),
-    %% FIXME: it should coap.hearbeat instead of idle_timeout?
-    Heartbeat = ?GET_IDLE_TIME(Config),
+    Heartbeat = maps:get(heartbeat, Config, ?DEF_IDLE_SECONDS),
     #channel{
         ctx = Ctx,
         conninfo = ConnInfo,
@@ -179,14 +180,17 @@ send_request(Channel, Request) ->
     | {ok, replies(), channel()}
     | {shutdown, Reason :: term(), channel()}
     | {shutdown, Reason :: term(), replies(), channel()}.
-handle_in(Msg, ChannleT) ->
-    Channel = ensure_keepalive_timer(ChannleT),
+handle_in(Msg, Channel0) ->
+    Channel = ensure_keepalive_timer(Channel0),
     case emqx_coap_message:is_request(Msg) of
         true ->
             check_auth_state(Msg, Channel);
         _ ->
             call_session(handle_response, Msg, Channel)
     end.
+
+handle_frame_error(Reason, Channel) ->
+    {shutdown, Reason, Channel}.
 
 %%--------------------------------------------------------------------
 %% Handle Delivers from broker to client
@@ -216,6 +220,8 @@ handle_timeout(_, {transport, Msg}, Channel) ->
     call_session(timeout, Msg, Channel);
 handle_timeout(_, disconnect, Channel) ->
     {shutdown, normal, Channel};
+handle_timeout(_, connection_expire, Channel) ->
+    {shutdown, expired, Channel};
 handle_timeout(_, _, Channel) ->
     {ok, Channel}.
 
@@ -263,7 +269,7 @@ handle_call(
         [ClientInfo, MountedTopic, NSubOpts]
     ),
     %% modify session state
-    SubReq = {Topic, Token},
+    SubReq = #{topic => Topic, token => Token, subopts => NSubOpts},
     TempMsg = #coap_message{type = non},
     %% FIXME: The subopts is not used for emqx_coap_session
     Result = emqx_coap_session:process_subscribe(
@@ -286,7 +292,7 @@ handle_call(
     ok = emqx_broker:unsubscribe(MountedTopic),
     _ = run_hooks(
         Ctx,
-        'session.unsubscribe',
+        'session.unsubscribed',
         [ClientInfo, MountedTopic, #{}]
     ),
 
@@ -321,6 +327,9 @@ handle_call(Req, _From, Channel) ->
 handle_cast(close, Channel) ->
     ?SLOG(info, #{msg => "close_connection"}),
     shutdown(normal, Channel);
+handle_cast(inc_recv_pkt, Channel) ->
+    _ = emqx_pd:inc_counter(recv_pkt, 1),
+    {ok, Channel};
 handle_cast(Req, Channel) ->
     ?SLOG(error, #{msg => "unexpected_cast", cast => Req}),
     {ok, Channel}.
@@ -375,7 +384,7 @@ ensure_keepalive_timer(Channel) ->
     ensure_keepalive_timer(fun ensure_timer/4, Channel).
 
 ensure_keepalive_timer(Fun, #channel{keepalive = KeepAlive} = Channel) ->
-    Heartbeat = emqx_keepalive:info(interval, KeepAlive),
+    Heartbeat = emqx_keepalive:info(check_interval, KeepAlive),
     Fun(keepalive, Heartbeat, keepalive, Channel).
 
 check_auth_state(Msg, #channel{connection_required = false} = Channel) ->
@@ -385,7 +394,7 @@ check_auth_state(Msg, #channel{connection_required = true} = Channel) ->
         true ->
             call_session(handle_request, Msg, Channel);
         false ->
-            URIQuery = emqx_coap_message:get_option(uri_query, Msg, #{}),
+            URIQuery = emqx_coap_message:extract_uri_query(Msg),
             case maps:get(<<"token">>, URIQuery, undefined) of
                 undefined ->
                     ?SLOG(debug, #{msg => "token_required_in_conn_mode", message => Msg});
@@ -427,40 +436,24 @@ check_token(
         clientinfo = ClientInfo
     } = Channel
 ) ->
-    IsDeleteConn = is_delete_connection_request(Msg),
     #{clientid := ClientId} = ClientInfo,
-    case emqx_coap_message:get_option(uri_query, Msg) of
+    case emqx_coap_message:extract_uri_query(Msg) of
         #{
             <<"clientid">> := ClientId,
             <<"token">> := Token
         } ->
             call_session(handle_request, Msg, Channel);
-        #{<<"clientid">> := ReqClientId, <<"token">> := ReqToken} ->
-            case emqx_gateway_cm:call(coap, ReqClientId, {check_token, ReqToken}) of
-                undefined when IsDeleteConn ->
+        _ ->
+            %% This channel is create by this DELETE command, so here can safely close this channel
+            case Token =:= undefined andalso is_delete_connection_request(Msg) of
+                true ->
                     Reply = emqx_coap_message:piggyback({ok, deleted}, Msg),
                     {shutdown, normal, Reply, Channel};
-                undefined ->
-                    ?SLOG(info, #{
-                        msg => "remote_connection_not_found",
-                        clientid => ReqClientId,
-                        token => ReqToken
-                    }),
-                    Reply = emqx_coap_message:reset(Msg),
-                    {shutdown, normal, Reply, Channel};
                 false ->
-                    ?SLOG(info, #{
-                        msg => "request_token_invalid", clientid => ReqClientId, token => ReqToken
-                    }),
-                    Reply = emqx_coap_message:piggyback({error, unauthorized}, Msg),
-                    {shutdown, normal, Reply, Channel};
-                true ->
-                    call_session(handle_request, Msg, Channel)
-            end;
-        _ ->
-            ErrMsg = <<"Missing token or clientid in connection mode">>,
-            Reply = emqx_coap_message:piggyback({error, bad_request}, ErrMsg, Msg),
-            {shutdown, normal, Reply, Channel}
+                    ErrMsg = <<"Missing token or clientid in connection mode">>,
+                    Reply = emqx_coap_message:piggyback({error, bad_request}, ErrMsg, Msg),
+                    {ok, {outgoing, Reply}, Channel}
+            end
     end.
 
 run_conn_hooks(
@@ -485,13 +478,16 @@ enrich_conninfo(
 ) ->
     case Queries of
         #{<<"clientid">> := ClientId} ->
-            Interval = maps:get(interval, emqx_keepalive:info(KeepAlive)),
+            %% in milliseconds
+            IntervalMs = emqx_keepalive:info(check_interval, KeepAlive),
+            %% in seconds
+            InternalS = floor(IntervalMs / 1000),
             NConnInfo = ConnInfo#{
                 clientid => ClientId,
                 proto_name => <<"CoAP">>,
                 proto_ver => <<"1">>,
                 clean_start => true,
-                keepalive => Interval,
+                keepalive => InternalS,
                 expiry_interval => 0
             },
             {ok, Channel#channel{conninfo = NConnInfo}};
@@ -587,6 +583,14 @@ process_connect(
             iter(Iter, reply({error, bad_request}, Msg, Result), Channel)
     end.
 
+schedule_connection_expire(Channel = #channel{ctx = Ctx, clientinfo = ClientInfo}) ->
+    case emqx_gateway_ctx:connection_expire_interval(Ctx, ClientInfo) of
+        undefined ->
+            Channel;
+        Interval ->
+            ensure_timer(connection_expire_timer, Interval, connection_expire, Channel)
+    end.
+
 run_hooks(Ctx, Name, Args) ->
     emqx_gateway_ctx:metrics_inc(Ctx, Name),
     emqx_hooks:run(Name, Args).
@@ -611,7 +615,7 @@ ensure_connected(
     NConnInfo = ConnInfo#{connected_at => erlang:system_time(millisecond)},
     _ = run_hooks(Ctx, 'client.connack', [NConnInfo, connection_accepted, #{}]),
     ok = run_hooks(Ctx, 'client.connected', [ClientInfo, NConnInfo]),
-    Channel#channel{conninfo = NConnInfo, conn_state = connected}.
+    schedule_connection_expire(Channel#channel{conninfo = NConnInfo, conn_state = connected}).
 
 %%--------------------------------------------------------------------
 %% Ensure disconnected
@@ -734,7 +738,7 @@ process_connection(
     Channel = #channel{conn_state = idle},
     Iter
 ) ->
-    Queries = emqx_coap_message:get_option(uri_query, Req),
+    Queries = emqx_coap_message:extract_uri_query(Req),
     case
         emqx_utils:pipeline(
             [
@@ -767,7 +771,8 @@ process_connection(
 ) when
     ConnState == connected
 ->
-    Queries = emqx_coap_message:get_option(uri_query, Req),
+    %% TODO should take over the session here
+    Queries = emqx_coap_message:extract_uri_query(Req),
     ErrMsg0 =
         case Queries of
             #{<<"clientid">> := ClientId} ->
@@ -785,7 +790,7 @@ process_connection(
         Channel
     );
 process_connection({close, Msg}, _, Channel, _) ->
-    Queries = emqx_coap_message:get_option(uri_query, Msg),
+    Queries = emqx_coap_message:extract_uri_query(Msg),
     case maps:get(<<"clientid">>, Queries, undefined) of
         undefined ->
             ok;

@@ -26,7 +26,7 @@ desc_type.label:
 
 local_topic.desc:
 """The MQTT topic filter to be forwarded to RocketMQ. All MQTT `PUBLISH` messages with the topic
-matching the `local_topic` will be forwarded.</br>
+matching the `local_topic` will be forwarded.<br/>
 NOTE: if the bridge is used as a rule action, `local_topic` should be left empty otherwise the messages will be duplicated."""
 
 local_topic.label:
@@ -40,5 +40,26 @@ template.desc:
 
 template.label:
 """Template"""
+
+action_parameters.desc:
+"""Action specific configuration."""
+
+action_parameters.label:
+"""Action"""
+
+rocketmq_action.desc:
+"""Configuration for RocketMQ Action"""
+
+rocketmq_action.label:
+"""RocketMQ Action Configuration"""
+
+config_connector.desc:
+"""Configuration for an RocketMQ Client."""
+
+config_connector.label:
+"""RocketMQ Client Configuration"""
+
+strategy.desc:
+"""Producer key dispatch strategy, the default is `roundrobin`, also supports placeholders, such as: `clientid`, `messageid`, `username`."""
 
 }

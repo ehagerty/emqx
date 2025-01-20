@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
     [
         wildcard/1,
         match/2,
+        intersection/2,
         validate/1,
         prepend/2,
         join/1,
@@ -115,12 +116,101 @@ t_sys_match(_) ->
     true = match(<<"a/b/$c">>, <<"a/b/#">>),
     true = match(<<"a/b/$c">>, <<"a/#">>).
 
+t_match_tokens(_) ->
+    true = match(emqx_topic:tokens(<<"a/b/c">>), words(<<"a/+/c">>)),
+    true = match(emqx_topic:tokens(<<"a//c">>), words(<<"a/+/c">>)),
+    false = match(emqx_topic:tokens(<<"a//c/">>), words(<<"a/+/c">>)),
+    true = match(emqx_topic:tokens(<<"a//c/">>), words(<<"a/+/c/#">>)).
+
 t_match_perf(_) ->
     true = match(<<"a/b/ccc">>, <<"a/#">>),
     Name = <<"/abkc/19383/192939/akakdkkdkak/xxxyyuya/akakak">>,
     Filter = <<"/abkc/19383/+/akakdkkdkak/#">>,
     true = match(Name, Filter),
     ok = bench('match/2', fun emqx_topic:match/2, [Name, Filter]).
+
+t_intersect(_) ->
+    <<"t/global/1/+">> = intersection(<<"t/global/#">>, <<"t/+/1/+">>),
+    <<"t/global/#">> = intersection(<<"t/global/#">>, <<"#">>),
+    <<"t/global/#">> = intersection(<<"t/global/#">>, <<"t/global/#">>),
+    <<"1/2/3/4/5">> = intersection(<<"1/+/3/+/5/#">>, <<"+/2/+/4/+">>),
+    <<"t/local/1">> = intersection(<<"t/local/1/#">>, <<"t/local/+">>),
+    false = intersection(<<"t/global/#">>, <<"t/local/+">>),
+    false = intersection(<<"t/local/1/+">>, <<"t/local/+">>).
+
+t_intersect_topic_wildcard(_) ->
+    <<"t/test/1">> = intersection(<<"t/test/#">>, <<"t/test/1">>),
+    <<"t/test/1/1">> = intersection(<<"t/test/1/1">>, <<"t/test/#">>),
+    false = intersection(<<"t/test/1/1">>, <<"t/test/+">>),
+    <<"t/test/1/1">> = intersection(<<"t/test/1/1">>, <<"t/test/1/1">>),
+    false = intersection(<<"t/test/1">>, <<"t/test/2">>),
+    false = intersection(<<"t/test/1">>, <<"t/test/1/2">>).
+
+t_intersect_commutes(_) ->
+    ?assertEqual(
+        intersection(<<"t/+/1/+">>, <<"t/global/#">>),
+        intersection(<<"t/global/#">>, <<"t/+/1/+">>)
+    ),
+    ?assertEqual(
+        intersection(<<"#">>, <<"t/global/#">>),
+        intersection(<<"t/global/#">>, <<"#">>)
+    ),
+    ?assertEqual(
+        intersection(<<"+/2/+/4/+">>, <<"1/+/3/+/5/#">>),
+        intersection(<<"1/+/3/+/5/#">>, <<"+/2/+/4/+">>)
+    ),
+    ?assertEqual(
+        intersection(<<"t/local/+">>, <<"t/local/1/#">>),
+        intersection(<<"t/local/1/#">>, <<"t/local/+">>)
+    ),
+    ?assertEqual(
+        intersection(<<"t/local/+">>, <<"t/global/#">>),
+        intersection(<<"t/global/#">>, <<"t/local/+">>)
+    ),
+    ?assertEqual(
+        intersection(<<"t/local/+">>, <<"t/local/1/+">>),
+        intersection(<<"t/local/1/+">>, <<"t/local/+">>)
+    ),
+    ?assertEqual(
+        intersection(<<"t/test/#">>, <<"t/test/1/1">>),
+        intersection(<<"t/test/1/1">>, <<"t/test/#">>)
+    ),
+    ?assertEqual(
+        intersection(<<"t/test/+">>, <<"t/test/1/1">>),
+        intersection(<<"t/test/1/1">>, <<"t/test/+">>)
+    ).
+
+t_sys_intersect(_) ->
+    <<"$SYS/broker/+">> = intersection(<<"$SYS/broker/#">>, <<"$SYS/+/+">>),
+    <<"$SYS/broker">> = intersection(<<"$SYS/broker">>, <<"$SYS/+">>),
+    false = intersection(<<"$SYS/broker">>, <<"+/+">>),
+    false = intersection(<<"$SYS/broker">>, <<"#">>).
+
+t_union(_) ->
+    Union = fun(Topics) -> lists:sort(emqx_topic:union(Topics)) end,
+    ?assertEqual([], Union([])),
+    ?assertEqual([<<"t/1/2/+">>], Union([<<"t/1/2/+">>])),
+    ?assertEqual([<<"t/1/2/#">>], Union([<<"t/1/2/+">>, <<"t/1/2/#">>])),
+    ?assertEqual([<<"t/+/1/#">>, <<"t/1/+/#">>], Union([<<"t/+/1/#">>, <<"t/1/+/#">>])),
+    ?assertEqual(
+        [<<"g/1">>, <<"t/+/+/#">>, <<"t/1">>],
+        Union([<<"t/1">>, <<"t/1">>, <<"t/2/+">>, <<"t/+/+/#">>, <<"t/+/+">>, <<"g/1">>])
+    ),
+    ?assertEqual(
+        [<<"#">>],
+        Union([<<"t/1">>, <<"t/1">>, <<"t/2/+">>, <<"t/+/+/#">>, <<"#">>, <<"g/1">>])
+    ).
+
+t_union_sys(_) ->
+    Union = fun(Topics) -> lists:sort(emqx_topic:union(Topics)) end,
+    ?assertEqual(
+        [<<"$SYS/cluster">>, <<"+/#">>],
+        Union([<<"+/#">>, <<"t/1/2/#">>, <<"$SYS/cluster">>])
+    ),
+    ?assertEqual(
+        [<<"$SYS/+">>, <<"$SYS/cluster/#">>, <<"+/#">>],
+        Union([<<"+/#">>, <<"t/1/2">>, <<"$SYS/cluster">>, <<"$SYS/cluster/#">>, <<"$SYS/+">>])
+    ).
 
 t_validate(_) ->
     true = validate(<<"a/+/#">>),
@@ -238,11 +328,11 @@ long_topic() ->
 t_parse(_) ->
     ?assertError(
         {invalid_topic_filter, <<"$queue/t">>},
-        parse(<<"$queue/t">>, #{share => <<"g">>})
+        parse(#share{group = <<"$queue">>, topic = <<"$queue/t">>}, #{})
     ),
     ?assertError(
         {invalid_topic_filter, <<"$share/g/t">>},
-        parse(<<"$share/g/t">>, #{share => <<"g">>})
+        parse(#share{group = <<"g">>, topic = <<"$share/g/t">>}, #{})
     ),
     ?assertError(
         {invalid_topic_filter, <<"$share/t">>},
@@ -254,8 +344,12 @@ t_parse(_) ->
     ),
     ?assertEqual({<<"a/b/+/#">>, #{}}, parse(<<"a/b/+/#">>)),
     ?assertEqual({<<"a/b/+/#">>, #{qos => 1}}, parse({<<"a/b/+/#">>, #{qos => 1}})),
-    ?assertEqual({<<"topic">>, #{share => <<"$queue">>}}, parse(<<"$queue/topic">>)),
-    ?assertEqual({<<"topic">>, #{share => <<"group">>}}, parse(<<"$share/group/topic">>)),
+    ?assertEqual(
+        {#share{group = <<"$queue">>, topic = <<"topic">>}, #{}}, parse(<<"$queue/topic">>)
+    ),
+    ?assertEqual(
+        {#share{group = <<"group">>, topic = <<"topic">>}, #{}}, parse(<<"$share/group/topic">>)
+    ),
     %% The '$local' and '$fastlane' topics have been deprecated.
     ?assertEqual({<<"$local/topic">>, #{}}, parse(<<"$local/topic">>)),
     ?assertEqual({<<"$local/$queue/topic">>, #{}}, parse(<<"$local/$queue/topic">>)),

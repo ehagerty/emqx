@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
 -behaviour(gen_server).
 
--include("include/emqx_gateway.hrl").
+-include("emqx_gateway.hrl").
 -include_lib("emqx/include/logger.hrl").
 
 %% APIs
@@ -209,7 +209,7 @@ handle_info(
     end;
 handle_info(Info, State) ->
     ?SLOG(warning, #{
-        msg => "unexcepted_info",
+        msg => "unexpected_info",
         info => Info
     }),
     {noreply, State}.
@@ -280,7 +280,7 @@ disable_authns(State) ->
 remove_all_authns(#state{name = GwName, config = Config}) ->
     lists:foreach(
         fun({ChainName, _}) ->
-            case emqx_authentication:delete_chain(ChainName) of
+            case emqx_authn_chains:delete_chain(ChainName) of
                 ok ->
                     ok;
                 {error, {not_found, _}} ->
@@ -297,9 +297,9 @@ remove_all_authns(#state{name = GwName, config = Config}) ->
     ).
 
 ensure_authenticator_created(ChainName, Confs) ->
-    case emqx_authentication:list_authenticators(ChainName) of
+    case emqx_authn_chains:list_authenticators(ChainName) of
         {ok, [#{id := AuthenticatorId}]} ->
-            case emqx_authentication:update_authenticator(ChainName, AuthenticatorId, Confs) of
+            case emqx_authn_chains:update_authenticator(ChainName, AuthenticatorId, Confs) of
                 {ok, _} -> ok;
                 {error, Reason} -> {error, {badauth, Reason}}
             end;
@@ -334,7 +334,7 @@ authn_conf(Conf) ->
     maps:get(authentication, Conf, undefined).
 
 do_create_authenticator(ChainName, AuthConf) ->
-    case emqx_authentication:create_authenticator(ChainName, AuthConf) of
+    case emqx_authn_chains:create_authenticator(ChainName, AuthConf) of
         {ok, _} ->
             ok;
         {error, Reason} ->
@@ -403,7 +403,7 @@ remove_deleted_authns(NAuthns, OAuthns) ->
     DeletedNames = ONames -- NNames,
     lists:foreach(
         fun(ChainName) ->
-            _ = emqx_authentication:delete_chain(ChainName)
+            _ = emqx_authn_chains:delete_chain(ChainName)
         end,
         DeletedNames
     ).

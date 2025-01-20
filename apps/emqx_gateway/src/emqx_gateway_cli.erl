@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -313,9 +313,9 @@ format_gateway(
         [
             Name,
             Status,
-            emqx_gateway_utils:unix_ts_to_rfc3339(CreatedAt),
+            emqx_utils_calendar:epoch_to_rfc3339(CreatedAt),
             StopOrStart,
-            emqx_gateway_utils:unix_ts_to_rfc3339(Timestamp),
+            emqx_utils_calendar:epoch_to_rfc3339(Timestamp),
             Config
         ]
     ).

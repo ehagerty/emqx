@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -94,6 +94,9 @@ del_stale_mfa(MaxHistory) ->
         ),
     delete_stale_mfa(mnesia:last(?CLUSTER_MFA), DoneId, MaxHistory).
 
+%% Do nothing when cluster_rpc_commit is empty.
+delete_stale_mfa(_, infinity, _Count) ->
+    ok;
 delete_stale_mfa('$end_of_table', _DoneId, _Count) ->
     ok;
 delete_stale_mfa(CurrId, DoneId, Count) when CurrId > DoneId ->

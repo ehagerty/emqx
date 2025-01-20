@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -49,31 +49,11 @@
 all() -> emqx_common_test_helpers:all(?SUITE).
 
 init_per_suite(Config) ->
-    DistPid =
-        case net_kernel:nodename() of
-            ignored ->
-                %% calling `net_kernel:start' without `epmd'
-                %% running will result in a failure.
-                emqx_common_test_helpers:start_epmd(),
-                {ok, Pid} = net_kernel:start(['master@127.0.0.1', longnames]),
-                ct:pal("start epmd, node name: ~p", [node()]),
-                Pid;
-            _ ->
-                undefined
-        end,
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    [{dist_pid, DistPid} | Config].
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    DistPid = ?config(dist_pid, Config),
-    case DistPid of
-        Pid when is_pid(Pid) ->
-            net_kernel:stop();
-        _ ->
-            ok
-    end,
-    emqx_common_test_helpers:stop_apps([]).
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(Case, Config) ->
     try
@@ -137,7 +117,8 @@ t_random_basic(Config) when is_list(Config) ->
     ClientId = <<"ClientId">>,
     Topic = <<"foo">>,
     Payload = <<"hello">>,
-    emqx:subscribe(Topic, #{qos => 2, share => <<"group1">>}),
+    Group = <<"group1">>,
+    emqx_broker:subscribe(emqx_topic:make_shared_record(Group, Topic), #{qos => 2}),
     MsgQoS2 = emqx_message:make(ClientId, 2, Topic, Payload),
     %% wait for the subscription to show up
     ct:sleep(200),
@@ -365,6 +346,14 @@ t_sticky(Config) when is_list(Config) ->
     ok = ensure_config(sticky, true),
     test_two_messages(sticky).
 
+t_sticky_initial_pick_hash_clientid(Config) when is_list(Config) ->
+    ok = ensure_config(sticky, hash_clientid, false),
+    test_two_messages(sticky).
+
+t_sticky_initial_pick_hash_topic(Config) when is_list(Config) ->
+    ok = ensure_config(sticky, hash_topic, false),
+    test_two_messages(sticky).
+
 %% two subscribers in one shared group
 %% one unsubscribe after receiving a message
 %% the other one in the group should receive the next message
@@ -402,7 +391,7 @@ t_hash(Config) when is_list(Config) ->
     ok = ensure_config(hash_clientid, false),
     test_two_messages(hash_clientid).
 
-t_hash_clinetid(Config) when is_list(Config) ->
+t_hash_clientid(Config) when is_list(Config) ->
     ok = ensure_config(hash_clientid, false),
     test_two_messages(hash_clientid).
 
@@ -513,7 +502,7 @@ test_two_messages(Strategy, Group) ->
     ok.
 
 last_message(ExpectedPayload, Pids) ->
-    last_message(ExpectedPayload, Pids, 100).
+    last_message(ExpectedPayload, Pids, 1000).
 
 last_message(ExpectedPayload, Pids, Timeout) ->
     receive
@@ -528,14 +517,15 @@ last_message(ExpectedPayload, Pids, Timeout) ->
 t_dispatch(Config) when is_list(Config) ->
     ok = ensure_config(random),
     Topic = <<"foo">>,
+    Group = <<"group1">>,
     ?assertEqual(
         {error, no_subscribers},
-        emqx_shared_sub:dispatch(<<"group1">>, Topic, #delivery{message = #message{}})
+        emqx_shared_sub:dispatch(Group, Topic, #delivery{message = #message{}})
     ),
-    emqx:subscribe(Topic, #{qos => 2, share => <<"group1">>}),
+    emqx_broker:subscribe(emqx_topic:make_shared_record(Group, Topic), #{qos => 2}),
     ?assertEqual(
         {ok, 1},
-        emqx_shared_sub:dispatch(<<"group1">>, Topic, #delivery{message = #message{}})
+        emqx_shared_sub:dispatch(Group, Topic, #delivery{message = #message{}})
     ).
 
 t_uncovered_func(Config) when is_list(Config) ->
@@ -549,6 +539,8 @@ t_per_group_config(Config) when is_list(Config) ->
         <<"local_group">> => local,
         <<"round_robin_group">> => round_robin,
         <<"sticky_group">> => sticky,
+        <<"sticky_group_initial_pick_hash_clientid">> => {sticky, hash_clientid},
+        <<"sticky_group_initial_pick_hash_topic">> => {sticky, hash_topic},
         <<"round_robin_per_group_group">> => round_robin_per_group
     }),
     %% Each test is repeated 4 times because random strategy may technically pass the test
@@ -556,10 +548,18 @@ t_per_group_config(Config) when is_list(Config) ->
 
     test_two_messages(sticky, <<"sticky_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin_per_group, <<"round_robin_per_group_group">>),
@@ -572,7 +572,7 @@ t_local(Config) when is_list(Config) ->
         <<"sticky_group">> => sticky
     },
 
-    Node = start_slave('local_shared_sub_testtesttest', 21999),
+    Node = start_peer('local_shared_sub_local_1', 21999),
     ok = ensure_group_config(GroupConfig),
     ok = ensure_group_config(Node, GroupConfig),
 
@@ -603,7 +603,7 @@ t_local(Config) when is_list(Config) ->
 
     emqtt:stop(ConnPid1),
     emqtt:stop(ConnPid2),
-    stop_slave(Node),
+    stop_peer(Node),
 
     ?assertEqual(local, emqx_shared_sub:strategy(<<"local_group">>)),
     ?assertEqual(local, RemoteLocalGroupStrategy),
@@ -625,7 +625,7 @@ t_remote(Config) when is_list(Config) ->
         <<"sticky_group">> => sticky
     },
 
-    Node = start_slave('remote_shared_sub_testtesttest', 21999),
+    Node = start_peer('remote_shared_sub_remote_1', 21999),
     ok = ensure_group_config(GroupConfig),
     ok = ensure_group_config(Node, GroupConfig),
 
@@ -661,7 +661,7 @@ t_remote(Config) when is_list(Config) ->
     after
         emqtt:stop(ConnPidLocal),
         emqtt:stop(ConnPidRemote),
-        stop_slave(Node)
+        stop_peer(Node)
     end.
 
 t_local_fallback(Config) when is_list(Config) ->
@@ -674,7 +674,7 @@ t_local_fallback(Config) when is_list(Config) ->
     Topic = <<"local_foo/bar">>,
     ClientId1 = <<"ClientId1">>,
     ClientId2 = <<"ClientId2">>,
-    Node = start_slave('local_fallback_shared_sub_test', 11888),
+    Node = start_peer('local_fallback_shared_sub_1', 11888),
 
     {ok, ConnPid1} = emqtt:start_link([{clientid, ClientId1}]),
     {ok, _} = emqtt:connect(ConnPid1),
@@ -690,7 +690,7 @@ t_local_fallback(Config) when is_list(Config) ->
     {true, UsedSubPid2} = last_message(<<"hello2">>, [ConnPid1], 2_000),
 
     emqtt:stop(ConnPid1),
-    stop_slave(Node),
+    stop_peer(Node),
 
     ?assertEqual(UsedSubPid1, UsedSubPid2),
     ok.
@@ -757,11 +757,16 @@ t_qos1_random_dispatch_if_all_members_are_down(Config) when is_list(Config) ->
     ?assert(is_process_alive(Pid2)),
 
     {ok, _} = emqtt:publish(ConnPub, Topic, <<"hello11">>, 1),
-    ct:sleep(100),
-    Msgs1 = emqx_mqueue:to_list(get_mqueue(Pid1)),
-    Msgs2 = emqx_mqueue:to_list(get_mqueue(Pid2)),
-    %% assert the message is in mqueue (because socket is closed)
-    ?assertMatch([#message{payload = <<"hello11">>}], Msgs1 ++ Msgs2),
+    ?retry(
+        100,
+        10,
+        begin
+            Msgs1 = emqx_mqueue:to_list(get_mqueue(Pid1)),
+            Msgs2 = emqx_mqueue:to_list(get_mqueue(Pid2)),
+            %% assert the message is in mqueue (because socket is closed)
+            ?assertMatch([#message{payload = <<"hello11">>}], Msgs1 ++ Msgs2)
+        end
+    ),
     emqtt:stop(ConnPub),
     ok.
 
@@ -921,6 +926,8 @@ t_session_takeover(Config) when is_list(Config) ->
     ?assertMatch([_], emqx:publish(Message3)),
     ?assertMatch([_], emqx:publish(Message4)),
     {true, _} = last_message(<<"hello2">>, [ConnPid2]),
+    %% We may or may not recv dup hello2 due to QoS1 redelivery
+    _ = last_message(<<"hello2">>, [ConnPid2]),
     {true, _} = last_message(<<"hello3">>, [ConnPid2]),
     {true, _} = last_message(<<"hello4">>, [ConnPid2]),
     ?assertEqual([], collect_msgs(timer:seconds(2))),
@@ -964,6 +971,8 @@ t_session_kicked(Config) when is_list(Config) ->
     %% on if it's picked as the first one for round_robin
     MsgRec1 = ?WAIT(2000, {publish, #{client_pid := ConnPid2, payload := P1}}, P1),
     MsgRec2 = ?WAIT(2000, {publish, #{client_pid := ConnPid2, payload := P2}}, P2),
+
+    ct:pal("MsgRec1: ~p MsgRec2 ~p ~n", [MsgRec1, MsgRec2]),
     case MsgRec2 of
         <<"hello3">> ->
             ?assertEqual(<<"hello1">>, MsgRec1);
@@ -991,37 +1000,110 @@ t_session_kicked(Config) when is_list(Config) ->
     ?assertEqual([], collect_msgs(0)),
     ok.
 
-%% FIXME: currently doesn't work
-%% t_different_groups_same_topic({init, Config}) ->
-%%     TestName = atom_to_binary(?FUNCTION_NAME),
-%%     ClientId = <<TestName/binary, (integer_to_binary(erlang:unique_integer()))/binary>>,
-%%     {ok, C} = emqtt:start_link([{clientid, ClientId}, {proto_ver, v5}]),
-%%     {ok, _} = emqtt:connect(C),
-%%     [{client, C}, {clientid, ClientId} | Config];
-%% t_different_groups_same_topic({'end', Config}) ->
-%%     C = ?config(client, Config),
-%%     emqtt:stop(C),
-%%     ok;
-%% t_different_groups_same_topic(Config) when is_list(Config) ->
-%%     C = ?config(client, Config),
-%%     ClientId = ?config(clientid, Config),
-%%     %% Subscribe and unsubscribe to both $queue and $shared topics
-%%     Topic = <<"t/1">>,
-%%     SharedTopic0 = <<"$share/aa/", Topic/binary>>,
-%%     SharedTopic1 = <<"$share/bb/", Topic/binary>>,
-%%     {ok, _, [2]} = emqtt:subscribe(C, {SharedTopic0, 2}),
-%%     {ok, _, [2]} = emqtt:subscribe(C, {SharedTopic1, 2}),
+-define(UPDATE_SUB_QOS(ConnPid, Topic, QoS),
+    ?assertMatch({ok, _, [QoS]}, emqtt:subscribe(ConnPid, {Topic, QoS}))
+).
 
-%%     Message0 = emqx_message:make(ClientId, _QoS = 2, Topic, <<"hi">>),
-%%     emqx:publish(Message0),
-%%     ?assertMatch([ {publish, #{payload := <<"hi">>}}
-%%                  , {publish, #{payload := <<"hi">>}}
-%%                  ], collect_msgs(5_000), #{routes => ets:tab2list(emqx_route)}),
+t_different_groups_same_topic({init, Config}) ->
+    TestName = atom_to_binary(?FUNCTION_NAME),
+    ClientId = <<TestName/binary, (integer_to_binary(erlang:unique_integer()))/binary>>,
+    {ok, C} = emqtt:start_link([{clientid, ClientId}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C),
+    [{client, C}, {clientid, ClientId} | Config];
+t_different_groups_same_topic({'end', Config}) ->
+    C = ?config(client, Config),
+    emqtt:stop(C),
+    ok;
+t_different_groups_same_topic(Config) when is_list(Config) ->
+    C = ?config(client, Config),
+    ClientId = ?config(clientid, Config),
+    %% Subscribe and unsubscribe to different group `aa` and `bb` with same topic
+    GroupA = <<"aa">>,
+    GroupB = <<"bb">>,
+    Topic = <<"t/1">>,
 
-%%     {ok, _, [0]} = emqtt:unsubscribe(C, SharedTopic0),
-%%     {ok, _, [0]} = emqtt:unsubscribe(C, SharedTopic1),
+    SharedTopicGroupA = format_share(GroupA, Topic),
+    ?UPDATE_SUB_QOS(C, SharedTopicGroupA, ?QOS_2),
+    SharedTopicGroupB = format_share(GroupB, Topic),
+    ?UPDATE_SUB_QOS(C, SharedTopicGroupB, ?QOS_2),
 
-%%     ok.
+    ?retry(
+        _Sleep0 = 100,
+        _Attempts0 = 50,
+        begin
+            ?assertEqual(2, length(emqx_router:match_routes(Topic)))
+        end
+    ),
+
+    Message0 = emqx_message:make(ClientId, ?QOS_2, Topic, <<"hi">>),
+    emqx:publish(Message0),
+    ?assertMatch(
+        [
+            {publish, #{payload := <<"hi">>}},
+            {publish, #{payload := <<"hi">>}}
+        ],
+        collect_msgs(5_000),
+        #{routes => ets:tab2list(emqx_route)}
+    ),
+
+    {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, SharedTopicGroupA),
+    {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, SharedTopicGroupB),
+
+    ok.
+
+t_different_groups_update_subopts({init, Config}) ->
+    TestName = atom_to_binary(?FUNCTION_NAME),
+    ClientId = <<TestName/binary, (integer_to_binary(erlang:unique_integer()))/binary>>,
+    {ok, C} = emqtt:start_link([{clientid, ClientId}, {proto_ver, v5}]),
+    {ok, _} = emqtt:connect(C),
+    [{client, C}, {clientid, ClientId} | Config];
+t_different_groups_update_subopts({'end', Config}) ->
+    C = ?config(client, Config),
+    emqtt:stop(C),
+    ok;
+t_different_groups_update_subopts(Config) when is_list(Config) ->
+    C = ?config(client, Config),
+    ClientId = ?config(clientid, Config),
+    %% Subscribe and unsubscribe to different group `aa` and `bb` with same topic
+    Topic = <<"t/1">>,
+    GroupA = <<"aa">>,
+    GroupB = <<"bb">>,
+    SharedTopicGroupA = format_share(GroupA, Topic),
+    SharedTopicGroupB = format_share(GroupB, Topic),
+
+    Fun = fun(Group, QoS) ->
+        ?UPDATE_SUB_QOS(C, format_share(Group, Topic), QoS),
+        ?assertMatch(
+            #{qos := QoS},
+            emqx_broker:get_subopts(ClientId, emqx_topic:make_shared_record(Group, Topic))
+        )
+    end,
+
+    [Fun(Group, QoS) || QoS <- [?QOS_0, ?QOS_1, ?QOS_2], Group <- [GroupA, GroupB]],
+
+    ?retry(
+        _Sleep0 = 100,
+        _Attempts0 = 50,
+        begin
+            ?assertEqual(2, length(emqx_router:match_routes(Topic)))
+        end
+    ),
+
+    Message0 = emqx_message:make(ClientId, _QoS = 2, Topic, <<"hi">>),
+    emqx:publish(Message0),
+    ?assertMatch(
+        [
+            {publish, #{payload := <<"hi">>}},
+            {publish, #{payload := <<"hi">>}}
+        ],
+        collect_msgs(5_000),
+        #{routes => ets:tab2list(emqx_route)}
+    ),
+
+    {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, SharedTopicGroupA),
+    {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, SharedTopicGroupB),
+
+    ok.
 
 t_queue_subscription({init, Config}) ->
     TestName = atom_to_binary(?FUNCTION_NAME),
@@ -1038,23 +1120,19 @@ t_queue_subscription({'end', Config}) ->
 t_queue_subscription(Config) when is_list(Config) ->
     C = ?config(client, Config),
     ClientId = ?config(clientid, Config),
-    %% Subscribe and unsubscribe to both $queue and $shared topics
+    %% Subscribe and unsubscribe to both $queue share and $share/<group> with same topic
     Topic = <<"t/1">>,
     QueueTopic = <<"$queue/", Topic/binary>>,
     SharedTopic = <<"$share/aa/", Topic/binary>>,
-    {ok, _, [?RC_GRANTED_QOS_2]} = emqtt:subscribe(C, {QueueTopic, 2}),
-    {ok, _, [?RC_GRANTED_QOS_2]} = emqtt:subscribe(C, {SharedTopic, 2}),
 
-    %% FIXME: we should actually see 2 routes, one for each group
-    %% ($queue and aa), but currently the latest subscription
-    %% overwrites the existing one.
+    ?UPDATE_SUB_QOS(C, QueueTopic, ?QOS_2),
+    ?UPDATE_SUB_QOS(C, SharedTopic, ?QOS_2),
+
     ?retry(
         _Sleep0 = 100,
         _Attempts0 = 50,
         begin
-            ct:pal("routes: ~p", [ets:tab2list(emqx_route)]),
-            %% FIXME: should ensure we have 2 subscriptions
-            true = emqx_router:has_routes(Topic)
+            ?assertEqual(2, length(emqx_router:match_routes(Topic)))
         end
     ),
 
@@ -1063,43 +1141,38 @@ t_queue_subscription(Config) when is_list(Config) ->
     emqx:publish(Message0),
     ?assertMatch(
         [
+            {publish, #{payload := <<"hi">>}},
             {publish, #{payload := <<"hi">>}}
-            %% FIXME: should receive one message from each group
-            %% , {publish, #{payload := <<"hi">>}}
         ],
-        collect_msgs(5_000)
+        collect_msgs(5_000),
+        #{routes => ets:tab2list(emqx_route)}
     ),
 
     {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, QueueTopic),
-    %% FIXME: return code should be success instead of 17 ("no_subscription_existed")
-    {ok, _, [?RC_NO_SUBSCRIPTION_EXISTED]} = emqtt:unsubscribe(C, SharedTopic),
+    {ok, _, [?RC_SUCCESS]} = emqtt:unsubscribe(C, SharedTopic),
 
-    %% FIXME: this should eventually be true, but currently we leak
-    %% the previous group subscription...
-    %% ?retry(
-    %%     _Sleep0 = 100,
-    %%     _Attempts0 = 50,
-    %%    begin
-    %%     ct:pal("routes: ~p", [ets:tab2list(emqx_route)]),
-    %%     false = emqx_router:has_routes(Topic)
-    %%    end
-    %%   ),
+    ?retry(
+        _Sleep0 = 100,
+        _Attempts0 = 50,
+        begin
+            ?assertEqual(0, length(emqx_router:match_routes(Topic)))
+        end
+    ),
     ct:sleep(500),
 
     Message1 = emqx_message:make(ClientId, _QoS = 2, Topic, <<"hello">>),
     emqx:publish(Message1),
-    %% FIXME: we should *not* receive any messages...
-    %% ?assertEqual([], collect_msgs(1_000), #{routes => ets:tab2list(emqx_route)}),
-    %% This is from the leaked group...
-    ?assertMatch([{publish, #{topic := Topic}}], collect_msgs(1_000), #{
-        routes => ets:tab2list(emqx_route)
-    }),
+    %% we should *not* receive any messages.
+    ?assertEqual([], collect_msgs(1_000), #{routes => ets:tab2list(emqx_route)}),
 
     ok.
 
 %%--------------------------------------------------------------------
 %% help functions
 %%--------------------------------------------------------------------
+
+format_share(Group, Topic) ->
+    emqx_topic:maybe_format_share(emqx_topic:make_shared_record(Group, Topic)).
 
 kill_process(Pid) ->
     kill_process(Pid, fun(_) -> erlang:exit(Pid, kill) end).
@@ -1127,10 +1200,14 @@ collect_msgs(Acc, Timeout) ->
     end.
 
 ensure_config(Strategy) ->
-    ensure_config(Strategy, _AckEnabled = true).
+    ensure_config(Strategy, _InitialStickyPick = random, _AckEnabled = true).
 
-ensure_config(Strategy, AckEnabled) ->
+ensure_config(Strategy, AckEnabled) when is_boolean(AckEnabled) ->
+    ensure_config(Strategy, _InitialStickyPick = random, AckEnabled).
+
+ensure_config(Strategy, InitialStickyPick, AckEnabled) ->
     emqx_config:put([mqtt, shared_subscription_strategy], Strategy),
+    emqx_config:put([mqtt, shared_subscription_initial_sticky_pick], InitialStickyPick),
     emqx_config:put([broker, shared_dispatch_ack_enabled], AckEnabled),
     ok.
 
@@ -1140,9 +1217,24 @@ ensure_node_config(Node, Strategy) ->
 ensure_group_config(Group2Strategy) ->
     lists:foreach(
         fun({Group, Strategy}) ->
-            emqx_config:force_put(
-                [broker, shared_subscription_group, Group, strategy], Strategy, unsafe
-            )
+            if
+                is_tuple(Strategy) ->
+                    {PrimaryStrategy, InitialStickyPick} = Strategy,
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, strategy],
+                        PrimaryStrategy,
+                        unsafe
+                    ),
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, initial_sticky_pick],
+                        InitialStickyPick,
+                        unsafe
+                    );
+                true ->
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, strategy], Strategy, unsafe
+                    )
+            end
         end,
         maps:to_list(Group2Strategy)
     ).
@@ -1189,35 +1281,22 @@ recv_msgs(Count, Msgs) ->
         Msgs
     end.
 
-start_slave(Name, Port) ->
-    {ok, Node} = ct_slave:start(
-        list_to_atom(atom_to_list(Name) ++ "@" ++ host()),
-        [
-            {kill_if_fail, true},
-            {monitor_master, true},
-            {init_timeout, 10000},
-            {startup_timeout, 10000},
-            {erl_flags, ebin_path()}
-        ]
+start_peer(Name, Port) ->
+    {ok, Node} = emqx_cth_peer:start_link(
+        Name,
+        emqx_common_test_helpers:ebin_path()
     ),
-
     pong = net_adm:ping(Node),
     setup_node(Node, Port),
     Node.
 
-stop_slave(Node) ->
+stop_peer(Node) ->
     rpc:call(Node, mria, leave, []),
-    ct_slave:stop(Node).
+    emqx_cth_peer:stop(Node).
 
 host() ->
     [_, Host] = string:tokens(atom_to_list(node()), "@"),
     Host.
-
-ebin_path() ->
-    string:join(["-pa" | lists:filter(fun is_lib/1, code:get_path())], " ").
-
-is_lib(Path) ->
-    string:prefix(Path, code:lib_dir()) =:= nomatch.
 
 setup_node(Node, Port) ->
     EnvHandler =
@@ -1234,16 +1313,25 @@ setup_node(Node, Port) ->
             ok
         end,
 
-    %% Load env before doing anything
-    [ok = rpc:call(Node, application, load, [App]) || App <- [gen_rpc, emqx, ekka, mria]],
-
-    %% Needs to be set explicitly because ekka:start() (which calls `gen` is called without Handler
-    %% in emqx_common_test_helpers:start_apps(...)
-    ok = rpc:call(Node, application, set_env, [gen_rpc, tcp_server_port, Port - 1]),
-    ok = rpc:call(Node, application, set_env, [gen_rpc, port_discovery, manual]),
+    MyPort = Port - 1,
+    PeerPort = Port - 2,
+    ok = pair_gen_rpc(node(), MyPort, PeerPort),
+    ok = pair_gen_rpc(Node, PeerPort, MyPort),
 
     %% Here we start the node and make it join the cluster
     ok = rpc:call(Node, emqx_common_test_helpers, start_apps, [[], EnvHandler]),
-    rpc:call(Node, mria, join, [node()]),
 
+    %% warm it up, also assert the peer ndoe name
+    Node = emqx_rpc:call(Node, erlang, node, []),
+    rpc:call(Node, mria, join, [node()]),
+    ok.
+
+pair_gen_rpc(Node, LocalPort, RemotePort) ->
+    _ = rpc:call(Node, application, load, [gen_rpc]),
+    ok = rpc:call(Node, application, set_env, [gen_rpc, port_discovery, manual]),
+    ok = rpc:call(Node, application, set_env, [gen_rpc, tcp_server_port, LocalPort]),
+    ok = rpc:call(Node, application, set_env, [gen_rpc, tcp_client_port, RemotePort]),
+    ok = rpc:call(Node, application, set_env, [gen_rpc, default_client_driver, tcp]),
+    _ = rpc:call(Node, application, stop, [gen_rpc]),
+    {ok, _} = rpc:call(Node, application, ensure_all_started, [gen_rpc]),
     ok.

@@ -1,7 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_greptimedb).
+
+-behaviour(emqx_connector_examples).
 
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
@@ -11,20 +13,21 @@
 -import(hoconsc, [mk/2, enum/1, ref/2]).
 
 -export([
-    conn_bridge_examples/1
-]).
-
--export([
     namespace/0,
     roots/0,
     fields/1,
     desc/1
 ]).
 
--type write_syntax() :: list().
--reflect_type([write_syntax/0]).
--typerefl_from_string({write_syntax/0, ?MODULE, to_influx_lines}).
--export([to_influx_lines/1]).
+%% Examples
+-export([
+    bridge_v2_examples/1,
+    conn_bridge_examples/1,
+    connector_examples/1
+]).
+
+-define(CONNECTOR_TYPE, greptimedb).
+-define(ACTION_TYPE, greptimedb).
 
 %% -------------------------------------------------------------------------------------------------
 %% api
@@ -34,44 +37,67 @@ conn_bridge_examples(Method) ->
         #{
             <<"greptimedb">> => #{
                 summary => <<"Greptimedb HTTP API V2 Bridge">>,
-                value => values("greptimedb", Method)
+                value => bridge_v1_values(Method)
             }
         }
     ].
 
-values(Protocol, get) ->
-    values(Protocol, post);
-values("greptimedb", post) ->
-    SupportUint = <<"uint_value=${payload.uint_key}u,">>,
-    TypeOpts = #{
-        bucket => <<"example_bucket">>,
-        org => <<"examlpe_org">>,
-        token => <<"example_token">>,
-        server => <<"127.0.0.1:4001">>
+bridge_v2_examples(Method) ->
+    ParamsExample = #{
+        parameters => #{
+            write_syntax => write_syntax_value(), precision => ms
+        }
     },
-    values(common, "greptimedb", SupportUint, TypeOpts);
-values(Protocol, put) ->
-    values(Protocol, post).
+    [
+        #{
+            <<"greptimedb">> => #{
+                summary => <<"GreptimeDB Action">>,
+                value => emqx_bridge_v2_schema:action_values(
+                    Method, greptimedb, greptimedb, ParamsExample
+                )
+            }
+        }
+    ].
 
-values(common, Protocol, SupportUint, TypeOpts) ->
-    CommonConfigs = #{
-        type => list_to_atom(Protocol),
+connector_examples(Method) ->
+    [
+        #{
+            <<"greptimedb">> => #{
+                summary => <<"GreptimeDB Connector">>,
+                value => emqx_connector_schema:connector_values(
+                    Method, greptimedb, connector_values(Method)
+                )
+            }
+        }
+    ].
+
+bridge_v1_values(_Method) ->
+    #{
+        type => greptimedb,
         name => <<"demo">>,
         enable => true,
         local_topic => <<"local/topic/#">>,
-        write_syntax =>
-            <<"${topic},clientid=${clientid}", " ", "payload=${payload},",
-                "${clientid}_int_value=${payload.int_key}i,", SupportUint/binary,
-                "bool=${payload.bool}">>,
+        write_syntax => write_syntax_value(),
         precision => ms,
         resource_opts => #{
             batch_size => 100,
             batch_time => <<"20ms">>
         },
+        username => <<"example_username">>,
+        password => <<"******">>,
+        dbname => <<"example_db">>,
         server => <<"127.0.0.1:4001">>,
         ssl => #{enable => false}
-    },
-    maps:merge(TypeOpts, CommonConfigs).
+    }.
+
+connector_values(Method) ->
+    maps:without([write_syntax, precision], bridge_v1_values(Method)).
+
+write_syntax_value() ->
+    <<"${topic},clientid=${clientid}", " ", "payload=${payload},",
+        "${clientid}_int_value=${payload.int_key}i,",
+        "uint_value=${payload.uint_key}u,"
+        "bool=${payload.bool}">>.
 
 %% -------------------------------------------------------------------------------------------------
 %% Hocon Schema Definitions
@@ -85,11 +111,50 @@ fields("put_grpc_v1") ->
     method_fields(put, greptimedb);
 fields("get_grpc_v1") ->
     method_fields(get, greptimedb);
-fields(Type) when
-    Type == greptimedb
-->
+fields(greptimedb = Type) ->
     greptimedb_bridge_common_fields() ++
-        connector_fields(Type).
+        connector_fields(Type);
+%% Actions
+fields(action) ->
+    {greptimedb,
+        mk(
+            hoconsc:map(name, ref(?MODULE, greptimedb_action)),
+            #{desc => <<"GreptimeDB Action Config">>, required => false}
+        )};
+fields(greptimedb_action) ->
+    emqx_bridge_v2_schema:make_producer_action_schema(
+        mk(ref(?MODULE, action_parameters), #{
+            required => true, desc => ?DESC(action_parameters)
+        })
+    );
+fields(action_parameters) ->
+    [
+        {write_syntax, fun write_syntax/1},
+        emqx_bridge_greptimedb_connector:precision_field()
+    ];
+%% Connectors
+fields("config_connector") ->
+    emqx_connector_schema:common_fields() ++
+        emqx_bridge_greptimedb_connector:fields("connector") ++
+        emqx_connector_schema:resource_opts_ref(?MODULE, connector_resource_opts);
+fields(connector_resource_opts) ->
+    emqx_connector_schema:resource_opts_fields();
+fields(Field) when
+    Field == "get_connector";
+    Field == "put_connector";
+    Field == "post_connector"
+->
+    Fields =
+        emqx_bridge_greptimedb_connector:fields("connector") ++
+            emqx_connector_schema:resource_opts_ref(?MODULE, connector_resource_opts),
+    emqx_connector_schema:api_fields(Field, ?CONNECTOR_TYPE, Fields);
+%$ Bridge v2
+fields(Field) when
+    Field == "get_bridge_v2";
+    Field == "post_bridge_v2";
+    Field == "put_bridge_v2"
+->
+    emqx_bridge_v2_schema:api_fields(Field, ?ACTION_TYPE, fields(greptimedb_action)).
 
 method_fields(post, ConnectorType) ->
     greptimedb_bridge_common_fields() ++
@@ -127,173 +192,28 @@ desc(Method) when Method =:= "get"; Method =:= "put"; Method =:= "post" ->
     ["Configuration for Greptimedb using `", string:to_upper(Method), "` method."];
 desc(greptimedb) ->
     ?DESC(emqx_bridge_greptimedb_connector, "greptimedb");
+desc(greptimedb_action) ->
+    ?DESC(greptimedb_action);
+desc(action_parameters) ->
+    ?DESC(action_parameters);
+desc("config_connector") ->
+    ?DESC("desc_config");
+desc(connector_resource_opts) ->
+    ?DESC(emqx_resource_schema, "resource_opts");
 desc(_) ->
     undefined.
 
 write_syntax(type) ->
-    ?MODULE:write_syntax();
+    emqx_bridge_influxdb:write_syntax_type();
 write_syntax(required) ->
     true;
 write_syntax(validator) ->
     [?NOT_EMPTY("the value of the field 'write_syntax' cannot be empty")];
 write_syntax(converter) ->
-    fun to_influx_lines/1;
+    fun emqx_bridge_influxdb:to_influx_lines/1;
 write_syntax(desc) ->
     ?DESC("write_syntax");
 write_syntax(format) ->
     <<"sql">>;
 write_syntax(_) ->
     undefined.
-
-to_influx_lines(RawLines) ->
-    try
-        influx_lines(str(RawLines), [])
-    catch
-        _:Reason:Stacktrace ->
-            Msg = lists:flatten(
-                io_lib:format("Unable to parse Greptimedb line protocol: ~p", [RawLines])
-            ),
-            ?SLOG(error, #{msg => Msg, error_reason => Reason, stacktrace => Stacktrace}),
-            throw(Msg)
-    end.
-
--define(MEASUREMENT_ESC_CHARS, [$,, $\s]).
--define(TAG_FIELD_KEY_ESC_CHARS, [$,, $=, $\s]).
--define(FIELD_VAL_ESC_CHARS, [$", $\\]).
-% Common separator for both tags and fields
--define(SEP, $\s).
--define(MEASUREMENT_TAG_SEP, $,).
--define(KEY_SEP, $=).
--define(VAL_SEP, $,).
--define(NON_EMPTY, [_ | _]).
-
-influx_lines([] = _RawLines, Acc) ->
-    ?NON_EMPTY = lists:reverse(Acc);
-influx_lines(RawLines, Acc) ->
-    {Acc1, RawLines1} = influx_line(string:trim(RawLines, leading, "\s\n"), Acc),
-    influx_lines(RawLines1, Acc1).
-
-influx_line([], Acc) ->
-    {Acc, []};
-influx_line(Line, Acc) ->
-    {?NON_EMPTY = Measurement, Line1} = measurement(Line),
-    {Tags, Line2} = tags(Line1),
-    {?NON_EMPTY = Fields, Line3} = influx_fields(Line2),
-    {Timestamp, Line4} = timestamp(Line3),
-    {
-        [
-            #{
-                measurement => Measurement,
-                tags => Tags,
-                fields => Fields,
-                timestamp => Timestamp
-            }
-            | Acc
-        ],
-        Line4
-    }.
-
-measurement(Line) ->
-    unescape(?MEASUREMENT_ESC_CHARS, [?MEASUREMENT_TAG_SEP, ?SEP], Line, []).
-
-tags([?MEASUREMENT_TAG_SEP | Line]) ->
-    tags1(Line, []);
-tags(Line) ->
-    {[], Line}.
-
-%% Empty line is invalid as fields are required after tags,
-%% need to break recursion here and fail later on parsing fields
-tags1([] = Line, Acc) ->
-    {lists:reverse(Acc), Line};
-%% Matching non empty Acc treats lines like "m, field=field_val" invalid
-tags1([?SEP | _] = Line, ?NON_EMPTY = Acc) ->
-    {lists:reverse(Acc), Line};
-tags1(Line, Acc) ->
-    {Tag, Line1} = tag(Line),
-    tags1(Line1, [Tag | Acc]).
-
-tag(Line) ->
-    {?NON_EMPTY = Key, Line1} = key(Line),
-    {?NON_EMPTY = Val, Line2} = tag_val(Line1),
-    {{Key, Val}, Line2}.
-
-tag_val(Line) ->
-    {Val, Line1} = unescape(?TAG_FIELD_KEY_ESC_CHARS, [?VAL_SEP, ?SEP], Line, []),
-    {Val, strip_l(Line1, ?VAL_SEP)}.
-
-influx_fields([?SEP | Line]) ->
-    fields1(string:trim(Line, leading, "\s"), []).
-
-%% Timestamp is optional, so fields may be at the very end of the line
-fields1([Ch | _] = Line, Acc) when Ch =:= ?SEP; Ch =:= $\n ->
-    {lists:reverse(Acc), Line};
-fields1([] = Line, Acc) ->
-    {lists:reverse(Acc), Line};
-fields1(Line, Acc) ->
-    {Field, Line1} = field(Line),
-    fields1(Line1, [Field | Acc]).
-
-field(Line) ->
-    {?NON_EMPTY = Key, Line1} = key(Line),
-    {Val, Line2} = field_val(Line1),
-    {{Key, Val}, Line2}.
-
-field_val([$" | Line]) ->
-    {Val, [$" | Line1]} = unescape(?FIELD_VAL_ESC_CHARS, [$"], Line, []),
-    %% Quoted val can be empty
-    {Val, strip_l(Line1, ?VAL_SEP)};
-field_val(Line) ->
-    %% Unquoted value should not be un-escaped according to Greptimedb protocol,
-    %% as it can only hold float, integer, uinteger or boolean value.
-    %% However, as templates are possible, un-escaping is applied here,
-    %% which also helps to detect some invalid lines, e.g.: "m,tag=1 field= ${timestamp}"
-    {Val, Line1} = unescape(?TAG_FIELD_KEY_ESC_CHARS, [?VAL_SEP, ?SEP, $\n], Line, []),
-    {?NON_EMPTY = Val, strip_l(Line1, ?VAL_SEP)}.
-
-timestamp([?SEP | Line]) ->
-    Line1 = string:trim(Line, leading, "\s"),
-    %% Similarly to unquoted field value, un-escape a timestamp to validate and handle
-    %% potentially escaped characters in a template
-    {T, Line2} = unescape(?TAG_FIELD_KEY_ESC_CHARS, [?SEP, $\n], Line1, []),
-    {timestamp1(T), Line2};
-timestamp(Line) ->
-    {undefined, Line}.
-
-timestamp1(?NON_EMPTY = Ts) -> Ts;
-timestamp1(_Ts) -> undefined.
-
-%% Common for both tag and field keys
-key(Line) ->
-    {Key, Line1} = unescape(?TAG_FIELD_KEY_ESC_CHARS, [?KEY_SEP], Line, []),
-    {Key, strip_l(Line1, ?KEY_SEP)}.
-
-%% Only strip a character between pairs, don't strip it(and let it fail)
-%% if the char to be stripped is at the end, e.g.: m,tag=val, field=val
-strip_l([Ch, Ch1 | Str], Ch) when Ch1 =/= ?SEP ->
-    [Ch1 | Str];
-strip_l(Str, _Ch) ->
-    Str.
-
-unescape(EscapeChars, SepChars, [$\\, Char | T], Acc) ->
-    ShouldEscapeBackslash = lists:member($\\, EscapeChars),
-    Acc1 =
-        case lists:member(Char, EscapeChars) of
-            true -> [Char | Acc];
-            false when not ShouldEscapeBackslash -> [Char, $\\ | Acc]
-        end,
-    unescape(EscapeChars, SepChars, T, Acc1);
-unescape(EscapeChars, SepChars, [Char | T] = L, Acc) ->
-    IsEscapeChar = lists:member(Char, EscapeChars),
-    case lists:member(Char, SepChars) of
-        true -> {lists:reverse(Acc), L};
-        false when not IsEscapeChar -> unescape(EscapeChars, SepChars, T, [Char | Acc])
-    end;
-unescape(_EscapeChars, _SepChars, [] = L, Acc) ->
-    {lists:reverse(Acc), L}.
-
-str(A) when is_atom(A) ->
-    atom_to_list(A);
-str(B) when is_binary(B) ->
-    binary_to_list(B);
-str(S) when is_list(S) ->
-    S.

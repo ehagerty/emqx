@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("emqx/include/emqx.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
@@ -42,7 +43,9 @@ all() ->
         {group, metrics},
         {group, metrics_simple},
         {group, metrics_fail},
-        {group, metrics_fail_simple}
+        {group, metrics_fail_simple},
+        {group, tracing},
+        {group, command_line}
     ].
 
 suite() ->
@@ -74,11 +77,14 @@ groups() ->
             t_sqlselect_inject_props,
             t_sqlselect_01,
             t_sqlselect_02,
+            t_sqlselect_03,
             t_sqlselect_1,
             t_sqlselect_2,
             t_sqlselect_3,
+            t_direct_dispatch,
             t_sqlselect_message_publish_event_keep_original_props_1,
             t_sqlselect_message_publish_event_keep_original_props_2,
+            t_sqlselect_missing_template_vars_render_as_undefined,
             t_sqlparse_event_1,
             t_sqlparse_event_2,
             t_sqlparse_event_3,
@@ -90,6 +96,7 @@ groups() ->
             t_sqlparse_foreach_6,
             t_sqlparse_foreach_7,
             t_sqlparse_foreach_8,
+            t_sqlparse_foreach_9,
             t_sqlparse_case_when_1,
             t_sqlparse_case_when_2,
             t_sqlparse_case_when_3,
@@ -98,6 +105,7 @@ groups() ->
             t_sqlparse_array_index_3,
             t_sqlparse_array_index_4,
             t_sqlparse_array_index_5,
+            t_sqlparse_array_with_expressions,
             t_sqlparse_select_matadata_1,
             t_sqlparse_array_range_1,
             t_sqlparse_array_range_2,
@@ -105,14 +113,16 @@ groups() ->
             t_sqlparse_undefined_variable,
             t_sqlparse_new_map,
             t_sqlparse_invalid_json,
-            t_sqlselect_as_put
+            t_sqlselect_as_put,
+            t_sqlselect_client_attr
         ]},
         {events, [], [
             t_events,
             t_event_client_disconnected_normal,
             t_event_client_disconnected_kicked,
             t_event_client_disconnected_discarded,
-            t_event_client_disconnected_takenover
+            t_event_client_disconnected_takenover,
+            t_event_client_disconnected_takenover_2
         ]},
         {telemetry, [], [
             t_get_basic_usage_info_0,
@@ -132,11 +142,18 @@ groups() ->
         ]},
         {metrics_fail, [], [
             t_rule_metrics_sync_fail,
-            t_rule_metrics_async_fail
+            t_rule_metrics_async_fail,
+            t_failed_rule_metrics
         ]},
         {metrics_fail_simple, [], [
             t_rule_metrics_sync_fail,
             t_rule_metrics_async_fail
+        ]},
+        {tracing, [], [
+            t_trace_rule_id
+        ]},
+        {command_line, [], [
+            t_command_line_list_print_rule
         ]}
     ].
 
@@ -145,20 +162,66 @@ groups() ->
 %%------------------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    %% ensure module loaded
-    emqx_rule_funcs_demo:module_info(),
-    application:load(emqx_conf),
-    ok = emqx_common_test_helpers:start_apps(
-        [emqx_conf, emqx_rule_engine, emqx_authz, emqx_bridge],
-        fun set_special_configs/1
+    Apps = emqx_cth_suite:start(
+        lists:flatten([
+            emqx,
+            emqx_conf,
+            emqx_rule_engine,
+            emqx_auth,
+            emqx_bridge,
+            [
+                {emqx_schema_validation, #{
+                    config => #{
+                        <<"schema_validation">> => #{
+                            <<"validations">> => [
+                                #{
+                                    <<"name">> => <<"v1">>,
+                                    <<"topics">> => [<<"sv/fail">>],
+                                    <<"strategy">> => <<"all_pass">>,
+                                    <<"failure_action">> => <<"drop">>,
+                                    <<"checks">> => [
+                                        #{
+                                            <<"type">> => <<"sql">>,
+                                            <<"sql">> => <<"select 1 where false">>
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }}
+             || is_ee()
+            ],
+            [
+                {emqx_message_transformation, #{
+                    config => #{
+                        <<"message_transformation">> => #{
+                            <<"transformations">> => [
+                                #{
+                                    <<"name">> => <<"t1">>,
+                                    <<"topics">> => <<"mt/fail">>,
+                                    <<"failure_action">> => <<"drop">>,
+                                    <<"payload_decoder">> => #{<<"type">> => <<"json">>},
+                                    <<"payload_encoder">> => #{<<"type">> => <<"json">>},
+                                    <<"operations">> => []
+                                }
+                            ]
+                        }
+                    }
+                }}
+             || is_ee()
+            ]
+        ]),
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    Config.
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_conf, emqx_rule_engine]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
-set_special_configs(emqx_authz) ->
+set_special_configs(emqx_auth) ->
     {ok, _} = emqx:update_config(
         [authorization],
         #{
@@ -202,10 +265,8 @@ init_per_group(metrics_fail_simple, Config) ->
         (_) -> simple_async
     end),
     meck:expect(?BRIDGE_IMPL, on_query, 3, {error, {unrecoverable_error, mecked_failure}}),
-    meck:expect(?BRIDGE_IMPL, on_query_async, fun(_, _, {ReplyFun, Args}, _) ->
-        Result = {error, {unrecoverable_error, mecked_failure}},
-        erlang:apply(ReplyFun, Args ++ [Result]),
-        Result
+    meck:expect(?BRIDGE_IMPL, on_query_async, fun(_, _, {_ReplyFun, _Args}, _) ->
+        {error, {unrecoverable_error, mecked_failure}}
     end),
     [{mecked, [?BRIDGE_IMPL]} | Config];
 init_per_group(_Groupname, Config) ->
@@ -227,12 +288,15 @@ init_per_testcase(t_events, Config) ->
         "\"$events/client_disconnected\", "
         "\"$events/client_connack\", "
         "\"$events/client_check_authz_complete\", "
+        "\"$events/client_check_authn_complete\", "
         "\"$events/session_subscribed\", "
         "\"$events/session_unsubscribed\", "
         "\"$events/message_acked\", "
         "\"$events/message_delivered\", "
         "\"$events/message_dropped\", "
         "\"$events/delivery_dropped\", "
+        "\"$events/schema_validation_failed\", "
+        "\"$events/message_transformation_failed\", "
         "\"t1\"",
     {ok, Rule} = emqx_rule_engine:create_rule(
         #{
@@ -249,12 +313,20 @@ init_per_testcase(t_events, Config) ->
     ),
     ?assertMatch(#{id := <<"rule:t_events">>}, Rule),
     [{hook_points_rules, Rule} | Config];
+init_per_testcase(t_get_basic_usage_info_1, Config) ->
+    meck:new(emqx_bridge, [passthrough, no_link, no_history]),
+    meck:expect(emqx_bridge, lookup, fun(_Type, _Name) -> {ok, #{mocked => true}} end),
+    Config;
 init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(t_events, Config) ->
     ets:delete(events_record_tab),
     ok = delete_rule(?config(hook_points_rules, Config)),
+    emqx_common_test_helpers:call_janitor(),
+    ok;
+end_per_testcase(t_get_basic_usage_info_1, _Config) ->
+    meck:unload(),
     emqx_common_test_helpers:call_janitor(),
     ok;
 end_per_testcase(_TestCase, _Config) ->
@@ -292,6 +364,66 @@ t_kv_store(_) ->
     1 = emqx_rule_funcs:kv_store_get(<<"abc">>),
     emqx_rule_funcs:kv_store_del(<<"abc">>),
     undefined = emqx_rule_funcs:kv_store_get(<<"abc">>).
+
+t_function_clause_errors(_Config) ->
+    SQL0 = <<"select upper(xxxx) from \"t/a\"">>,
+    Payload = <<"{}">>,
+    ?assertMatch(
+        {error,
+            {select_and_transform_error,
+                {throw,
+                    #{
+                        arguments := [undefined],
+                        reason := bad_sql_function_argument,
+                        function_name := upper
+                    },
+                    _Stack}}},
+        emqx_rule_sqltester:test(
+            #{
+                sql => SQL0,
+                context => #{payload => Payload, topic => <<"t/a">>}
+            }
+        )
+    ),
+    SQL1 = <<"foreach xs as x do upper(xxxx) from \"t/a\"">>,
+    ?assertMatch(
+        {error, {
+            {doeach_error,
+                {throw,
+                    #{
+                        arguments := [undefined],
+                        reason := bad_sql_function_argument,
+                        function_name := upper
+                    },
+                    _Stack0}},
+            _Stack1
+        }},
+        emqx_rule_sqltester:test(
+            #{
+                sql => SQL1,
+                context => #{payload => Payload, xs => [1, 2, 3], topic => <<"t/a">>}
+            }
+        )
+    ),
+    SQL2 = <<"foreach upper(xxxx) as x from \"t/a\"">>,
+    ?assertMatch(
+        {error,
+            {select_and_collect_error,
+                {throw,
+                    #{
+                        arguments := [undefined],
+                        reason := bad_sql_function_argument,
+                        function_name := upper
+                    },
+                    _Stack}}},
+        emqx_rule_sqltester:test(
+            #{
+                sql => SQL2,
+                context => #{payload => Payload, topic => <<"t/a">>}
+            }
+        )
+    ),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Test cases for rule registry
@@ -517,16 +649,39 @@ t_get_rule_ids_by_action(_) ->
     ?assertEqual([], emqx_rule_engine:get_rule_ids_by_action(<<"mysql:not_exists">>)),
     ok = delete_rules_by_ids([<<"t_get_rule_ids_by_action">>]).
 
+%% Check that command line interface don't crash when listing and showing rules
+t_command_line_list_print_rule(_) ->
+    ID = <<"t_command_line">>,
+    Rule1 = #{
+        id => ID,
+        sql => <<"SELECT * FROM \"t\"">>,
+        actions => [
+            #{function => console, args => #{}},
+            #{function => republish, args => #{}},
+            <<"mqtt:my_mqtt_bridge">>,
+            <<"mysql:foo">>
+        ],
+        description => ID,
+        created_at => erlang:system_time(millisecond)
+    },
+    ok = create_rules([Rule1]),
+    ok = emqx_rule_engine_cli:cmd(["list"]),
+    ok = emqx_rule_engine_cli:cmd(["show", binary_to_list(ID)]),
+    ok = delete_rules_by_ids([ID]).
+
 t_ensure_action_removed(_) ->
     Id = <<"t_ensure_action_removed">>,
     GetSelectedData = <<"emqx_rule_sqltester:get_selected_data">>,
-    emqx:update_config(
+    {ok, _} = emqx:update_config(
         [rule_engine, rules, Id],
         #{
             <<"actions">> => [
                 #{<<"function">> => GetSelectedData},
                 #{<<"function">> => <<"console">>},
-                #{<<"function">> => <<"republish">>},
+                #{
+                    <<"function">> => <<"republish">>,
+                    <<"args">> => #{<<"topic">> => <<"some/topic">>}
+                },
                 <<"mysql:foo">>,
                 <<"mqtt:bar">>
             ],
@@ -726,6 +881,13 @@ t_events(_Config) ->
     session_subscribed(Client2),
     ct:pal("====== verify t1"),
     message_publish(Client),
+    is_ee() andalso
+        begin
+            ct:pal("====== verify $events/schema_validation_failed"),
+            schema_validation_failed(Client),
+            ct:pal("====== verify $events/message_transformation_failed"),
+            message_transformation_failed(Client)
+        end,
     ct:pal("====== verify $events/delivery_dropped"),
     delivery_dropped(Client),
     ct:pal("====== verify $events/message_delivered"),
@@ -903,6 +1065,66 @@ t_event_client_disconnected_takenover(_Config) ->
 
     delete_rule(TopicRule).
 
+t_event_client_disconnected_takenover_2(_Config) ->
+    SQL =
+        "select * "
+        "from \"$events/client_disconnected\" ",
+    RepubT = <<"repub/to/disconnected/takenover">>,
+
+    {ok, TopicRule} = emqx_rule_engine:create_rule(
+        #{
+            sql => SQL,
+            id => ?TMP_RULEID,
+            actions => [republish_action(RepubT, <<>>)]
+        }
+    ),
+
+    {ok, ClientRecv} = emqtt:start_link([
+        {clientid, <<"get_repub_client">>}, {username, <<"emqx0">>}
+    ]),
+    {ok, _} = emqtt:connect(ClientRecv),
+    {ok, _, _} = emqtt:subscribe(ClientRecv, RepubT, 0),
+    ct:sleep(200),
+
+    {ok, Client1} = emqtt:start_link([
+        {clientid, <<"emqx">>}, {username, <<"emqx">>}, {clean_start, false}
+    ]),
+    {ok, _} = emqtt:connect(Client1),
+    ok = emqtt:disconnect(Client1),
+
+    %% receive the normal disconnected event
+    receive
+        {publish, #{topic := T, payload := Payload}} ->
+            ?assertEqual(RepubT, T),
+            ?assertMatch(
+                #{<<"reason">> := <<"normal">>}, emqx_utils_json:decode(Payload, [return_maps])
+            )
+    after 1000 ->
+        ct:fail(wait_for_repub_disconnected_discarded)
+    end,
+
+    {ok, Client2} = emqtt:start_link([
+        {clientid, <<"emqx">>}, {username, <<"emqx">>}, {clean_start, false}
+    ]),
+    {ok, _} = emqtt:connect(Client2),
+
+    %% should not receive the takenoverdisconnected event
+    receive
+        {publish, #{topic := T1, payload := Payload1}} ->
+            ?assertEqual(RepubT, T1),
+            ?assertMatch(
+                #{<<"reason">> := <<"takenover">>}, emqx_utils_json:decode(Payload1, [return_maps])
+            ),
+            ct:fail(wait_for_repub_disconnected_discarded)
+    after 1000 ->
+        ok
+    end,
+
+    emqtt:stop(ClientRecv),
+    emqtt:stop(Client2),
+
+    delete_rule(TopicRule).
+
 client_connack_failed() ->
     {ok, Client} = emqtt:start_link(
         [
@@ -943,6 +1165,7 @@ client_connected(Client, Client2) ->
     {ok, _} = emqtt:connect(Client2),
     verify_event('client.connack'),
     verify_event('client.connected'),
+    verify_event('client.check_authn_complete'),
     ok.
 client_disconnected(Client, Client2) ->
     ok = emqtt:disconnect(Client, 0, #{'User-Property' => {<<"reason">>, <<"normal">>}}),
@@ -972,7 +1195,6 @@ delivery_dropped(Client) ->
     {ok, _, _} = emqtt:subscribe(Client, #{}, <<"t1">>, [{nl, true}, {qos, 1}]),
     ct:sleep(50),
     message_publish(Client),
-    ct:pal("--- current emqx hooks: ~p", [ets:tab2list(emqx_hooks)]),
     verify_event('delivery.dropped'),
     ok.
 message_dropped(Client) ->
@@ -981,6 +1203,16 @@ message_dropped(Client) ->
     ok.
 message_acked(_Client) ->
     verify_event('message.acked'),
+    ok.
+schema_validation_failed(Client) ->
+    {ok, _} = emqtt:publish(Client, <<"sv/fail">>, <<"">>, [{qos, 1}]),
+    ct:sleep(100),
+    verify_event('schema.validation_failed'),
+    ok.
+message_transformation_failed(Client) ->
+    {ok, _} = emqtt:publish(Client, <<"mt/fail">>, <<"will fail to { parse">>, [{qos, 1}]),
+    ct:sleep(100),
+    verify_event('message.transformation_failed'),
     ok.
 
 t_match_atom_and_binary(_Config) ->
@@ -1298,14 +1530,13 @@ t_sqlselect_inject_props(_Config) ->
             actions => [Repub]
         }
     ),
-    Props = user_properties(#{<<"inject_key">> => <<"inject_val">>}),
     {ok, Client} = emqtt:start_link([{username, <<"emqx">>}, {proto_ver, v5}]),
     {ok, _} = emqtt:connect(Client),
     {ok, _, _} = emqtt:subscribe(Client, <<"t2">>, 0),
     emqtt:publish(Client, <<"t1">>, #{}, <<"{\"x\":1}">>, [{qos, 0}]),
     receive
-        {publish, #{topic := T, payload := Payload, properties := Props2}} ->
-            ?assertEqual(Props, Props2),
+        {publish, #{topic := T, payload := Payload, properties := Props}} ->
+            ?assertEqual(user_properties(#{<<"inject_key">> => <<"inject_val">>}), Props),
             ?assertEqual(<<"t2">>, T),
             ?assertEqual(<<"{\"x\":1}">>, Payload)
     after 2000 ->
@@ -1406,6 +1637,260 @@ t_sqlselect_02(_Config) ->
 
     emqtt:stop(Client),
     delete_rule(TopicRule1).
+
+t_sqlselect_03(_Config) ->
+    init_events_counters(),
+    SQL = "SELECT * FROM \"t/r\" ",
+    Repub = republish_action(
+        <<"t/republish">>,
+        <<"${.}">>,
+        <<"${pub_props.'User-Property'}">>,
+        #{
+            <<"Payload-Format-Indicator">> => <<"${.payload.pfi}">>,
+            <<"Message-Expiry-Interval">> => <<"${.payload.mei}">>,
+            <<"Content-Type">> => <<"${.payload.ct}">>,
+            <<"Response-Topic">> => <<"${.payload.rt}">>,
+            <<"Correlation-Data">> => <<"${.payload.cd}">>
+        }
+    ),
+    RepubRaw = emqx_utils_maps:binary_key_map(Repub#{function => <<"republish">>}),
+    ct:pal("republish action raw:\n  ~p", [RepubRaw]),
+    RuleRaw = #{
+        <<"sql">> => SQL,
+        <<"actions">> => [RepubRaw]
+    },
+    {ok, _} = emqx_conf:update([rule_engine, rules, ?TMP_RULEID], RuleRaw, #{}),
+    on_exit(fun() -> emqx_rule_engine:delete_rule(?TMP_RULEID) end),
+    %% to check what republish is actually producing without loss of information
+    SQL1 = "select * from \"t/republish\" ",
+    RuleId0 = ?TMP_RULEID,
+    RuleId1 = <<RuleId0/binary, "2">>,
+    {ok, _} = emqx_rule_engine:create_rule(
+        #{
+            sql => SQL1,
+            id => RuleId1,
+            actions => [
+                #{
+                    function => <<"emqx_rule_engine_SUITE:action_record_triggered_events">>,
+                    args => #{}
+                }
+            ]
+        }
+    ),
+    on_exit(fun() -> emqx_rule_engine:delete_rule(RuleId1) end),
+
+    UserProps = maps:to_list(#{<<"mykey">> => <<"myval">>}),
+    Payload =
+        emqx_utils_json:encode(
+            #{
+                pfi => 1,
+                mei => 2,
+                ct => <<"3">>,
+                rt => <<"4">>,
+                cd => <<"5">>
+            }
+        ),
+    {ok, Client} = emqtt:start_link([
+        {username, <<"emqx">>},
+        {proto_ver, v5},
+        {properties, #{'Topic-Alias-Maximum' => 100}}
+    ]),
+    on_exit(fun() -> emqtt:stop(Client) end),
+    {ok, _} = emqtt:connect(Client),
+    {ok, _, _} = emqtt:subscribe(Client, <<"t/republish">>, 0),
+    PubProps = #{'User-Property' => UserProps},
+    ExpectedMQTTProps0 = #{
+        'Payload-Format-Indicator' => 1,
+        'Message-Expiry-Interval' => 2,
+        'Content-Type' => <<"3">>,
+        'Response-Topic' => <<"4">>,
+        'Correlation-Data' => <<"5">>,
+        %% currently, `Topic-Alias' is dropped `emqx_message:filter_pub_props',
+        %% so the channel controls those aliases on its own, starting from 1.
+        'Topic-Alias' => 1,
+        'User-Property' => UserProps
+    },
+    emqtt:publish(Client, <<"t/r">>, PubProps, Payload, [{qos, 0}]),
+    receive
+        {publish, #{topic := <<"t/republish">>, properties := Props1}} ->
+            ?assertEqual(ExpectedMQTTProps0, Props1),
+            ok
+    after 2000 ->
+        ct:pal("mailbox:\n  ~p", [?drainMailbox()]),
+        ct:fail("message not republished (l. ~b)", [?LINE])
+    end,
+    ExpectedMQTTProps1 = #{
+        'Payload-Format-Indicator' => 1,
+        'Message-Expiry-Interval' => 2,
+        'Content-Type' => <<"3">>,
+        'Response-Topic' => <<"4">>,
+        'Correlation-Data' => <<"5">>,
+        'User-Property' => maps:from_list(UserProps),
+        'User-Property-Pairs' => [
+            #{key => K, value => V}
+         || {K, V} <- UserProps
+        ]
+    },
+    ?assertMatch(
+        [
+            {'message.publish', #{
+                topic := <<"t/republish">>,
+                pub_props := ExpectedMQTTProps1
+            }}
+        ],
+        ets:lookup(events_record_tab, 'message.publish'),
+        #{expected_props => ExpectedMQTTProps1}
+    ),
+
+    ct:pal("testing payload that is not a json object"),
+    emqtt:publish(Client, <<"t/r">>, PubProps, <<"not-a-map">>, [{qos, 0}]),
+    ExpectedMQTTProps2 = #{
+        'Content-Type' => <<"undefined">>,
+        'Correlation-Data' => <<"undefined">>,
+        'Response-Topic' => <<"undefined">>,
+        %% currently, `Topic-Alias' is dropped `emqx_message:filter_pub_props',
+        %% so the channel controls those aliases on its own, starting from 1.
+        'Topic-Alias' => 1,
+        'User-Property' => UserProps
+    },
+    receive
+        {publish, #{topic := T1, properties := Props2}} ->
+            ?assertEqual(ExpectedMQTTProps2, Props2),
+            %% empty this time, due to topic alias set before
+            ?assertEqual(<<>>, T1),
+            ok
+    after 2000 ->
+        ct:pal("mailbox:\n  ~p", [?drainMailbox()]),
+        ct:fail("message not republished (l. ~b)", [?LINE])
+    end,
+
+    ct:pal("testing payload with some uncoercible keys"),
+    ets:delete_all_objects(events_record_tab),
+    Payload1 =
+        emqx_utils_json:encode(#{
+            pfi => <<"bad_value1">>,
+            mei => <<"bad_value2">>,
+            ct => <<"some_value3">>,
+            rt => <<"some_value4">>,
+            cd => <<"some_value5">>
+        }),
+    emqtt:publish(Client, <<"t/r">>, PubProps, Payload1, [{qos, 0}]),
+    ExpectedMQTTProps3 = #{
+        %% currently, `Topic-Alias' is dropped `emqx_message:filter_pub_props',
+        %% so the channel controls those aliases on its own, starting from 1.
+        'Topic-Alias' => 1,
+        'Content-Type' => <<"some_value3">>,
+        'Response-Topic' => <<"some_value4">>,
+        'Correlation-Data' => <<"some_value5">>,
+        'User-Property' => UserProps
+    },
+    receive
+        {publish, #{topic := T2, properties := Props3}} ->
+            ?assertEqual(ExpectedMQTTProps3, Props3),
+            %% empty this time, due to topic alias set before
+            ?assertEqual(<<>>, T2),
+            ok
+    after 2000 ->
+        ct:pal("mailbox:\n  ~p", [?drainMailbox()]),
+        ct:fail("message not republished (l. ~b)", [?LINE])
+    end,
+    ExpectedMQTTProps4 = #{
+        'Content-Type' => <<"some_value3">>,
+        'Response-Topic' => <<"some_value4">>,
+        'Correlation-Data' => <<"some_value5">>,
+        'User-Property' => maps:from_list(UserProps),
+        'User-Property-Pairs' => [
+            #{key => K, value => V}
+         || {K, V} <- UserProps
+        ]
+    },
+    ?assertMatch(
+        [
+            {'message.publish', #{
+                topic := <<"t/republish">>,
+                pub_props := ExpectedMQTTProps4
+            }}
+        ],
+        ets:lookup(events_record_tab, 'message.publish'),
+        #{expected_props => ExpectedMQTTProps4}
+    ),
+
+    ct:pal("testing a payload with a more complex placeholder"),
+    Repub1 = republish_action(
+        <<"t/republish">>,
+        <<"${.}">>,
+        <<"${pub_props.'User-Property'}">>,
+        #{
+            %% Note: `Payload-Format-Indicator' is capped at 225.
+            <<"Payload-Format-Indicator">> => <<"1${.payload.pfi}3">>,
+            <<"Message-Expiry-Interval">> => <<"9${.payload.mei}6">>
+        }
+    ),
+    RepubRaw1 = emqx_utils_maps:binary_key_map(Repub1#{function => <<"republish">>}),
+    ct:pal("republish action raw:\n  ~p", [RepubRaw1]),
+    RuleRaw1 = #{
+        <<"sql">> => SQL,
+        <<"actions">> => [RepubRaw1]
+    },
+    {ok, _} = emqx_conf:update([rule_engine, rules, ?TMP_RULEID], RuleRaw1, #{}),
+
+    Payload2 =
+        emqx_utils_json:encode(#{
+            pfi => <<"2">>,
+            mei => <<"87">>
+        }),
+    emqtt:publish(Client, <<"t/r">>, PubProps, Payload2, [{qos, 0}]),
+    ExpectedMQTTProps5 = #{
+        %% Note: PFI should be 0 or 1 according to spec, but we don't validate this when
+        %% serializing nor parsing...
+        'Payload-Format-Indicator' => 123,
+        'Message-Expiry-Interval' => 9876,
+        %% currently, `Topic-Alias' is dropped `emqx_message:filter_pub_props',
+        %% so the channel controls those aliases on its own, starting from 1.
+        'Topic-Alias' => 1,
+        'User-Property' => UserProps
+    },
+    receive
+        {publish, #{topic := T3, properties := Props4}} ->
+            ?assertEqual(ExpectedMQTTProps5, Props4),
+            %% empty this time, due to topic alias set before
+            ?assertEqual(<<>>, T3),
+            ok
+    after 2000 ->
+        ct:pal("mailbox:\n  ~p", [?drainMailbox()]),
+        ct:fail("message not republished (l. ~b)", [?LINE])
+    end,
+
+    ct:pal("testing payload-format-indicator cap"),
+    Payload3 =
+        emqx_utils_json:encode(#{
+            pfi => <<"999999">>,
+            mei => <<"87">>
+        }),
+    emqtt:publish(Client, <<"t/r">>, PubProps, Payload3, [{qos, 0}]),
+    ExpectedMQTTProps6 = #{
+        %% Note: PFI should be 0 or 1 according to spec, but we don't validate this when
+        %% serializing nor parsing...
+        %% Note: PFI is capped at 16#FF
+        'Payload-Format-Indicator' => 16#FF band 19999993,
+        'Message-Expiry-Interval' => 9876,
+        %% currently, `Topic-Alias' is dropped `emqx_message:filter_pub_props',
+        %% so the channel controls those aliases on its own, starting from 1.
+        'Topic-Alias' => 1,
+        'User-Property' => UserProps
+    },
+    receive
+        {publish, #{topic := T4, properties := Props5}} ->
+            ?assertEqual(ExpectedMQTTProps6, Props5),
+            %% empty this time, due to topic alias set before
+            ?assertEqual(<<>>, T4),
+            ok
+    after 2000 ->
+        ct:pal("mailbox:\n  ~p", [?drainMailbox()]),
+        ct:fail("message not republished (l. ~b)", [?LINE])
+    end,
+
+    ok.
 
 t_sqlselect_1(_Config) ->
     SQL =
@@ -1511,6 +1996,42 @@ t_sqlselect_3(_Config) ->
 
     emqtt:stop(Client),
     delete_rule(TopicRule).
+
+%% select from t/1, republish to t/1, no dead-loop expected
+%% i.e. payload is mutated once and only once
+t_direct_dispatch(_Config) ->
+    SQL = "SELECT * FROM \"t/1\"",
+    Repub = republish_action(
+        <<"t/1">>,
+        <<"republished: ${payload}">>,
+        <<"${user_properties}">>,
+        #{},
+        true
+    ),
+    {ok, Rule} = emqx_rule_engine:create_rule(
+        #{
+            sql => SQL,
+            id => ?TMP_RULEID,
+            actions => [Repub]
+        }
+    ),
+    {ok, Pub} = emqtt:start_link([{clientid, <<"pubclient">>}]),
+    {ok, _} = emqtt:connect(Pub),
+    {ok, Sub} = emqtt:start_link([{clientid, <<"subclient">>}]),
+    {ok, _} = emqtt:connect(Sub),
+    {ok, _, _} = emqtt:subscribe(Sub, <<"t/1">>, 0),
+    Payload = base64:encode(crypto:strong_rand_bytes(12)),
+    emqtt:publish(Pub, <<"t/1">>, Payload, 0),
+    receive
+        {publish, #{topic := T, payload := Payload1}} ->
+            ?assertEqual(<<"t/1">>, T),
+            ?assertEqual(<<"republished: ", Payload/binary>>, Payload1)
+    after 2000 ->
+        ct:fail(wait_for_t2)
+    end,
+    emqtt:stop(Pub),
+    emqtt:stop(Sub),
+    delete_rule(Rule).
 
 t_sqlselect_message_publish_event_keep_original_props_1(_Config) ->
     %% republish the client.connected msg
@@ -1627,6 +2148,32 @@ t_sqlselect_as_put(_Config) ->
         PayloadMap2
     ).
 
+t_sqlselect_missing_template_vars_render_as_undefined(_Config) ->
+    SQL = <<"SELECT * FROM \"$events/client_connected\"">>,
+    Repub = republish_action(<<"t2">>, <<"${clientid}:${missing.var}">>),
+    {ok, TopicRule} = emqx_rule_engine:create_rule(
+        #{
+            sql => SQL,
+            id => ?TMP_RULEID,
+            actions => [Repub]
+        }
+    ),
+    {ok, Client1} = emqtt:start_link([{clientid, <<"sub-01">>}]),
+    {ok, _} = emqtt:connect(Client1),
+    {ok, _, _} = emqtt:subscribe(Client1, <<"t2">>),
+    {ok, Client2} = emqtt:start_link([{clientid, <<"pub-02">>}]),
+    {ok, _} = emqtt:connect(Client2),
+    emqtt:publish(Client2, <<"foo/bar/1">>, <<>>),
+    receive
+        {publish, Msg} ->
+            ?assertMatch(#{topic := <<"t2">>, payload := <<"pub-02:undefined">>}, Msg)
+    after 2000 ->
+        ct:fail(wait_for_t2)
+    end,
+    emqtt:stop(Client2),
+    emqtt:stop(Client1),
+    delete_rule(TopicRule).
+
 t_sqlparse_event_1(_Config) ->
     Sql =
         "select topic as tp "
@@ -1636,7 +2183,10 @@ t_sqlparse_event_1(_Config) ->
         emqx_rule_sqltester:test(
             #{
                 sql => Sql,
-                context => #{topic => <<"t/tt">>}
+                context => #{
+                    topic => <<"t/tt">>,
+                    event => 'session.subscribed'
+                }
             }
         )
     ).
@@ -1650,7 +2200,10 @@ t_sqlparse_event_2(_Config) ->
         emqx_rule_sqltester:test(
             #{
                 sql => Sql,
-                context => #{clientid => <<"abc">>}
+                context => #{
+                    clientid => <<"abc">>,
+                    event => 'client.connected'
+                }
             }
         )
     ).
@@ -2131,6 +2684,53 @@ t_sqlparse_foreach_8(_Config) ->
         )
      || SqlN <- [Sql3]
     ].
+
+t_sqlparse_foreach_9(_Config) ->
+    Sql1 =
+        "foreach json_decode(payload) as p "
+        "do p.ts as ts "
+        "from \"t/#\" ",
+    Context = #{
+        payload =>
+            emqx_utils_json:encode(
+                [
+                    #{
+                        <<"ts">> => 1451649600512,
+                        <<"values">> =>
+                            #{
+                                <<"respiratoryrate">> => 20,
+                                <<"heartrate">> => 130,
+                                <<"systolic">> => 50
+                            }
+                    }
+                ]
+            ),
+        topic => <<"t/a">>
+    },
+    ?assertMatch(
+        {ok, [#{<<"ts">> := 1451649600512}]},
+        emqx_rule_sqltester:test(
+            #{
+                sql => Sql1,
+                context => Context
+            }
+        )
+    ),
+    %% doesn't work if we don't decode it first
+    Sql2 =
+        "foreach payload as p "
+        "do p.ts as ts "
+        "from \"t/#\" ",
+    ?assertMatch(
+        {ok, []},
+        emqx_rule_sqltester:test(
+            #{
+                sql => Sql2,
+                context => Context
+            }
+        )
+    ),
+    ok.
 
 t_sqlparse_case_when_1(_Config) ->
     %% case-when-else clause
@@ -2633,6 +3233,30 @@ t_sqlparse_array_index_5(_Config) ->
         )
     ).
 
+t_sqlparse_array_with_expressions(_Config) ->
+    Sql =
+        "select "
+        "  [21 + 21, abs(-abs(-2)), [1 + 1], 4] "
+        "from \"t/#\" ",
+    {ok, Res} =
+        emqx_rule_sqltester:test(
+            #{
+                sql => Sql,
+                context => #{
+                    payload => <<"">>,
+                    topic => <<"t/a">>
+                }
+            }
+        ),
+    ?assert(
+        lists:any(
+            fun({_K, V}) ->
+                V =:= [42, 2, [2], 4]
+            end,
+            maps:to_list(Res)
+        )
+    ).
+
 t_sqlparse_select_matadata_1(_Config) ->
     %% array with json string payload:
     Sql0 =
@@ -3067,7 +3691,7 @@ t_get_basic_usage_info_1(_Config) ->
             referenced_bridges =>
                 #{
                     mqtt => 1,
-                    webhook => 3
+                    http => 3
                 }
         },
         emqx_rule_engine:get_basic_usage_info()
@@ -3131,13 +3755,15 @@ t_get_rule_ids_by_action_reference_ingress_bridge(_Config) ->
     matched := 1,
     'actions.total' := 1,
     'actions.failed' := 0,
-    'actions.success' := 1
+    'actions.success' := 1,
+    'actions.discarded' := 0
 }).
 -define(FAIL_METRICS, #{
     matched := 1,
     'actions.total' := 1,
     'actions.failed' := 1,
-    'actions.success' := 0
+    'actions.success' := 0,
+    'actions.discarded' := 0
 }).
 
 t_rule_metrics_sync(_Config) ->
@@ -3200,9 +3826,212 @@ create_bridge(Type, Name, Config) ->
     {ok, _Bridge} = emqx_bridge:create(Type, Name, Config),
     emqx_bridge_resource:bridge_id(Type, Name).
 
+create_rule(Name, SQL) ->
+    Rule = emqx_rule_engine_SUITE:make_simple_rule(Name, SQL),
+    {ok, _} = emqx_rule_engine:create_rule(Rule).
+
+emqtt_client_config() ->
+    [
+        {host, "localhost"},
+        {clientid, <<"client">>},
+        {username, <<"testuser">>},
+        {password, <<"pass">>}
+    ].
+
+filesync(Name, Type) ->
+    ct:sleep(50),
+    filesync(Name, Type, 5).
+
+%% sometime the handler process is not started yet.
+filesync(Name, Type, 0) ->
+    ct:fail("Handler process not started ~p ~p", [Name, Type]);
+filesync(Name0, Type, Retry) ->
+    Name =
+        case is_binary(Name0) of
+            true -> Name0;
+            false -> list_to_binary(Name0)
+        end,
+    try
+        Handler = binary_to_atom(<<"trace_", (atom_to_binary(Type))/binary, "_", Name/binary>>),
+        ok = logger_disk_log_h:filesync(Handler)
+    catch
+        E:R ->
+            ct:pal("Filesync error:~p ~p~n", [{Name, Type, Retry}, {E, R}]),
+            ct:sleep(100),
+            filesync(Name, Type, Retry - 1)
+    end.
+
+t_trace_rule_id(_Config) ->
+    %% Start MQTT Client
+    emqx_trace_SUITE:reload(),
+    {ok, T} = emqtt:start_link(emqtt_client_config()),
+    emqtt:connect(T),
+    %% Create rules
+    create_rule(
+        <<"test_rule_id_1">>,
+        <<"select 1 as rule_number from \"rule_1_topic\"">>
+    ),
+    create_rule(
+        <<"test_rule_id_2">>,
+        <<"select 2 as rule_number from \"rule_2_topic\"">>
+    ),
+    %% Start tracing
+    ok = emqx_trace_handler:install(
+        "CLI-RULE-1", ruleid, <<"test_rule_id_1">>, all, "tmp/rule_trace_1.log"
+    ),
+    ok = emqx_trace_handler:install(
+        "CLI-RULE-2", ruleid, <<"test_rule_id_2">>, all, "tmp/rule_trace_2.log"
+    ),
+    emqx_trace:check(),
+    ok = filesync("CLI-RULE-1", ruleid),
+    ok = filesync("CLI-RULE-2", ruleid),
+
+    %% Verify the tracing file exits
+    ?assert(filelib:is_regular("tmp/rule_trace_1.log")),
+    ?assert(filelib:is_regular("tmp/rule_trace_2.log")),
+
+    %% Get current traces
+    ?assertMatch(
+        [
+            #{
+                type := ruleid,
+                filter := <<"test_rule_id_1">>,
+                level := debug,
+                dst := "tmp/rule_trace_1.log",
+                name := <<"CLI-RULE-1">>
+            },
+            #{
+                type := ruleid,
+                filter := <<"test_rule_id_2">>,
+                name := <<"CLI-RULE-2">>,
+                level := debug,
+                dst := "tmp/rule_trace_2.log"
+            }
+        ],
+        emqx_trace_handler:running()
+    ),
+
+    %% Trigger rule
+    emqtt:publish(T, <<"rule_1_topic">>, <<"my_traced_message">>),
+    ?retry(
+        100,
+        5,
+        begin
+            ok = filesync("CLI-RULE-1", ruleid),
+            {ok, Bin} = file:read_file("tmp/rule_trace_1.log"),
+            ?assertNotEqual(nomatch, binary:match(Bin, [<<"my_traced_message">>]))
+        end
+    ),
+    ok = filesync("CLI-RULE-2", ruleid),
+    ?assert(filelib:file_size("tmp/rule_trace_2.log") =:= 0),
+
+    %% Stop tracing
+    ok = emqx_trace_handler:uninstall(ruleid, <<"CLI-RULE-1">>),
+    ok = emqx_trace_handler:uninstall(ruleid, <<"CLI-RULE-2">>),
+    ?assertEqual([], emqx_trace_handler:running()),
+    emqtt:disconnect(T).
+
+t_sqlselect_client_attr(_) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    {ok, Compiled} = emqx_variform:compile("user_property.group"),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], [
+        #{
+            expression => Compiled,
+            set_as_attr => <<"group">>
+        },
+        #{
+            expression => Compiled,
+            set_as_attr => <<"group2">>
+        }
+    ]),
+
+    SQL =
+        "SELECT client_attrs as payload FROM \"t/1\" ",
+    Repub = republish_action(<<"t/2">>),
+    {ok, _TopicRule} = emqx_rule_engine:create_rule(
+        #{
+            sql => SQL,
+            id => ?TMP_RULEID,
+            actions => [Repub]
+        }
+    ),
+
+    {ok, Client} = emqtt:start_link([
+        {clientid, ClientId},
+        {proto_ver, v5},
+        {properties, #{'User-Property' => [{<<"group">>, <<"g1">>}]}}
+    ]),
+    {ok, _} = emqtt:connect(Client),
+
+    {ok, _, _} = emqtt:subscribe(Client, <<"t/2">>, 0),
+    ct:sleep(100),
+    emqtt:publish(Client, <<"t/1">>, <<"Hello">>),
+
+    receive
+        {publish, #{topic := Topic, payload := Payload}} ->
+            ?assertEqual(<<"t/2">>, Topic),
+            ?assertMatch(
+                #{<<"group">> := <<"g1">>, <<"group2">> := <<"g1">>},
+                emqx_utils_json:decode(Payload)
+            )
+    after 1000 ->
+        ct:fail(wait_for_t_2)
+    end,
+
+    emqtt:disconnect(Client),
+    emqx_rule_engine:delete_rule(?TMP_RULEID),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], []).
+
+%% Checks that we bump both `failed' and one of its sub-counters when failures occur while
+%% evaluating rule SQL.
+t_failed_rule_metrics(_Config) ->
+    {ok, C} = emqtt:start_link(emqtt_client_config()),
+    emqtt:connect(C),
+    RuleId = atom_to_binary(?FUNCTION_NAME),
+    %% Never matches
+    create_rule(
+        RuleId,
+        <<"select 1 from \"t\" where false">>
+    ),
+    {ok, _} = emqtt:publish(C, <<"t">>, <<"hi">>, [{qos, 2}]),
+    ?assertMatch(
+        #{
+            'matched' := 1,
+            'failed' := 1,
+            'failed.no_result' := 1,
+            'failed.exception' := 0
+        },
+        get_counters(RuleId)
+    ),
+    %% Exception in select clause
+    delete_rule(RuleId),
+    create_rule(
+        RuleId,
+        <<"select map_get(1, 1) from \"t\"">>
+    ),
+    {ok, _} = emqtt:publish(C, <<"t">>, <<"hi">>, [{qos, 2}]),
+    ?assertMatch(
+        #{
+            'matched' := 1,
+            'failed' := 1,
+            'failed.no_result' := 0,
+            'failed.exception' := 1
+        },
+        get_counters(RuleId)
+    ),
+    delete_rule(RuleId),
+    emqtt:stop(C),
+    ok.
+
 %%------------------------------------------------------------------------------
 %% Internal helpers
 %%------------------------------------------------------------------------------
+
+is_ee() ->
+    emqx_release:edition() == ee.
+
+get_counters(RuleId) ->
+    emqx_metrics_worker:get_counters(rule_metrics, RuleId).
 
 republish_action(Topic) ->
     republish_action(Topic, <<"${payload}">>).
@@ -3211,6 +4040,12 @@ republish_action(Topic, Payload) ->
     republish_action(Topic, Payload, <<"${user_properties}">>).
 
 republish_action(Topic, Payload, UserProperties) ->
+    republish_action(Topic, Payload, UserProperties, _MQTTProperties = #{}).
+
+republish_action(Topic, Payload, UserProperties, MQTTProperties) ->
+    republish_action(Topic, Payload, UserProperties, MQTTProperties, false).
+
+republish_action(Topic, Payload, UserProperties, MQTTProperties, DirectDispatch) ->
     #{
         function => republish,
         args => #{
@@ -3218,7 +4053,9 @@ republish_action(Topic, Payload, UserProperties) ->
             topic => Topic,
             qos => 0,
             retain => false,
-            user_properties => UserProperties
+            mqtt_properties => MQTTProperties,
+            user_properties => UserProperties,
+            direct_dispatch => DirectDispatch
         }
     }.
 
@@ -3286,12 +4123,14 @@ verify_event_fields('message.publish', Fields) ->
         username := Username,
         payload := Payload,
         peerhost := PeerHost,
+        peername := PeerName,
         topic := Topic,
         qos := QoS,
         flags := Flags,
         pub_props := Properties,
         timestamp := Timestamp,
-        publish_received_at := EventAt
+        publish_received_at := EventAt,
+        client_attrs := ClientAttrs
     } = Fields,
     Now = erlang:system_time(millisecond),
     TimestampElapse = Now - Timestamp,
@@ -3300,6 +4139,7 @@ verify_event_fields('message.publish', Fields) ->
     ?assertEqual(<<"c_event">>, ClientId),
     ?assertEqual(<<"u_event">>, Username),
     ?assertEqual(<<"{\"id\": 1, \"name\": \"ha\"}">>, Payload),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3307,7 +4147,8 @@ verify_event_fields('message.publish', Fields) ->
     ?assertMatch(#{'Message-Expiry-Interval' := 60}, Properties),
     ?assert(0 =< TimestampElapse andalso TimestampElapse =< 60 * 1000),
     ?assert(0 =< RcvdAtElapse andalso RcvdAtElapse =< 60 * 1000),
-    ?assert(EventAt =< Timestamp);
+    ?assert(EventAt =< Timestamp),
+    ?assert(is_map(ClientAttrs));
 verify_event_fields('client.connected', Fields) ->
     #{
         clientid := ClientId,
@@ -3323,7 +4164,8 @@ verify_event_fields('client.connected', Fields) ->
         is_bridge := IsBridge,
         conn_props := Properties,
         timestamp := Timestamp,
-        connected_at := EventAt
+        connected_at := EventAt,
+        client_attrs := ClientAttrs
     } = Fields,
     Now = erlang:system_time(millisecond),
     TimestampElapse = Now - Timestamp,
@@ -3342,7 +4184,8 @@ verify_event_fields('client.connected', Fields) ->
     ?assertMatch(#{'Session-Expiry-Interval' := 60}, Properties),
     ?assert(0 =< TimestampElapse andalso TimestampElapse =< 60 * 1000),
     ?assert(0 =< RcvdAtElapse andalso RcvdAtElapse =< 60 * 1000),
-    ?assert(EventAt =< Timestamp);
+    ?assert(EventAt =< Timestamp),
+    ?assert(is_map(ClientAttrs));
 verify_event_fields('client.disconnected', Fields) ->
     #{
         reason := Reason,
@@ -3352,7 +4195,8 @@ verify_event_fields('client.disconnected', Fields) ->
         sockname := SockName,
         disconn_props := Properties,
         timestamp := Timestamp,
-        disconnected_at := EventAt
+        disconnected_at := EventAt,
+        client_attrs := ClientAttrs
     } = Fields,
     Now = erlang:system_time(millisecond),
     TimestampElapse = Now - Timestamp,
@@ -3365,7 +4209,8 @@ verify_event_fields('client.disconnected', Fields) ->
     ?assertMatch(#{'User-Property' := #{<<"reason">> := <<"normal">>}}, Properties),
     ?assert(0 =< TimestampElapse andalso TimestampElapse =< 60 * 1000),
     ?assert(0 =< RcvdAtElapse andalso RcvdAtElapse =< 60 * 1000),
-    ?assert(EventAt =< Timestamp);
+    ?assert(EventAt =< Timestamp),
+    ?assert(is_map(ClientAttrs));
 verify_event_fields(SubUnsub, Fields) when
     SubUnsub == 'session.subscribed';
     SubUnsub == 'session.unsubscribed'
@@ -3374,15 +4219,18 @@ verify_event_fields(SubUnsub, Fields) when
         clientid := ClientId,
         username := Username,
         peerhost := PeerHost,
+        peername := PeerName,
         topic := Topic,
         qos := QoS,
-        timestamp := Timestamp
+        timestamp := Timestamp,
+        client_attrs := ClientAttrs
     } = Fields,
     Now = erlang:system_time(millisecond),
     TimestampElapse = Now - Timestamp,
     ?assert(is_atom(reason)),
     ?assertEqual(<<"c_event2">>, ClientId),
     ?assertEqual(<<"u_event2">>, Username),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3395,7 +4243,8 @@ verify_event_fields(SubUnsub, Fields) when
         #{'User-Property' := #{<<"topic_name">> := <<"t1">>}},
         maps:get(PropKey, Fields)
     ),
-    ?assert(0 =< TimestampElapse andalso TimestampElapse =< 60 * 1000);
+    ?assert(0 =< TimestampElapse andalso TimestampElapse =< 60 * 1000),
+    ?assert(is_map(ClientAttrs));
 verify_event_fields('delivery.dropped', Fields) ->
     #{
         event := 'delivery.dropped',
@@ -3409,6 +4258,7 @@ verify_event_fields('delivery.dropped', Fields) ->
         node := Node,
         payload := Payload,
         peerhost := PeerHost,
+        peername := PeerName,
         pub_props := Properties,
         publish_received_at := EventAt,
         qos := QoS,
@@ -3428,6 +4278,7 @@ verify_event_fields('delivery.dropped', Fields) ->
     ?assertEqual(<<"c_event">>, FromClientId),
     ?assertEqual(<<"u_event">>, FromUsername),
     ?assertEqual(<<"{\"id\": 1, \"name\": \"ha\"}">>, Payload),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3444,6 +4295,7 @@ verify_event_fields('message.dropped', Fields) ->
         username := Username,
         payload := Payload,
         peerhost := PeerHost,
+        peername := PeerName,
         topic := Topic,
         qos := QoS,
         flags := Flags,
@@ -3459,6 +4311,7 @@ verify_event_fields('message.dropped', Fields) ->
     ?assertEqual(<<"c_event">>, ClientId),
     ?assertEqual(<<"u_event">>, Username),
     ?assertEqual(<<"{\"id\": 1, \"name\": \"ha\"}">>, Payload),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3476,6 +4329,7 @@ verify_event_fields('message.delivered', Fields) ->
         from_username := FromUsername,
         payload := Payload,
         peerhost := PeerHost,
+        peername := PeerName,
         topic := Topic,
         qos := QoS,
         flags := Flags,
@@ -3492,6 +4346,7 @@ verify_event_fields('message.delivered', Fields) ->
     ?assertEqual(<<"c_event">>, FromClientId),
     ?assertEqual(<<"u_event">>, FromUsername),
     ?assertEqual(<<"{\"id\": 1, \"name\": \"ha\"}">>, Payload),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3509,6 +4364,7 @@ verify_event_fields('message.acked', Fields) ->
         from_username := FromUsername,
         payload := Payload,
         peerhost := PeerHost,
+        peername := PeerName,
         topic := Topic,
         qos := QoS,
         flags := Flags,
@@ -3526,6 +4382,7 @@ verify_event_fields('message.acked', Fields) ->
     ?assertEqual(<<"c_event">>, FromClientId),
     ?assertEqual(<<"u_event">>, FromUsername),
     ?assertEqual(<<"{\"id\": 1, \"name\": \"ha\"}">>, Payload),
+    verify_peername(PeerName),
     verify_ipaddr(PeerHost),
     ?assertEqual(<<"t1">>, Topic),
     ?assertEqual(1, QoS),
@@ -3569,13 +4426,16 @@ verify_event_fields('client.check_authz_complete', Fields) ->
         clientid := ClientId,
         action := Action,
         result := Result,
+        peername := PeerName,
         topic := Topic,
         authz_source := AuthzSource,
-        username := Username
+        username := Username,
+        client_attrs := ClientAttrs
     } = Fields,
     ?assertEqual(<<"t1">>, Topic),
     ?assert(lists:member(Action, [subscribe, publish])),
     ?assert(lists:member(Result, [allow, deny])),
+    verify_peername(PeerName),
     ?assert(
         lists:member(AuthzSource, [
             cache,
@@ -3590,7 +4450,59 @@ verify_event_fields('client.check_authz_complete', Fields) ->
         ])
     ),
     ?assert(lists:member(ClientId, [<<"c_event">>, <<"c_event2">>])),
-    ?assert(lists:member(Username, [<<"u_event">>, <<"u_event2">>])).
+    ?assert(lists:member(Username, [<<"u_event">>, <<"u_event2">>])),
+    ?assert(is_map(ClientAttrs));
+verify_event_fields('client.check_authn_complete', Fields) ->
+    #{
+        clientid := ClientId,
+        peername := PeerName,
+        username := Username,
+        is_anonymous := IsAnonymous,
+        is_superuser := IsSuperuser,
+        client_attrs := ClientAttrs
+    } = Fields,
+    verify_peername(PeerName),
+    ?assert(lists:member(ClientId, [<<"c_event">>, <<"c_event2">>])),
+    ?assert(lists:member(Username, [<<"u_event">>, <<"u_event2">>])),
+    ?assert(erlang:is_boolean(IsAnonymous)),
+    ?assert(erlang:is_boolean(IsSuperuser)),
+    ?assert(is_map(ClientAttrs));
+verify_event_fields('schema.validation_failed', Fields) ->
+    #{
+        validation := ValidationName,
+        clientid := ClientId,
+        username := Username,
+        payload := _Payload,
+        peername := PeerName,
+        qos := _QoS,
+        topic := _Topic,
+        flags := _Flags,
+        pub_props := _PubProps,
+        publish_received_at := _PublishReceivedAt
+    } = Fields,
+    ?assertEqual(<<"v1">>, ValidationName),
+    verify_peername(PeerName),
+    ?assert(lists:member(ClientId, [<<"c_event">>, <<"c_event2">>])),
+    ?assert(lists:member(Username, [<<"u_event">>, <<"u_event2">>])),
+    ok;
+verify_event_fields('message.transformation_failed', Fields) ->
+    #{
+        transformation := TransformationName,
+        clientid := ClientId,
+        username := Username,
+        payload := _Payload,
+        peername := PeerName,
+        qos := _QoS,
+        topic := _Topic,
+        flags := _Flags,
+        pub_props := _PubProps,
+        publish_received_at := _PublishReceivedAt
+    } = Fields,
+    ?assertEqual(<<"t1">>, TransformationName),
+    verify_peername(PeerName),
+    ?assert(lists:member(ClientId, [<<"c_event">>, <<"c_event2">>])),
+    ?assert(lists:member(Username, [<<"u_event">>, <<"u_event2">>])),
+    ok.
 
 verify_peername(PeerName) ->
     case string:split(PeerName, ":") of

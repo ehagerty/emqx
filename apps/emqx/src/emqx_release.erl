@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,13 +24,29 @@
     version/0,
     version_with_prefix/0,
     vsn_compare/1,
-    vsn_compare/2
+    vsn_compare/2,
+    get_flavor/0,
+    on_load/0
 ]).
+
+-ifdef(TEST).
+-export([set_flavor/1]).
+-endif.
+
+-on_load(on_load/0).
 
 -include("emqx_release.hrl").
 
+-ifndef(EMQX_RELEASE_EDITION).
+-define(EMQX_RELEASE_EDITION, ce).
+-endif.
+
 -define(EMQX_DESCS, #{
-    ee => "EMQX Enterprise",
+    ee =>
+        case get_flavor() of
+            official -> "EMQX Enterprise";
+            Flavor -> io_lib:format("EMQX Enterprise(~s)", [Flavor])
+        end,
     ce => "EMQX"
 }).
 
@@ -49,7 +65,13 @@
     ce => "v"
 }).
 
+%% @hidden Initialize edition. Almost static. use persistent_term to trick compiler.
+-spec on_load() -> ok.
+on_load() ->
+    persistent_term:put('EMQX_RELEASE_EDITION', ?EMQX_RELEASE_EDITION).
+
 %% @doc Return EMQX description.
+-dialyzer({[no_match], [description/0]}).
 description() ->
     maps:get(edition(), ?EMQX_DESCS).
 
@@ -57,11 +79,8 @@ description() ->
 %% Read info from persistent_term at runtime.
 %% Or meck this function to run tests for another edition.
 -spec edition() -> ce | ee.
--ifdef(EMQX_RELEASE_EDITION).
-edition() -> ?EMQX_RELEASE_EDITION.
--else.
-edition() -> ce.
--endif.
+edition() ->
+    persistent_term:get('EMQX_RELEASE_EDITION').
 
 %% @doc Return EMQX version prefix string.
 edition_vsn_prefix() ->
@@ -146,3 +165,22 @@ parse_vsn(Vsn) ->
         _:_ ->
             erlang:error({invalid_version_string, Vsn})
     end.
+
+-spec get_flavor() -> atom().
+-ifdef(TEST).
+set_flavor(Flavor) when is_atom(Flavor) ->
+    persistent_term:put({?MODULE, 'EMQX_FLAVOR'}, Flavor).
+
+get_flavor() ->
+    persistent_term:get({?MODULE, 'EMQX_FLAVOR'}, official).
+-else.
+
+-ifndef(EMQX_FLAVOR).
+get_flavor() ->
+    official.
+-else.
+get_flavor() ->
+    ?EMQX_FLAVOR.
+-endif.
+
+-endif.

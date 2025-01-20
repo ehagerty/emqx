@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,17 +32,21 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:load_config(emqx_modules_schema, ?BASE_CONF),
-    ok = emqx_mgmt_api_test_util:init_suite(
-        [emqx_conf, emqx_modules]
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            {emqx_modules, #{config => ?BASE_CONF}},
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    emqx_delayed:load(),
-    Config.
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    ok = emqx_delayed:unload(),
-    emqx_mgmt_api_test_util:end_suite([emqx_conf, emqx_modules]),
-    Config.
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
     {ok, _} = emqx_cluster_rpc:start_link(),
@@ -189,6 +193,49 @@ t_messages(_) ->
 
     ok = emqtt:disconnect(C1).
 
+t_delete_messages_via_topic(_) ->
+    clear_all_record(),
+    emqx_delayed:load(),
+
+    OriginTopic = <<"t/a">>,
+    Topic = <<"$delayed/123/", OriginTopic/binary>>,
+
+    publish_a_delayed_message(Topic),
+    publish_a_delayed_message(Topic),
+
+    %% assert: delayed messages are saved
+    ?assertMatch([_, _], get_messages(2)),
+
+    %% delete these messages via topic
+    TopicInUrl = uri_string:quote(OriginTopic),
+    {ok, 204, _} = request(
+        delete,
+        uri(["mqtt", "delayed", "messages", TopicInUrl])
+    ),
+
+    %% assert: messages are deleted
+    ?assertEqual([], get_messages(0)),
+
+    %% assert: return 400 if the topic parameter is invalid
+    TopicFilter = uri_string:quote(<<"t/#">>),
+    ?assertMatch(
+        {ok, 400, _},
+        request(
+            delete,
+            uri(["mqtt", "delayed", "messages", TopicFilter])
+        )
+    ),
+
+    %% assert: return 404 if no messages found for the topic
+    ?assertMatch(
+        {ok, 404, _},
+        request(
+            delete,
+            uri(["mqtt", "delayed", "messages", TopicInUrl])
+        )
+    ),
+    ok.
+
 t_large_payload(_) ->
     clear_all_record(),
     emqx_delayed:load(),
@@ -246,3 +293,14 @@ get_messages(Len) ->
         )
     ),
     Msgs.
+
+publish_a_delayed_message(Topic) ->
+    {ok, C1} = emqtt:start_link([{clean_start, true}]),
+    {ok, _} = emqtt:connect(C1),
+    emqtt:publish(
+        C1,
+        Topic,
+        <<"This is a delayed messages">>,
+        [{qos, 1}]
+    ),
+    ok = emqtt:disconnect(C1).

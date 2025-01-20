@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_out/3,
     handle_deliver/2,
     handle_timeout/3,
@@ -71,7 +72,7 @@
     %% Connection State
     conn_state :: conn_state(),
     %% Inflight register message queue
-    register_inflight :: maybe(term()),
+    register_inflight :: option(term()),
     %% Topics list for awaiting to register to client
     register_awaiting_queue :: list(),
     %% Duration for asleep
@@ -104,15 +105,6 @@
 
 -type replies() :: reply() | [reply()].
 
--define(TIMER_TABLE, #{
-    alive_timer => keepalive,
-    retry_timer => retry_delivery,
-    await_timer => expire_awaiting_rel,
-    expire_timer => expire_session,
-    asleep_timer => expire_asleep,
-    register_timer => retry_register
-}).
-
 -define(DEFAULT_OVERRIDE, #{
     clientid => <<"${ConnInfo.clientid}">>
     %, username => <<"${ConnInfo.clientid}">>
@@ -132,6 +124,8 @@
 %% 2h
 -define(DEFAULT_SESSION_EXPIRY, 7200000).
 
+-define(RAND_CLIENTID_BYTES, 16).
+
 %%--------------------------------------------------------------------
 %% Init the channel
 %%--------------------------------------------------------------------
@@ -139,7 +133,7 @@
 %% @doc Init protocol
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     Option
@@ -161,6 +155,7 @@ init(
             listener => ListenerId,
             protocol => 'mqtt-sn',
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -315,7 +310,7 @@ maybe_assign_clientid(_Packet, ClientInfo = #{clientid := ClientId}) when
     ClientId == undefined;
     ClientId == <<>>
 ->
-    {ok, ClientInfo#{clientid => emqx_guid:to_base62(emqx_guid:gen())}};
+    {ok, ClientInfo#{clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYTES)}};
 maybe_assign_clientid(_Packet, ClientInfo) ->
     {ok, ClientInfo}.
 
@@ -373,19 +368,28 @@ ensure_connected(
 ) ->
     NConnInfo = ConnInfo#{connected_at => erlang:system_time(millisecond)},
     ok = run_hooks(Ctx, 'client.connected', [ClientInfo, NConnInfo]),
-    Channel#channel{
+    schedule_connection_expire(Channel#channel{
         conninfo = NConnInfo,
         conn_state = connected
-    }.
+    }).
+
+schedule_connection_expire(Channel = #channel{ctx = Ctx, clientinfo = ClientInfo}) ->
+    case emqx_gateway_ctx:connection_expire_interval(Ctx, ClientInfo) of
+        undefined ->
+            Channel;
+        Interval ->
+            ensure_timer(connection_expire, Interval, Channel)
+    end.
 
 process_connect(
     Channel = #channel{
         ctx = Ctx,
         conninfo = ConnInfo = #{clean_start := CleanStart},
-        clientinfo = ClientInfo
+        clientinfo = ClientInfo,
+        will_msg = MaybeWillMsg
     }
 ) ->
-    SessFun = fun(ClientInfoT, _) -> emqx_mqttsn_session:init(ClientInfoT) end,
+    SessFun = fun(ClientInfoT, _) -> emqx_mqttsn_session:init(ClientInfoT, MaybeWillMsg) end,
     case
         emqx_gateway_ctx:open_session(
             Ctx,
@@ -430,14 +434,14 @@ ensure_keepalive(Channel = #channel{conninfo = ConnInfo}) ->
 ensure_keepalive_timer(0, Channel) ->
     Channel;
 ensure_keepalive_timer(Interval, Channel) ->
-    Keepalive = emqx_keepalive:init(round(timer:seconds(Interval))),
-    ensure_timer(alive_timer, Channel#channel{keepalive = Keepalive}).
+    Keepalive = emqx_keepalive:init(Interval),
+    ensure_timer(keepalive, Channel#channel{keepalive = Keepalive}).
 
 %%--------------------------------------------------------------------
 %% Handle incoming packet
 %%--------------------------------------------------------------------
 
--spec handle_in(emqx_types:packet() | {frame_error, any()}, channel()) ->
+-spec handle_in(mqtt_sn_message(), channel()) ->
     {ok, channel()}
     | {ok, replies(), channel()}
     | {shutdown, Reason :: term(), channel()}
@@ -452,6 +456,12 @@ handle_in(
 handle_in(?SN_ADVERTISE_MSG(_GwId, _Radius), Channel) ->
     % ignore
     shutdown(normal, Channel);
+%% Ack DISCONNECT even if it is not connected
+handle_in(
+    ?SN_DISCONNECT_MSG(_Duration),
+    Channel = #channel{conn_state = idle}
+) ->
+    handle_out(disconnect, normal, Channel);
 handle_in(
     Publish =
         ?SN_PUBLISH_MSG(
@@ -669,7 +679,7 @@ handle_in(
         topic_name => TopicName
     }),
     NChannel = cancel_timer(
-        register_timer,
+        retry_register,
         Channel#channel{register_inflight = undefined}
     ),
     send_next_register_or_replay_publish(TopicName, NChannel);
@@ -692,7 +702,7 @@ handle_in(
                 topic_name => TopicName
             }),
             NChannel = cancel_timer(
-                register_timer,
+                retry_register,
                 Channel#channel{register_inflight = undefined}
             ),
             send_next_register_or_replay_publish(TopicName, NChannel)
@@ -766,6 +776,8 @@ handle_in(
                         Publishes,
                         Channel#channel{session = NSession}
                     );
+                {error, ?RC_PROTOCOL_ERROR} ->
+                    handle_out(disconnect, ?RC_PROTOCOL_ERROR, Channel);
                 {error, ?RC_PACKET_IDENTIFIER_IN_USE} ->
                     ?SLOG(warning, #{
                         msg => "commit_puback_failed",
@@ -1008,15 +1020,9 @@ handle_in(
 ) ->
     AckPkt = ?SN_WILLMSGRESP_MSG(?SN_RC_ACCEPTED),
     NWillMsg = update_will_msg(WillMsg, Payload),
-    {ok, {outgoing, AckPkt}, Channel#channel{will_msg = NWillMsg}};
-handle_in(
-    {frame_error, Reason},
-    Channel = #channel{conn_state = _ConnState}
-) ->
-    ?SLOG(error, #{
-        msg => "unexpected_frame_error",
-        reason => Reason
-    }),
+    {ok, {outgoing, AckPkt}, Channel#channel{will_msg = NWillMsg}}.
+
+handle_frame_error(Reason, Channel) ->
     shutdown(Reason, Channel).
 
 after_message_acked(ClientInfo, Msg, #channel{ctx = Ctx}) ->
@@ -1165,7 +1171,7 @@ do_publish(
     case emqx_mqttsn_session:publish(ClientInfo, MsgId, Msg, Session) of
         {ok, _PubRes, NSession} ->
             NChannel1 = ensure_timer(
-                await_timer,
+                expire_awaiting_rel,
                 Channel#channel{session = NSession}
             ),
             handle_out(pubrec, MsgId, NChannel1);
@@ -1178,10 +1184,6 @@ do_publish(
                 Channel
             );
         {error, ?RC_RECEIVE_MAXIMUM_EXCEEDED} ->
-            ?SLOG(warning, #{
-                msg => "dropped_the_qos2_packet_due_to_awaiting_rel_full",
-                msg_id => MsgId
-            }),
             ok = metrics_inc(Ctx, 'packets.publish.dropped'),
             handle_out(puback, {TopicId, MsgId, ?SN_RC_CONGESTION}, Channel)
     end.
@@ -1439,18 +1441,11 @@ awake(
         clientid => ClientId,
         previous_state => ConnState
     }),
-    {ok, Publishes, Session1} = emqx_mqttsn_session:replay(ClientInfo, Session),
-    {NPublishes, NSession} =
-        case emqx_mqttsn_session:deliver(ClientInfo, [], Session1) of
-            {ok, Session2} ->
-                {Publishes, Session2};
-            {ok, More, Session2} ->
-                {lists:append(Publishes, More), Session2}
-        end,
-    Channel1 = cancel_timer(asleep_timer, Channel),
+    {ok, Publishes, NSession} = emqx_mqttsn_session:replay(ClientInfo, Session),
+    Channel1 = cancel_timer(expire_asleep, Channel),
     {Replies0, NChannel0} = outgoing_deliver_and_register(
         do_deliver(
-            NPublishes,
+            Publishes,
             Channel1#channel{
                 conn_state = awake, session = NSession
             }
@@ -1499,7 +1494,7 @@ asleep(Duration, Channel = #channel{conn_state = asleep}) ->
         msg => "update_asleep_timer",
         new_duration => Duration
     }),
-    ensure_asleep_timer(Duration, cancel_timer(asleep_timer, Channel));
+    ensure_asleep_timer(Duration, cancel_timer(expire_asleep, Channel));
 asleep(Duration, Channel = #channel{conn_state = connected}) ->
     ?SLOG(info, #{
         msg => "goto_asleep_state",
@@ -1907,7 +1902,7 @@ maybe_shutdown(Reason, Channel = #channel{conninfo = ConnInfo}) ->
         ?UINT_MAX ->
             {ok, Channel};
         I when I > 0 ->
-            {ok, ensure_timer(expire_timer, I, Channel)};
+            {ok, ensure_timer(expire_session, I, Channel)};
         _ ->
             shutdown(Reason, Channel)
     end.
@@ -2007,7 +2002,7 @@ handle_deliver(
             handle_out(
                 publish,
                 Publishes,
-                ensure_timer(retry_timer, NChannel)
+                ensure_timer(retry_delivery, NChannel)
             );
         {ok, NSession} ->
             {ok, Channel#channel{session = NSession}}
@@ -2068,7 +2063,7 @@ handle_timeout(
     case emqx_keepalive:check(StatVal, Keepalive) of
         {ok, NKeepalive} ->
             NChannel = Channel#channel{keepalive = NKeepalive},
-            {ok, reset_timer(alive_timer, NChannel)};
+            {ok, reset_timer(keepalive, NChannel)};
         {error, timeout} ->
             handle_out(disconnect, ?SN_RC2_KEEPALIVE_TIMEOUT, Channel)
     end;
@@ -2080,23 +2075,10 @@ handle_timeout(
     {ok, Channel};
 handle_timeout(
     _TRef,
-    retry_delivery,
+    retry_delivery = TimerName,
     Channel = #channel{conn_state = asleep}
 ) ->
-    {ok, reset_timer(retry_timer, Channel)};
-handle_timeout(
-    _TRef,
-    retry_delivery,
-    Channel = #channel{session = Session, clientinfo = ClientInfo}
-) ->
-    case emqx_mqttsn_session:retry(ClientInfo, Session) of
-        {ok, NSession} ->
-            {ok, clean_timer(retry_timer, Channel#channel{session = NSession})};
-        {ok, Publishes, Timeout, NSession} ->
-            NChannel = Channel#channel{session = NSession},
-            %% XXX: These replay messages should awaiting register acked?
-            handle_out(publish, Publishes, reset_timer(retry_timer, Timeout, NChannel))
-    end;
+    {ok, reset_timer(TimerName, Channel)};
 handle_timeout(
     _TRef,
     expire_awaiting_rel,
@@ -2105,20 +2087,23 @@ handle_timeout(
     {ok, Channel};
 handle_timeout(
     _TRef,
-    expire_awaiting_rel,
+    expire_awaiting_rel = TimerName,
     Channel = #channel{conn_state = asleep}
 ) ->
-    {ok, reset_timer(await_timer, Channel)};
+    {ok, reset_timer(TimerName, Channel)};
 handle_timeout(
     _TRef,
-    expire_awaiting_rel,
+    TimerName,
     Channel = #channel{session = Session, clientinfo = ClientInfo}
-) ->
-    case emqx_mqttsn_session:expire(ClientInfo, awaiting_rel, Session) of
-        {ok, NSession} ->
-            {ok, clean_timer(await_timer, Channel#channel{session = NSession})};
-        {ok, Timeout, NSession} ->
-            {ok, reset_timer(await_timer, Timeout, Channel#channel{session = NSession})}
+) when TimerName == retry_delivery; TimerName == expire_awaiting_rel ->
+    case emqx_mqttsn_session:handle_timeout(ClientInfo, TimerName, Session) of
+        {ok, Publishes, NSession} ->
+            NChannel = Channel#channel{session = NSession},
+            handle_out(publish, Publishes, clean_timer(TimerName, NChannel));
+        {ok, Publishes, Timeout, NSession} ->
+            NChannel = Channel#channel{session = NSession},
+            %% XXX: These replay messages should awaiting register acked?
+            handle_out(publish, Publishes, reset_timer(TimerName, Timeout, NChannel))
     end;
 handle_timeout(
     _TRef,
@@ -2145,7 +2130,13 @@ handle_timeout(_TRef, expire_session, Channel) ->
     shutdown(expired, Channel);
 handle_timeout(_TRef, expire_asleep, Channel) ->
     shutdown(asleep_timeout, Channel);
+handle_timeout(_TRef, connection_expire, Channel) ->
+    NChannel = clean_timer(connection_expire, Channel),
+    handle_out(disconnect, expired, NChannel);
 handle_timeout(_TRef, Msg, Channel) ->
+    %% NOTE
+    %% We do not expect `emqx_mqttsn_session` to set up any custom timers (i.e with
+    %% `emqx_session:ensure_timer/3`), because `emqx_session_mem` doesn't use any.
     ?SLOG(error, #{
         msg => "unexpected_timeout",
         timeout_msg => Msg
@@ -2210,7 +2201,7 @@ ensure_asleep_timer(Channel = #channel{asleep_timer_duration = Duration}) when
 
 ensure_asleep_timer(Durtion, Channel) ->
     ensure_timer(
-        asleep_timer,
+        expire_asleep,
         timer:seconds(Durtion),
         Channel#channel{asleep_timer_duration = Durtion}
     ).
@@ -2219,9 +2210,8 @@ ensure_register_timer(Channel) ->
     ensure_register_timer(0, Channel).
 
 ensure_register_timer(RetryTimes, Channel = #channel{timers = Timers}) ->
-    Msg = maps:get(register_timer, ?TIMER_TABLE),
-    TRef = emqx_utils:start_timer(?REGISTER_TIMEOUT, {Msg, RetryTimes}),
-    Channel#channel{timers = Timers#{register_timer => TRef}}.
+    TRef = emqx_utils:start_timer(?REGISTER_TIMEOUT, {retry_register, RetryTimes}),
+    Channel#channel{timers = Timers#{retry_register => TRef}}.
 
 cancel_timer(Name, Channel = #channel{timers = Timers}) ->
     case maps:get(Name, Timers, undefined) of
@@ -2242,8 +2232,7 @@ ensure_timer(Name, Channel = #channel{timers = Timers}) ->
     end.
 
 ensure_timer(Name, Time, Channel = #channel{timers = Timers}) ->
-    Msg = maps:get(Name, ?TIMER_TABLE),
-    TRef = emqx_utils:start_timer(Time, Msg),
+    TRef = emqx_utils:start_timer(Time, Name),
     Channel#channel{timers = Timers#{Name => TRef}}.
 
 reset_timer(Name, Channel) ->
@@ -2255,13 +2244,12 @@ reset_timer(Name, Time, Channel) ->
 clean_timer(Name, Channel = #channel{timers = Timers}) ->
     Channel#channel{timers = maps:remove(Name, Timers)}.
 
-interval(alive_timer, #channel{keepalive = KeepAlive}) ->
-    emqx_keepalive:info(interval, KeepAlive);
-interval(retry_timer, #channel{session = Session}) ->
+interval(keepalive, #channel{keepalive = KeepAlive}) ->
+    emqx_keepalive:info(check_interval, KeepAlive);
+interval(retry_delivery, #channel{session = Session}) ->
     emqx_mqttsn_session:info(retry_interval, Session);
-interval(await_timer, #channel{session = Session}) ->
+interval(expire_awaiting_rel, #channel{session = Session}) ->
     emqx_mqttsn_session:info(await_rel_timeout, Session).
-
 %%--------------------------------------------------------------------
 %% Helper functions
 %%--------------------------------------------------------------------

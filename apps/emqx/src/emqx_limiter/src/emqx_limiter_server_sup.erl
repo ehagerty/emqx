@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ start(Type) ->
     Spec = make_child(Type),
     supervisor:start_child(?MODULE, Spec).
 
--spec start(emqx_limiter_schema:limiter_type(), hocons:config()) -> _.
+-spec start(emqx_limiter_schema:limiter_type(), hocon:config()) -> _.
 start(Type, Cfg) ->
     Spec = make_child(Type, Cfg),
     supervisor:start_child(?MODULE, Spec).
@@ -86,7 +86,7 @@ init([]) ->
 %%  Internal functions
 %%--==================================================================
 make_child(Type) ->
-    Cfg = emqx_limiter_schema:get_node_opts(Type),
+    Cfg = emqx_limiter_utils:get_node_opts(Type),
     make_child(Type, Cfg).
 
 make_child(Type, Cfg) ->

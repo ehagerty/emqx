@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 -export([add_handler/0, remove_handler/0]).
 -export([pre_config_update/3, post_config_update/5]).
 -export([regenerate_minirest_dispatch/0]).
+-export([delay_job/1]).
 
 -behaviour(gen_server).
 
@@ -68,7 +69,7 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State, hibernate}.
 
-handle_info(i18n_lang_changed, _State) ->
+handle_info(regenerate, _State) ->
     NewState = regenerate_minirest_dispatch(),
     {noreply, NewState, hibernate};
 handle_info({update_listeners, OldListeners, NewListeners}, _State) ->
@@ -146,14 +147,15 @@ remove_sensitive_data(Conf0) ->
     end.
 
 post_config_update(_, {change_i18n_lang, _}, _NewConf, _OldConf, _AppEnvs) ->
-    delay_job(i18n_lang_changed);
+    delay_job(regenerate);
 post_config_update(_, _Req, NewConf, OldConf, _AppEnvs) ->
+    SwaggerSupport = diff_swagger_support(NewConf, OldConf),
     OldHttp = get_listener(http, OldConf),
     OldHttps = get_listener(https, OldConf),
     NewHttp = get_listener(http, NewConf),
     NewHttps = get_listener(https, NewConf),
-    {StopHttp, StartHttp} = diff_listeners(http, OldHttp, NewHttp),
-    {StopHttps, StartHttps} = diff_listeners(https, OldHttps, NewHttps),
+    {StopHttp, StartHttp} = diff_listeners(http, OldHttp, NewHttp, SwaggerSupport),
+    {StopHttps, StartHttps} = diff_listeners(https, OldHttps, NewHttps, SwaggerSupport),
     Stop = maps:merge(StopHttp, StopHttps),
     Start = maps:merge(StartHttp, StartHttps),
     delay_job({update_listeners, Stop, Start}).
@@ -167,10 +169,16 @@ delay_job(Msg) ->
 get_listener(Type, Conf) ->
     emqx_utils_maps:deep_get([listeners, Type], Conf, undefined).
 
-diff_listeners(_, Listener, Listener) -> {#{}, #{}};
-diff_listeners(Type, undefined, Start) -> {#{}, #{Type => Start}};
-diff_listeners(Type, Stop, undefined) -> {#{Type => Stop}, #{}};
-diff_listeners(Type, Stop, Start) -> {#{Type => Stop}, #{Type => Start}}.
+diff_swagger_support(NewConf, OldConf) ->
+    maps:get(swagger_support, NewConf, true) =:=
+        maps:get(swagger_support, OldConf, true).
+
+diff_listeners(_, undefined, undefined, _) -> {#{}, #{}};
+diff_listeners(_, Listener, Listener, true) -> {#{}, #{}};
+diff_listeners(Type, undefined, Start, _) -> {#{}, #{Type => Start}};
+diff_listeners(Type, Stop, undefined, _) -> {#{Type => Stop}, #{}};
+diff_listeners(Type, Listener, Listener, false) -> {#{Type => Listener}, #{Type => Listener}};
+diff_listeners(Type, Stop, Start, _) -> {#{Type => Stop}, #{Type => Start}}.
 
 -define(DIR, <<"dashboard">>).
 
@@ -180,8 +188,8 @@ ensure_ssl_cert(#{<<"listeners">> := #{<<"https">> := #{<<"bind">> := Bind} = Ht
     Https1 = emqx_dashboard_schema:https_converter(Https0, #{}),
     Conf1 = emqx_utils_maps:deep_put([<<"listeners">>, <<"https">>], Conf0, Https1),
     Ssl = maps:get(<<"ssl_options">>, Https1, undefined),
-    Opts = #{required_keys => [[<<"keyfile">>], [<<"certfile">>], [<<"cacertfile">>]]},
-    case emqx_tls_lib:ensure_ssl_files(?DIR, Ssl, Opts) of
+    Opts = #{required_keys => [[<<"keyfile">>], [<<"certfile">>]]},
+    case emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(?DIR, Ssl, Opts) of
         {ok, undefined} ->
             {error, <<"ssl_cert_not_found">>};
         {ok, NewSsl} ->

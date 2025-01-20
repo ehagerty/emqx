@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -41,6 +41,16 @@ all() -> emqx_common_test_helpers:all(?MODULE).
 %% CT callbacks
 %%--------------------------------------------------------------------
 
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
+
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
 init_per_testcase(TestCase, Config) when
     TestCase =/= t_ws_sub_protocols_mqtt_equivalents,
     TestCase =/= t_ws_sub_protocols_mqtt,
@@ -60,49 +70,15 @@ init_per_testcase(TestCase, Config) when
     ok = meck:expect(cowboy_req, sock, fun(_) -> {{127, 0, 0, 1}, 18083} end),
     ok = meck:expect(cowboy_req, cert, fun(_) -> undefined end),
     ok = meck:expect(cowboy_req, parse_cookies, fun(_) -> error(badarg) end),
-    %% Mock emqx_access_control
-    ok = meck:new(emqx_access_control, [passthrough, no_history, no_link]),
-    ok = meck:expect(emqx_access_control, authorize, fun(_, _, _) -> allow end),
-    %% Mock emqx_hooks
-    ok = meck:new(emqx_hooks, [passthrough, no_history, no_link]),
-    ok = meck:expect(emqx_hooks, run, fun(_Hook, _Args) -> ok end),
-    ok = meck:expect(emqx_hooks, run_fold, fun(_Hook, _Args, Acc) -> Acc end),
-    %% Mock emqx_broker
-    ok = meck:new(emqx_broker, [passthrough, no_history, no_link]),
-    ok = meck:expect(emqx_broker, subscribe, fun(_, _, _) -> ok end),
-    ok = meck:expect(emqx_broker, publish, fun(#message{topic = Topic}) ->
-        [{node(), Topic, 1}]
-    end),
-    ok = meck:expect(emqx_broker, unsubscribe, fun(_) -> ok end),
-    %% Mock emqx_metrics
-    ok = meck:new(emqx_metrics, [passthrough, no_history, no_link]),
-    ok = meck:expect(emqx_metrics, inc, fun(_) -> ok end),
-    ok = meck:expect(emqx_metrics, inc, fun(_, _) -> ok end),
-    ok = meck:expect(emqx_metrics, inc_recv, fun(_) -> ok end),
-    ok = meck:expect(emqx_metrics, inc_sent, fun(_) -> ok end),
-    PrevConfig = emqx_config:get_listener_conf(ws, default, [websocket]),
-    [
-        {prev_config, PrevConfig}
-        | Config
-    ];
+    Config;
 init_per_testcase(t_ws_non_check_origin, Config) ->
     add_bucket(),
-    ok = emqx_common_test_helpers:start_apps([]),
-    PrevConfig = emqx_config:get_listener_conf(ws, default, [websocket]),
     emqx_config:put_listener_conf(ws, default, [websocket, check_origin_enable], false),
     emqx_config:put_listener_conf(ws, default, [websocket, check_origins], []),
-    [
-        {prev_config, PrevConfig}
-        | Config
-    ];
-init_per_testcase(_, Config) ->
+    Config;
+init_per_testcase(_TestCase, Config) ->
     add_bucket(),
-    PrevConfig = emqx_config:get_listener_conf(ws, default, [websocket]),
-    ok = emqx_common_test_helpers:start_apps([]),
-    [
-        {prev_config, PrevConfig}
-        | Config
-    ].
+    Config.
 
 end_per_testcase(TestCase, _Config) when
     TestCase =/= t_ws_sub_protocols_mqtt_equivalents,
@@ -112,41 +88,14 @@ end_per_testcase(TestCase, _Config) when
     TestCase =/= t_ws_pingreq_before_connected
 ->
     del_bucket(),
-    lists:foreach(
-        fun meck:unload/1,
-        [
-            emqx_cm,
-            cowboy_req,
-            emqx_access_control,
-            emqx_broker,
-            emqx_hooks,
-            emqx_metrics
-        ]
-    );
-end_per_testcase(t_ws_non_check_origin, Config) ->
-    del_bucket(),
-    PrevConfig = ?config(prev_config, Config),
-    emqx_config:put_listener_conf(ws, default, [websocket], PrevConfig),
-    stop_apps(),
+    meck:unload([
+        emqx_cm,
+        cowboy_req
+    ]),
     ok;
 end_per_testcase(_, Config) ->
     del_bucket(),
-    PrevConfig = ?config(prev_config, Config),
-    emqx_config:put_listener_conf(ws, default, [websocket], PrevConfig),
-    stop_apps(),
     Config.
-
-init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([]),
-    Config.
-
-end_per_suite(_) ->
-    emqx_common_test_helpers:stop_apps([]),
-    ok.
-
-%% FIXME: this is a temp fix to tests share configs.
-stop_apps() ->
-    emqx_common_test_helpers:stop_apps([], #{erase_all_configs => false}).
 
 %%--------------------------------------------------------------------
 %% Test Cases
@@ -182,7 +131,7 @@ t_header(_) ->
     set_ws_opts(proxy_address_header, <<"x-forwarded-for">>),
     set_ws_opts(proxy_port_header, <<"x-forwarded-port">>),
     {ok, St, _} = ?ws_conn:websocket_init([
-        req,
+        #{},
         #{
             zone => default,
             limiter => limiter_cfg(),
@@ -265,12 +214,12 @@ ws_pingreq(State) ->
                 protocols => [{<<"mqtt">>, gun_ws_h}]
             }),
             ws_pingreq(State#{wref => StreamRef});
-        {gun_down, _WPID, _, Reason, _, _} ->
+        {gun_down, _WPID, _, Reason, _} ->
             State#{result => {gun_down, Reason}};
-        {gun_upgrade, WPID, _Ref, _Proto, _Data} ->
+        {gun_upgrade, WPID, Ref, _Proto, _Data} ->
             ct:pal("-- gun_upgrade, send ping-req"),
             PingReq = {binary, <<192, 0>>},
-            ok = gun:ws_send(WPID, PingReq),
+            ok = gun:ws_send(WPID, Ref, PingReq),
             gun:flush(WPID),
             ws_pingreq(State);
         {gun_ws, _WPID, _Ref, {binary, <<208, 0>>}} ->
@@ -391,8 +340,9 @@ t_websocket_info_rate_limit(_) ->
     {ok, _} = websocket_info({cast, rate_limit}, st()),
     ok = timer:sleep(1),
     receive
-        {check_gc, Stats} ->
-            ?assertEqual(#{cnt => 0, oct => 0}, Stats)
+        {check_gc, Cnt, Oct} ->
+            ?assertEqual(0, Cnt),
+            ?assertEqual(0, Oct)
     after 0 -> error(expect_check_gc)
     end.
 
@@ -400,6 +350,7 @@ t_websocket_info_cast(_) ->
     {ok, _St} = websocket_info({cast, msg}, st()).
 
 t_websocket_info_incoming(_) ->
+    ok = emqx_broker:subscribe(<<"#">>, <<?MODULE_STRING>>),
     ConnPkt = #mqtt_packet_connect{
         proto_name = <<"MQTT">>,
         proto_ver = ?MQTT_PROTO_V5,
@@ -411,16 +362,28 @@ t_websocket_info_incoming(_) ->
         username = <<"username">>,
         password = <<"passwd">>
     },
-    {[{close, protocol_error}], St1} = websocket_info({incoming, ?CONNECT_PACKET(ConnPkt)}, st()),
-    % ?assertEqual(<<224,2,130,0>>, iolist_to_binary(IoData1)),
+    {[{binary, IoData1}, {close, protocol_error}], St1} =
+        websocket_info({incoming, ?CONNECT_PACKET(ConnPkt)}, st()),
+    ?assertEqual(<<224, 2, ?RC_PROTOCOL_ERROR, 0>>, iolist_to_binary(IoData1)),
     %% PINGREQ
     {[{binary, IoData2}], St2} =
         websocket_info({incoming, ?PACKET(?PINGREQ)}, St1),
     ?assertEqual(<<208, 0>>, iolist_to_binary(IoData2)),
-    %% PUBLISH
-    Publish = ?PUBLISH_PACKET(?QOS_1, <<"t">>, 1, <<"payload">>),
-    {[{binary, IoData3}], _St3} = websocket_info({incoming, Publish}, St2),
-    ?assertEqual(<<64, 4, 0, 1, 0, 0>>, iolist_to_binary(IoData3)).
+    %% PUBLISH with property
+    Publish = ?PUBLISH_PACKET(
+        ?QOS_1, <<"t">>, 1, #{'User-Property' => [{<<"k">>, <<"v">>}]}, <<"payload">>
+    ),
+    {[{binary, IoData3}], St3} = websocket_info({incoming, Publish}, St2),
+    ?assertEqual(<<64, 4, 0, 1, 0, 0>>, iolist_to_binary(IoData3)),
+    %% frame_error
+    Cause = invalid_property_code,
+    FrameError = {frame_error, #{cause => Cause, property_code => 16#2B}},
+    %% cowboy_websocket's close reason must be an atom to avoid crashing the sender process.
+    %% ensure the cause is atom
+    {[{binary, IoData4}, {close, CauseReq}], _St4} =
+        websocket_info({incoming, FrameError}, St3),
+    ?assertEqual(<<224, 2, ?RC_MALFORMED_PACKET, 0>>, iolist_to_binary(IoData4)),
+    ?assertEqual(Cause, CauseReq).
 
 t_websocket_info_check_gc(_) ->
     Stats = #{cnt => 10, oct => 1000},
@@ -430,8 +393,8 @@ t_websocket_info_deliver(_) ->
     Msg0 = emqx_message:make(clientid, ?QOS_0, <<"t">>, <<"">>),
     Msg1 = emqx_message:make(clientid, ?QOS_1, <<"t">>, <<"">>),
     self() ! {deliver, <<"#">>, Msg1},
-    {ok, _St} = websocket_info({deliver, <<"#">>, Msg0}, st()).
-% ?assertEqual(<<48,3,0,1,116,50,5,0,1,116,0,1>>, iolist_to_binary(IoData)).
+    {[{binary, _Pub1}, {binary, _Pub2}], _St} =
+        websocket_info({deliver, <<"#">>, Msg0}, st()).
 
 t_websocket_info_timeout_limiter(_) ->
     Ref = make_ref(),
@@ -483,7 +446,6 @@ t_handle_info_close(_) ->
 t_handle_info_event(_) ->
     ok = meck:expect(emqx_cm, register_channel, fun(_, _, _) -> ok end),
     ok = meck:expect(emqx_cm, insert_channel_info, fun(_, _, _) -> ok end),
-    ok = meck:expect(emqx_cm, connection_closed, fun(_) -> true end),
     {ok, _} = ?ws_conn:handle_info({event, connected}, st()),
     {ok, _} = ?ws_conn:handle_info({event, disconnected}, st()),
     {ok, _} = ?ws_conn:handle_info({event, updated}, st()).
@@ -540,14 +502,24 @@ t_parse_incoming_order(_) ->
 
 t_parse_incoming_frame_error(_) ->
     {Packets, _St} = ?ws_conn:parse_incoming(<<3, 2, 1, 0>>, [], st()),
-    FrameError = {frame_error, malformed_packet},
-    [{incoming, FrameError}] = Packets.
+
+    ?assertMatch(
+        [
+            {incoming,
+                {frame_error, #{
+                    header_type := _,
+                    cause := malformed_packet
+                }}}
+        ],
+        Packets
+    ).
 
 t_handle_incomming_frame_error(_) ->
     FrameError = {frame_error, bad_qos},
-    Serialize = emqx_frame:serialize_fun(#{version => 5, max_size => 16#FFFF}),
-    {[{close, bad_qos}], _St} = ?ws_conn:handle_incoming(FrameError, st(#{serialize => Serialize})).
-% ?assertEqual(<<224,2,129,0>>, iolist_to_binary(IoData)).
+    Serialize = #{version => 5, max_size => 16#FFFF, strict_mode => false},
+    {[{binary, IoData}, {close, bad_qos}], _St} =
+        ?ws_conn:handle_incoming(FrameError, st(#{serialize => Serialize})),
+    ?assertEqual(<<224, 2, 129, 0>>, iolist_to_binary(IoData)).
 
 t_handle_outgoing(_) ->
     Packets = [
@@ -561,7 +533,7 @@ t_handle_outgoing(_) ->
 t_run_gc(_) ->
     GcSt = emqx_gc:init(#{count => 10, bytes => 100}),
     WsSt = st(#{gc_state => GcSt}),
-    ?ws_conn:run_gc(#{cnt => 100, oct => 10000}, WsSt).
+    ?ws_conn:run_gc(100, 10000, WsSt).
 
 t_enqueue(_) ->
     Packet = ?PUBLISH_PACKET(?QOS_0),
@@ -578,7 +550,7 @@ t_shutdown(_) ->
 st() -> st(#{}).
 st(InitFields) when is_map(InitFields) ->
     {ok, St, _} = ?ws_conn:websocket_init([
-        req,
+        #{},
         #{
             zone => default,
             listener => {ws, default},
@@ -616,10 +588,11 @@ channel(InitFields) ->
         is_superuser => false,
         mountpoint => undefined
     },
-    Conf = emqx_cm:get_session_confs(ClientInfo, #{
-        receive_maximum => 0, expiry_interval => 0
-    }),
-    Session = emqx_session:init(Conf),
+    Session = emqx_session:create(
+        ClientInfo,
+        #{receive_maximum => 0, expiry_interval => 0},
+        _WillMsg = undefined
+    ),
     maps:fold(
         fun(Field, Value, Channel) ->
             emqx_channel:set_field(Field, Value, Channel)
@@ -658,7 +631,7 @@ ws_client(State) ->
                 #{protocols => [{P, gun_ws_h} || P <- Protos]}
             ),
             ws_client(State#{wref => StreamRef});
-        {gun_down, _WPID, _, Reason, _, _} ->
+        {gun_down, _WPID, _, Reason, _} ->
             State#{result => {gun_down, Reason}};
         {gun_upgrade, _WPID, _Ref, _Proto, Data} ->
             ct:pal("-- gun_upgrade: ~p", [Data]),

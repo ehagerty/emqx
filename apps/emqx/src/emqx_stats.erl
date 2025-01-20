@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -37,7 +37,8 @@
     setstat/2,
     setstat/3,
     statsfun/1,
-    statsfun/2
+    statsfun/2,
+    names/0
 ]).
 
 -export([
@@ -61,7 +62,7 @@
 -record(update, {name, countdown, interval, func}).
 
 -record(state, {
-    timer :: maybe(reference()),
+    timer :: option(reference()),
     updates :: [#update{}],
     tick_ms :: timeout()
 }).
@@ -98,12 +99,18 @@
     [
         'sessions.count',
         %% Maximum Number of Concurrent Sessions
-        'sessions.max'
+        'sessions.max',
+        %% Count of Sessions in the cluster
+        'cluster_sessions.count',
+        %% Maximum Number of Sessions in the cluster
+        'cluster_sessions.max'
     ]
 ).
 
 %% PubSub stats
 -define(PUBSUB_STATS, [
+    'durable_subscriptions.count',
+    'durable_subscriptions.max',
     'topics.count',
     'topics.max',
     'suboptions.count',
@@ -156,6 +163,36 @@ getstats() ->
         undefined -> [];
         _ -> ets:tab2list(?TAB)
     end.
+
+names() ->
+    [
+        emqx_connections_count,
+        emqx_connections_max,
+        emqx_durable_subscriptions_count,
+        emqx_durable_subscriptions_max,
+        emqx_live_connections_count,
+        emqx_live_connections_max,
+        emqx_cluster_sessions_count,
+        emqx_cluster_sessions_max,
+        emqx_sessions_count,
+        emqx_sessions_max,
+        emqx_channels_count,
+        emqx_channels_max,
+        emqx_topics_count,
+        emqx_topics_max,
+        emqx_suboptions_count,
+        emqx_suboptions_max,
+        emqx_subscribers_count,
+        emqx_subscribers_max,
+        emqx_subscriptions_count,
+        emqx_subscriptions_max,
+        emqx_subscriptions_shared_count,
+        emqx_subscriptions_shared_max,
+        emqx_retained_count,
+        emqx_retained_max,
+        emqx_delayed_count,
+        emqx_delayed_max
+    ].
 
 %% @doc Get stats by name.
 -spec getstat(atom()) -> non_neg_integer().

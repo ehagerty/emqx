@@ -42,6 +42,12 @@ precision.desc:
 precision.label:
 """Time Precision"""
 
+pool_size.desc:
+"""Size of the connection pool towards the bridge target service."""
+
+pool_size.label:
+"""Connection Pool Size"""
+
 protocol.desc:
 """InfluxDB's protocol. HTTP API or HTTP API V2."""
 
@@ -49,8 +55,8 @@ protocol.label:
 """Protocol"""
 
 server.desc:
-"""The IPv4 or IPv6 address or the hostname to connect to.</br>
-A host entry has the following form: `Host[:Port]`.</br>
+"""The IPv4 or IPv6 address or the hostname to connect to.<br/>
+A host entry has the following form: `Host[:Port]`.<br/>
 The InfluxDB default port 8086 is used if `[:Port]` is not specified."""
 
 server.label:
@@ -67,5 +73,10 @@ username.desc:
 
 username.label:
 """Username"""
+
+influxdb_parameters.label:
+"""InfluxDB Type Specific Parameters"""
+influxdb_parameters.desc:
+"""Set of parameters specific for the given type of this InfluxDB connector, `influxdb_type` can be one of `influxdb_api_v1`, `influxdb_api_v1`."""
 
 }

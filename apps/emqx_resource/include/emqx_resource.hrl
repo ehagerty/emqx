@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -13,20 +13,47 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 %%--------------------------------------------------------------------
--type resource_type() :: module().
+
+-ifndef(EMQX_RESOURCE_HRL).
+-define(EMQX_RESOURCE_HRL, true).
+%% bridge/connector/action status
+-define(status_connected, connected).
+-define(status_connecting, connecting).
+-define(status_disconnected, disconnected).
+%% Note: the `stopped' status can only be emitted by `emqx_resource_manager'...  Modules
+%% implementing `emqx_resource' behavior should not return it.  The `rm_' prefix is to
+%% remind us of that.
+-define(rm_status_stopped, stopped).
+
+-type resource_type() :: atom().
+-type resource_module() :: module().
 -type resource_id() :: binary().
+-type channel_id() :: action_resource_id() | source_resource_id().
 -type raw_resource_config() :: binary() | raw_term_resource_config().
 -type raw_term_resource_config() :: #{binary() => term()} | [raw_term_resource_config()].
 -type resource_config() :: term().
--type resource_spec() :: map().
 -type resource_state() :: term().
--type resource_status() :: connected | disconnected | connecting | stopped.
+%% Note: the `stopped' status can only be emitted by `emqx_resource_manager'...  Modules
+%% implementing `emqx_resource' behavior should not return it.
+-type resource_status() ::
+    ?status_connected | ?status_disconnected | ?status_connecting | ?rm_status_stopped.
+-type health_check_status() :: ?status_connected | ?status_disconnected | ?status_connecting.
+-type channel_status() :: ?status_connected | ?status_connecting | ?status_disconnected.
 -type callback_mode() :: always_sync | async_if_possible.
--type query_mode() :: simple_sync | simple_async | sync | async | no_queries.
+-type query_mode() :: resource_query_mode().
+-type resource_query_mode() ::
+    simple_sync
+    | simple_async
+    | simple_sync_internal_buffer
+    | simple_async_internal_buffer
+    | sync
+    | async
+    | no_queries.
+-type query_kind() :: sync | async.
 -type result() :: term().
 -type reply_fun() ::
-    {fun((result(), Args :: term()) -> any()), Args :: term()}
-    | {fun((result(), Args :: term()) -> any()), Args :: term(), reply_context()}
+    {fun((...) -> any()), Args :: [term()]}
+    | {fun((...) -> any()), Args :: [term()], reply_context()}
     | undefined.
 -type reply_context() :: #{reply_dropped => boolean()}.
 -type query_opts() :: #{
@@ -36,18 +63,24 @@
     expire_at => infinity | integer(),
     async_reply_fun => reply_fun(),
     simple_query => boolean(),
-    is_buffer_supported => boolean(),
-    reply_to => reply_fun()
+    %% Set only by actions that use internal buffering (Kafka, Pulsar).
+    internal_buffer => boolean(),
+    reply_to => reply_fun(),
+    %% Called `query_mode' due to legacy reasons...
+    query_mode => query_kind(),
+    connector_resource_id => resource_id(),
+    is_fallback => boolean()
 }.
 -type resource_data() :: #{
     id := resource_id(),
     mod := module(),
     callback_mode := callback_mode(),
-    query_mode := query_mode(),
+    query_mode := resource_query_mode(),
     config := resource_config(),
     error := term(),
-    state := resource_state(),
-    status := resource_status()
+    status := resource_status(),
+    added_channels := term(),
+    state := resource_state()
 }.
 -type resource_group() :: binary().
 -type creation_opts() :: #{
@@ -74,9 +107,12 @@
     batch_size => pos_integer(),
     batch_time => pos_integer(),
     max_buffer_bytes => pos_integer(),
-    query_mode => query_mode(),
+    query_mode => resource_query_mode(),
     resume_interval => pos_integer(),
-    inflight_window => pos_integer()
+    inflight_window => pos_integer(),
+    %% Only for `emqx_resource_manager' usage.  If false, prevents spawning buffer
+    %% workers, regardless of resource query mode.
+    spawn_buffer_workers => boolean()
 }.
 -type query_result() ::
     ok
@@ -85,6 +121,13 @@
     | {ok, term(), term(), term()}
     | {error, {recoverable_error, term()}}
     | {error, term()}.
+
+-type batch_query_result() :: query_result() | [query_result()].
+
+-type action_resource_id() :: resource_id().
+-type source_resource_id() :: resource_id().
+-type connector_resource_id() :: resource_id().
+-type message_tag() :: action_resource_id().
 
 -define(WORKER_POOL_SIZE, 16).
 
@@ -119,7 +162,24 @@
 %% boolean
 -define(START_AFTER_CREATED, true).
 
--define(TEST_ID_PREFIX, "_probe_:").
+%% Keep this test_id_prefix is match "^[A-Za-z0-9]+[A-Za-z0-9-_]*$".
+%% See `hocon_tconf`
+-define(PROBE_ID_PREFIX, "PROBE_").
+-define(PROBE_ID_RAND_BYTES, 8).
+-define(PROBE_ID_NEW(),
+    iolist_to_binary([?PROBE_ID_PREFIX, emqx_utils:rand_id(?PROBE_ID_RAND_BYTES)])
+).
+-define(PROBE_ID_MATCH(Suffix), <<?PROBE_ID_PREFIX, _:?PROBE_ID_RAND_BYTES/binary, Suffix/binary>>).
 -define(RES_METRICS, resource_metrics).
+-define(LOG_LEVEL(_L_),
+    case _L_ of
+        true -> info;
+        false -> warning
+    end
+).
+-define(TAG, "RESOURCE").
 
 -define(RESOURCE_ALLOCATION_TAB, emqx_resource_allocations).
+-define(RESOURCE_CACHE, emqx_resource_cache).
+
+-endif.

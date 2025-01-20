@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -83,18 +83,21 @@ index_score(Index, Tokens) ->
 %% Returns `undefined' if there are no indices with score `> 0'.
 %%
 %% @see index_score/2
--spec select_index(emqx:words(), list(index())) -> index() | undefined.
+-spec select_index(emqx_types:words(), list(index())) -> index() | undefined.
 select_index(Tokens, Indices) ->
     select_index(Tokens, Indices, 0, undefined).
 
 %% @doc For an index and a wildcard topic
-%% returns a matchspec pattern for the corresponding index key.
+%% returns a tuple of:
+%% * matchspec pattern for the corresponding index key
+%% * boolean flag indicating whether the pattern is exact
 %%
 %% E.g. for `[2, 3]' index and <code>['+', <<"b">>, '+', <<"d">>]</code> wildcard topic
 %% returns <code>{[2, 3], {[<<"b">>, '_'], ['_', <<"d">>]}}</code> pattern.
--spec condition(index(), emqx_types:words()) -> match_pattern_part().
+-spec condition(index(), emqx_types:words()) -> {match_pattern_part(), boolean()}.
 condition(Index, Tokens) ->
-    {Index, condition(Index, Tokens, 1, [], [])}.
+    {Condition, IsExact} = condition(Index, Tokens, 1, [], []),
+    {{Index, Condition}, IsExact}.
 
 %% @doc Returns a matchspec pattern for a wildcard topic.
 %%
@@ -103,15 +106,17 @@ condition(Index, Tokens) ->
 -spec condition(emqx_types:words()) -> match_pattern_part().
 condition(Tokens) ->
     Tokens1 = [
-        case W =:= '+' of
-            true -> '_';
+        case W of
+            '+' -> '_';
             _ -> W
         end
      || W <- Tokens
     ],
     case length(Tokens1) > 0 andalso lists:last(Tokens1) =:= '#' of
-        false -> Tokens1;
-        _ -> (Tokens1 -- ['#']) ++ '_'
+        false ->
+            Tokens1;
+        _ ->
+            (Tokens1 -- ['#']) ++ '_'
     end.
 
 %% @doc Restores concrete topic from its index key representation.
@@ -162,13 +167,13 @@ select_index(Tokens, [Index | Indices], MaxScore, SelectedIndex) ->
     end.
 
 condition([_NIndex | _OtherIndex], ['#' | _OtherTokens], _N, IndexMatch, OtherMatch) ->
-    {lists:reverse(IndexMatch) ++ '_', lists:reverse(OtherMatch) ++ '_'};
+    {{lists:reverse(IndexMatch) ++ '_', lists:reverse(OtherMatch) ++ '_'}, false};
 condition([], ['#' | _OtherTokens], _N, IndexMatch, OtherMatch) ->
-    {lists:reverse(IndexMatch), lists:reverse(OtherMatch) ++ '_'};
+    {{lists:reverse(IndexMatch), lists:reverse(OtherMatch) ++ '_'}, true};
 condition([], Tokens, _N, IndexMatch, OtherMatch) ->
-    {lists:reverse(IndexMatch), lists:reverse(OtherMatch) ++ condition(Tokens)};
+    {{lists:reverse(IndexMatch), lists:reverse(OtherMatch) ++ condition(Tokens)}, true};
 condition([_NIndex | _OtherIndex], [], _N, IndexMatch, OtherMatch) ->
-    {lists:reverse(IndexMatch) ++ '_', lists:reverse(OtherMatch)};
+    {{lists:reverse(IndexMatch), lists:reverse(OtherMatch)}, true};
 condition([NIndex | OtherIndex], ['+' | OtherTokens], N, IndexMatch, OtherMatch) when
     NIndex =:= N
 ->

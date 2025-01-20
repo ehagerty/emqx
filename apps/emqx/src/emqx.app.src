@@ -2,7 +2,7 @@
 {application, emqx, [
     {id, "emqx"},
     {description, "EMQX Core"},
-    {vsn, "5.1.5"},
+    {vsn, "5.5.1"},
     {modules, []},
     {registered, []},
     {applications, [
@@ -10,14 +10,19 @@
         stdlib,
         gproc,
         gen_rpc,
+        mnesia,
         mria,
+        ekka,
         esockd,
         cowboy,
         sasl,
-        os_mon,
         lc,
         hocon,
-        emqx_durable_storage
+        emqx_ds_backends,
+        bcrypt,
+        emqx_http_lib,
+        recon,
+        os_mon
     ]},
     {mod, {emqx_app, []}},
     {env, []},

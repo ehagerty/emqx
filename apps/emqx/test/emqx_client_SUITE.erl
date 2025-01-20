@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -72,45 +72,59 @@ groups() ->
             t_dollar_topics,
             t_sub_non_utf8_topic
         ]},
-        {mqttv5, [non_parallel_tests], [t_basic_with_props_v5]},
+        {mqttv5, [non_parallel_tests], [t_basic_with_props_v5, t_v5_receive_maximim_in_connack]},
         {others, [non_parallel_tests], [
             t_username_as_clientid,
+            t_certcn_as_alias,
+            t_certdn_as_alias,
+            t_client_attr_from_user_property,
+            t_sock_closed_reason_normal,
+            t_sock_closed_force_closed_by_client,
             t_certcn_as_clientid_default_config_tls,
             t_certcn_as_clientid_tlsv1_3,
             t_certcn_as_clientid_tlsv1_2,
-            t_peercert_preserved_before_connected
+            t_peercert_preserved_before_connected,
+            t_clientid_override,
+            t_clientid_override_fail_with_empty_render_result,
+            t_clientid_override_fail_with_expression_exception
         ]}
     ].
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    emqx_config:put_listener_conf(ssl, default, [ssl_options, verify], verify_peer),
-    emqx_listeners:restart_listener('ssl:default'),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [{emqx, "listeners.ssl.default.ssl_options.verify = verify_peer"}],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(_Case, Config) ->
     Config.
 
 end_per_testcase(_Case, _Config) ->
-    emqx_config:put_zone_conf(default, [mqtt, idle_timeout], 15000).
+    %% restore default values
+    emqx_config:put_zone_conf(default, [mqtt, idle_timeout], 15000),
+    emqx_config:put_zone_conf(default, [mqtt, use_username_as_clientid], false),
+    emqx_config:put_zone_conf(default, [mqtt, peer_cert_as_clientid], disabled),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], []),
+    emqx_config:put_zone_conf(default, [mqtt, clientid_override], disabled),
+    ok.
 
 %%--------------------------------------------------------------------
 %% Test cases for MQTT v3
 %%--------------------------------------------------------------------
 
 t_basic_v3(_) ->
-    t_basic([{proto_ver, v3}]).
+    run_basic([{proto_ver, v3}]).
 
 %%--------------------------------------------------------------------
 %% Test cases for MQTT v4
 %%--------------------------------------------------------------------
 
 t_basic_v4(_Config) ->
-    t_basic([{proto_ver, v4}]).
+    run_basic([{proto_ver, v4}]).
 
 t_cm(_) ->
     emqx_config:put_zone_conf(default, [mqtt, idle_timeout], 1000),
@@ -335,19 +349,30 @@ t_sub_non_utf8_topic(_) ->
 %% Test cases for MQTT v5
 %%--------------------------------------------------------------------
 
-t_basic_with_props_v5(_) ->
-    t_basic([
+v5_conn_props(ReceiveMaximum) ->
+    [
         {proto_ver, v5},
-        {properties, #{'Receive-Maximum' => 4}}
-    ]).
+        {properties, #{'Receive-Maximum' => ReceiveMaximum}}
+    ].
+
+t_basic_with_props_v5(_) ->
+    run_basic(v5_conn_props(4)).
+
+t_v5_receive_maximim_in_connack(_) ->
+    ReceiveMaximum = 7,
+    {ok, C} = emqtt:start_link(v5_conn_props(ReceiveMaximum)),
+    {ok, Props} = emqtt:connect(C),
+    ?assertMatch(#{'Receive-Maximum' := ReceiveMaximum}, Props),
+    ok = emqtt:disconnect(C),
+    ok.
 
 %%--------------------------------------------------------------------
 %% General test cases.
 %%--------------------------------------------------------------------
 
-t_basic(_Opts) ->
+run_basic(Opts) ->
     Topic = nth(1, ?TOPICS),
-    {ok, C} = emqtt:start_link([{proto_ver, v4}]),
+    {ok, C} = emqtt:start_link(Opts),
     {ok, _} = emqtt:connect(C),
     {ok, _, [1]} = emqtt:subscribe(C, Topic, qos1),
     {ok, _, [2]} = emqtt:subscribe(C, Topic, qos2),
@@ -373,6 +398,139 @@ t_username_as_clientid(_) ->
     end,
     emqtt:disconnect(C).
 
+t_certcn_as_alias(_) ->
+    test_cert_extraction_as_alias(cn).
+
+t_certdn_as_alias(_) ->
+    test_cert_extraction_as_alias(dn).
+
+test_cert_extraction_as_alias(Which) ->
+    %% extract the first two chars
+    ClientId = iolist_to_binary(["ClientIdFor_", atom_to_list(Which)]),
+    {ok, Compiled} = emqx_variform:compile("substr(" ++ atom_to_list(Which) ++ ",0,2)"),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], [
+        #{
+            expression => Compiled,
+            set_as_attr => <<"alias">>
+        }
+    ]),
+    SslConf = emqx_common_test_helpers:client_mtls('tlsv1.2'),
+    {ok, Client} = emqtt:start_link([
+        {clientid, ClientId}, {port, 8883}, {ssl, true}, {ssl_opts, SslConf}
+    ]),
+    {ok, _} = emqtt:connect(Client),
+    %% assert only two chars are extracted
+    ?assertMatch(
+        #{clientinfo := #{client_attrs := #{<<"alias">> := <<_, _>>}}},
+        emqx_cm:get_chan_info(ClientId)
+    ),
+    emqtt:disconnect(Client).
+
+t_client_attr_from_user_property(_Config) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    {ok, Compiled} = emqx_variform:compile("user_property.group"),
+    emqx_config:put_zone_conf(default, [mqtt, client_attrs_init], [
+        #{
+            expression => Compiled,
+            set_as_attr => <<"group">>
+        },
+        #{
+            expression => Compiled,
+            set_as_attr => <<"group2">>
+        }
+    ]),
+    SslConf = emqx_common_test_helpers:client_mtls('tlsv1.3'),
+    {ok, Client} = emqtt:start_link([
+        {clientid, ClientId},
+        {port, 8883},
+        {ssl, true},
+        {ssl_opts, SslConf},
+        {proto_ver, v5},
+        {properties, #{'User-Property' => [{<<"group">>, <<"g1">>}]}}
+    ]),
+    {ok, _} = emqtt:connect(Client),
+    %% assert only two chars are extracted
+    ?assertMatch(
+        #{clientinfo := #{client_attrs := #{<<"group">> := <<"g1">>, <<"group2">> := <<"g1">>}}},
+        emqx_cm:get_chan_info(ClientId)
+    ),
+    emqtt:disconnect(Client).
+
+t_sock_closed_reason_normal(_) ->
+    ProtoVers = [v3, v4, v5],
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    [
+        ?check_trace(
+            begin
+                {ok, C} = emqtt:start_link([{proto_ver, Ver}, {clientid, ClientId}]),
+                {ok, _} = emqtt:connect(C),
+                ?wait_async_action(
+                    emqtt:disconnect(C),
+                    #{?snk_kind := sock_closed_normal},
+                    5_000
+                )
+            end,
+            fun(Trace0) ->
+                ?assertMatch([#{clientid := ClientId}], ?of_kind(sock_closed_normal, Trace0)),
+                ok
+            end
+        )
+     || Ver <- ProtoVers
+    ].
+
+t_sock_closed_force_closed_by_client(_) ->
+    ProtoVers = [v3, v4, v5],
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    process_flag(trap_exit, true),
+    [
+        ?check_trace(
+            begin
+                {ok, C} = emqtt:start_link([{proto_ver, Ver}, {clientid, ClientId}]),
+                {ok, _} = emqtt:connect(C),
+                ?wait_async_action(
+                    exit(C, kill),
+                    #{?snk_kind := sock_closed_with_other_reason},
+                    5_000
+                )
+            end,
+            fun(Trace0) ->
+                ?assertMatch(
+                    [#{clientid := ClientId}], ?of_kind(sock_closed_with_other_reason, Trace0)
+                ),
+                ok
+            end
+        )
+     || Ver <- ProtoVers
+    ],
+    process_flag(trap_exit, false).
+
+t_clientid_override(_) ->
+    emqx_logger:set_log_level(debug),
+    ClientId = <<"original-clientid-0">>,
+    Username = <<"username1">>,
+    Override = <<"username">>,
+    {ok, Rule1} = emqx_variform:compile(Override),
+    emqx_config:put_zone_conf(default, [mqtt, clientid_override], Rule1),
+    {ok, Client} = emqtt:start_link([{clientid, ClientId}, {port, 1883}, {username, Username}]),
+    {ok, _} = emqtt:connect(Client),
+    ?assertMatch(#{clientid := Username}, maps:get(clientinfo, emqx_cm:get_chan_info(Username))),
+    ?assertMatch(undefined, emqx_cm:get_chan_info(ClientId)),
+    emqtt:disconnect(Client).
+
+t_clientid_override_fail_with_empty_render_result(_) ->
+    test_clientid_override_fail(<<"original-clientid-1">>, <<"undefined_var">>).
+
+t_clientid_override_fail_with_expression_exception(_) ->
+    test_clientid_override_fail(<<"original-clientid-2">>, <<"nth(1,undefined_var)">>).
+
+test_clientid_override_fail(ClientId, Expr) ->
+    {ok, Rule1} = emqx_variform:compile(Expr),
+    emqx_config:put_zone_conf(default, [mqtt, clientid_override], Rule1),
+    {ok, Client} = emqtt:start_link([{clientid, ClientId}, {port, 1883}]),
+    {ok, _} = emqtt:connect(Client),
+    ?assertMatch(#{clientid := ClientId}, maps:get(clientinfo, emqx_cm:get_chan_info(ClientId))),
+    emqtt:disconnect(Client).
+
 t_certcn_as_clientid_default_config_tls(_) ->
     tls_certcn_as_clientid(default).
 
@@ -395,7 +553,7 @@ t_peercert_preserved_before_connected(_) ->
         ?HP_HIGHEST
     ),
     ClientId = atom_to_binary(?FUNCTION_NAME),
-    SslConf = emqx_common_test_helpers:client_ssl_twoway(default),
+    SslConf = emqx_common_test_helpers:client_mtls(default),
     {ok, Client} = emqtt:start_link([
         {port, 8883},
         {clientid, ClientId},
@@ -409,7 +567,8 @@ t_peercert_preserved_before_connected(_) ->
     ?assertMatch(
         #{conninfo := ConnInfo} when not is_map_key(peercert, ConnInfo),
         emqx_connection:info(ConnPid)
-    ).
+    ),
+    emqtt:disconnect(Client).
 
 on_hook(ConnInfo, _, 'client.connect' = HP, Pid) ->
     _ = Pid ! {HP, ConnInfo},
@@ -445,7 +604,7 @@ confirm_tls_version(Client, RequiredProtocol) ->
     SSLSocket = element(3, SocketInfo),
     {ok, SSLInfo} = ssl:connection_information(SSLSocket),
     Protocol = proplists:get_value(protocol, SSLInfo),
-    RequiredProtocol = Protocol.
+    ?assertEqual(RequiredProtocol, Protocol).
 
 tls_certcn_as_clientid(default = TLSVsn) ->
     tls_certcn_as_clientid(TLSVsn, 'tlsv1.3');
@@ -455,7 +614,7 @@ tls_certcn_as_clientid(TLSVsn) ->
 tls_certcn_as_clientid(TLSVsn, RequiredTLSVsn) ->
     CN = <<"Client">>,
     emqx_config:put_zone_conf(default, [mqtt, peer_cert_as_clientid], cn),
-    SslConf = emqx_common_test_helpers:client_ssl_twoway(TLSVsn),
+    SslConf = emqx_common_test_helpers:client_mtls(TLSVsn),
     {ok, Client} = emqtt:start_link([{port, 8883}, {ssl, true}, {ssl_opts, SslConf}]),
     {ok, _} = emqtt:connect(Client),
     #{clientinfo := #{clientid := CN}} = emqx_cm:get_chan_info(CN),

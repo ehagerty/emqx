@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -37,25 +37,25 @@ format_path([Name | Rest]) -> [iol(Name), "." | format_path(Rest)].
 %% @doc Plain check the input config.
 %% The input can either be `richmap' or plain `map'.
 %% Always return plain map with atom keys.
--spec check(module(), hocon:config() | iodata()) ->
+-spec check(hocon_schema:schema(), hocon:config() | iodata()) ->
     {ok, hocon:config()} | {error, any()}.
-check(SchemaModule, Conf) ->
+check(Schema, Conf) ->
     %% TODO: remove required
     %% fields should state required or not in their schema
     Opts = #{atom_key => true, required => false},
-    check(SchemaModule, Conf, Opts).
+    check(Schema, Conf, Opts).
 
-check(SchemaModule, Conf, Opts) when is_map(Conf) ->
+check(Schema, Conf, Opts) when is_map(Conf) ->
     try
-        {ok, hocon_tconf:check_plain(SchemaModule, Conf, Opts)}
+        {ok, hocon_tconf:check_plain(Schema, Conf, Opts)}
     catch
         throw:Errors:Stacktrace ->
             compact_errors(Errors, Stacktrace)
     end;
-check(SchemaModule, HoconText, Opts) ->
+check(Schema, HoconText, Opts) ->
     case hocon:binary(HoconText, #{format => map}) of
         {ok, MapConfig} ->
-            check(SchemaModule, MapConfig, Opts);
+            check(Schema, MapConfig, Opts);
         {error, Reason} ->
             {error, Reason}
     end.
@@ -138,7 +138,7 @@ compact_errors(SchemaModule, Error, Stacktrace) ->
     }}.
 
 %% @doc This is only used in static check scripts in the CI.
--spec load_and_check(module(), filename:filename_all()) -> {ok, term()} | {error, any()}.
+-spec load_and_check(module(), file:name_all()) -> {ok, term()} | {error, any()}.
 load_and_check(SchemaModule, File) ->
     try
         do_load_and_check(SchemaModule, File)

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -30,8 +30,9 @@ init_suite(Apps, SetConfigs) when is_function(SetConfigs) ->
     init_suite(Apps, SetConfigs, #{}).
 
 init_suite(Apps, SetConfigs, Opts) ->
-    application:load(emqx_management),
-    emqx_common_test_helpers:start_apps(Apps ++ [emqx_dashboard], SetConfigs, Opts),
+    emqx_common_test_helpers:start_apps(
+        Apps ++ [emqx_management, emqx_dashboard], SetConfigs, Opts
+    ),
     _ = emqx_common_test_http:create_default_app(),
     ok.
 
@@ -40,8 +41,7 @@ end_suite() ->
 
 end_suite(Apps) ->
     emqx_common_test_http:delete_default_app(),
-    emqx_common_test_helpers:stop_apps(Apps ++ [emqx_dashboard]),
-    application:unload(emqx_management),
+    emqx_common_test_helpers:stop_apps(Apps ++ [emqx_management, emqx_dashboard]),
     ok.
 
 set_special_configs(emqx_dashboard) ->
@@ -49,6 +49,26 @@ set_special_configs(emqx_dashboard) ->
     ok;
 set_special_configs(_App) ->
     ok.
+
+-spec emqx_dashboard() -> emqx_cth_suite:appspec().
+emqx_dashboard() ->
+    emqx_dashboard(
+        "dashboard {\n"
+        "           listeners.http { enable = true, bind = 18083}, \n"
+        "           password_expired_time = \"86400s\"\n"
+        "}"
+    ).
+
+emqx_dashboard(Config) ->
+    {emqx_dashboard, #{
+        config => Config,
+        before_start => fun() ->
+            {ok, _} = emqx_common_test_http:create_default_app()
+        end,
+        after_start => fun() ->
+            true = emqx_dashboard_listener:is_ready(infinity)
+        end
+    }}.
 
 %% there is no difference between the 'request' and 'request_api'
 %% the 'request' is only to be compatible with the 'emqx_dashboard_api_test_helpers:request'
@@ -60,6 +80,9 @@ request(Method, Url, Body) ->
 
 uri(Parts) ->
     emqx_dashboard_api_test_helpers:uri(Parts).
+
+uri(Host, Parts) ->
+    emqx_dashboard_api_test_helpers:uri(Host, Parts).
 
 %% compatible_mode will return as same as 'emqx_dashboard_api_test_helpers:request'
 request_api_with_body(Method, Url, Body) ->
@@ -90,33 +113,38 @@ request_api(Method, Url, QueryParams, AuthOrHeaders, [], Opts) when
 ->
     NewUrl =
         case QueryParams of
-            "" -> Url;
-            _ -> Url ++ "?" ++ QueryParams
+            [] -> Url;
+            _ -> Url ++ "?" ++ build_query_string(QueryParams)
         end,
     do_request_api(Method, {NewUrl, build_http_header(AuthOrHeaders)}, Opts);
-request_api(Method, Url, QueryParams, AuthOrHeaders, Body, Opts) when
+request_api(Method, Url, QueryParams, AuthOrHeaders, Body0, Opts) when
     (Method =:= post) orelse
         (Method =:= patch) orelse
         (Method =:= put) orelse
         (Method =:= delete)
 ->
+    ContentType = maps:get('content-type', Opts, "application/json"),
     NewUrl =
         case QueryParams of
             "" -> Url;
             _ -> Url ++ "?" ++ QueryParams
         end,
+    Body =
+        case Body0 of
+            {raw, B} -> B;
+            _ -> emqx_utils_json:encode(Body0)
+        end,
     do_request_api(
         Method,
-        {NewUrl, build_http_header(AuthOrHeaders), "application/json",
-            emqx_utils_json:encode(Body)},
-        Opts
+        {NewUrl, build_http_header(AuthOrHeaders), ContentType, Body},
+        maps:remove('content-type', Opts)
     ).
 
 do_request_api(Method, Request, Opts) ->
     ReturnAll = maps:get(return_all, Opts, false),
     CompatibleMode = maps:get(compatible_mode, Opts, false),
     HttpcReqOpts = maps:get(httpc_req_opts, Opts, []),
-    ct:pal("Method: ~p, Request: ~p, Opts: ~p", [Method, Request, Opts]),
+    ct:pal("~p: ~p~nOpts: ~p", [Method, Request, Opts]),
     case httpc:request(Method, Request, [], HttpcReqOpts) of
         {error, socket_closed_remotely} ->
             {error, socket_closed_remotely};
@@ -136,16 +164,37 @@ do_request_api(Method, Request, Opts) ->
             {error, Reason}
     end.
 
+simplify_result(Res) ->
+    case Res of
+        {error, {{_, Status, _}, _, Body}} ->
+            {Status, Body};
+        {ok, {{_, Status, _}, _, Body}} ->
+            {Status, Body}
+    end.
+
 auth_header_() ->
     emqx_common_test_http:default_auth_header().
+
+build_query_string(Query = #{}) ->
+    build_query_string(maps:to_list(Query));
+build_query_string(Query = [{_, _} | _]) ->
+    uri_string:compose_query([{emqx_utils_conv:bin(K), V} || {K, V} <- Query]);
+build_query_string(QueryString) ->
+    unicode:characters_to_list(QueryString).
 
 build_http_header(X) when is_list(X) ->
     X;
 build_http_header(X) ->
     [X].
 
+default_server() ->
+    ?SERVER.
+
 api_path(Parts) ->
     join_http_path([?SERVER, ?BASE_PATH | Parts]).
+
+api_path(Host, Parts) ->
+    join_http_path([Host, ?BASE_PATH | Parts]).
 
 api_path_without_base_path(Parts) ->
     join_http_path([?SERVER | Parts]).
@@ -180,7 +229,7 @@ upload_request(URL, FilePath, Name, MimeType, RequestData, AuthorizationToken) -
     Method = post,
     Filename = filename:basename(FilePath),
     {ok, Data} = file:read_file(FilePath),
-    Boundary = emqx_guid:to_base62(emqx_guid:gen()),
+    Boundary = emqx_utils:rand_id(32),
     RequestBody = format_multipart_formdata(
         Data,
         RequestData,
@@ -193,9 +242,13 @@ upload_request(URL, FilePath, Name, MimeType, RequestData, AuthorizationToken) -
     ContentLength = integer_to_list(length(binary_to_list(RequestBody))),
     Headers = [
         {"Content-Length", ContentLength},
-        case AuthorizationToken =/= undefined of
-            true -> {"Authorization", "Bearer " ++ binary_to_list(AuthorizationToken)};
-            false -> {}
+        case AuthorizationToken of
+            _ when is_tuple(AuthorizationToken) ->
+                AuthorizationToken;
+            _ when is_binary(AuthorizationToken) ->
+                {"Authorization", "Bearer " ++ binary_to_list(AuthorizationToken)};
+            _ ->
+                {}
         end
     ],
     HTTPOptions = [],
@@ -257,3 +310,33 @@ format_multipart_formdata(Data, Params, Name, FileNames, MimeType, Boundary) ->
         FileNames
     ),
     erlang:iolist_to_binary([WithPaths, StartBoundary, <<"--">>, LineSeparator]).
+
+maybe_json_decode(X) ->
+    case emqx_utils_json:safe_decode(X, [return_maps]) of
+        {ok, Decoded} -> Decoded;
+        {error, _} -> X
+    end.
+
+simple_request(Method, Path, Params) ->
+    AuthHeader = auth_header_(),
+    simple_request(Method, Path, Params, AuthHeader).
+
+simple_request(Method, Path, Params, AuthHeader) ->
+    Opts = #{return_all => true},
+    case request_api(Method, Path, "", AuthHeader, Params, Opts) of
+        {ok, {{_, Status, _}, _Headers, Body0}} ->
+            Body = maybe_json_decode(Body0),
+            {Status, Body};
+        {error, {{_, Status, _}, _Headers, Body0}} ->
+            Body =
+                case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+                    {ok, Decoded0 = #{<<"message">> := Msg0}} ->
+                        Msg = maybe_json_decode(Msg0),
+                        Decoded0#{<<"message">> := Msg};
+                    {ok, Decoded0} ->
+                        Decoded0;
+                    {error, _} ->
+                        Body0
+                end,
+            {Status, Body}
+    end.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_azure_event_hub_tests).
@@ -12,7 +12,7 @@
 
 %% erlfmt-ignore
 aeh_producer_hocon() ->
-"""
+"
 bridges.azure_event_hub_producer.my_producer {
   enable = true
   authentication {
@@ -33,7 +33,6 @@ bridges.azure_event_hub_producer.my_producer {
     max_inflight = 10
     message {
       key = \"${.clientid}\"
-      timestamp = \"${.timestamp}\"
       value = \"${.}\"
     }
     partition_count_refresh_interval = 60s
@@ -63,7 +62,7 @@ bridges.azure_event_hub_producer.my_producer {
     server_name_indication = auto
   }
 }
-""".
+".
 
 %%===========================================================================
 %% Helper functions
@@ -160,19 +159,19 @@ aeh_producer_test_() ->
             )},
         {"ssl disabled",
             ?_assertThrow(
-                ?validation_error(#{expected := "true"}, "false"),
+                ?validation_error("Expected: true" ++ _, <<"false">>),
                 check(Override(#{<<"ssl">> => #{<<"enable">> => <<"false">>}}))
             )},
         {"bad authn mechanism: scram sha256",
             ?_assertThrow(
-                ?validation_error(#{expected := "plain"}, "scram_sha_256"),
+                ?validation_error("Expected: plain" ++ _, <<"scram_sha_256">>),
                 check(
                     Override(#{<<"authentication">> => #{<<"mechanism">> => <<"scram_sha_256">>}})
                 )
             )},
         {"bad authn mechanism: scram sha512",
             ?_assertThrow(
-                ?validation_error(#{expected := "plain"}, "scram_sha_512"),
+                ?validation_error("Expected: plain" ++ _, <<"scram_sha_512">>),
                 check(
                     Override(#{<<"authentication">> => #{<<"mechanism">> => <<"scram_sha_512">>}})
                 )
@@ -184,12 +183,12 @@ aeh_producer_test_() ->
             )},
         {"bad compression: snappy",
             ?_assertThrow(
-                ?validation_error(#{expected := "no_compression"}, "snappy"),
+                ?validation_error("Expected: no_compression" ++ _, <<"snappy">>),
                 check(Override(#{<<"kafka">> => #{<<"compression">> => <<"snappy">>}}))
             )},
         {"bad compression: gzip",
             ?_assertThrow(
-                ?validation_error(#{expected := "no_compression"}, "gzip"),
+                ?validation_error("Expected: no_compression" ++ _, <<"gzip">>),
                 check(Override(#{<<"kafka">> => #{<<"compression">> => <<"gzip">>}}))
             )}
     ].

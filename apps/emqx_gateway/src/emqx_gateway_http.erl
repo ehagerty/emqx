@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@
 %% @doc Gateway Interface Module for HTTP-APIs
 -module(emqx_gateway_http).
 
--include("include/emqx_gateway.hrl").
+-include("emqx_gateway.hrl").
 -include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/emqx_authentication.hrl").
+-include_lib("emqx_auth/include/emqx_authn_chains.hrl").
 
 -define(AUTHN, ?EMQX_AUTHENTICATION_CONFIG_ROOT_NAME_ATOM).
 
@@ -135,7 +135,9 @@ gateways(Status) ->
     end.
 
 gateway_status(GwName) ->
-    case emqx_gateway:lookup(GwName) of
+    case emqx_gateway:is_gateway_app_started() andalso emqx_gateway:lookup(GwName) of
+        false ->
+            #{node => node(), status => unloaded};
         undefined ->
             #{node => node(), status => unloaded};
         #{status := Status, config := Config} ->
@@ -160,10 +162,10 @@ cluster_gateway_status(GwName) ->
 max_connections_count(Config) ->
     Listeners = emqx_gateway_utils:normalize_config(Config),
     lists:foldl(
-        fun({_, _, _, SocketOpts, _}, Acc) ->
+        fun({_, _, _, Conf0}, Acc) ->
             emqx_gateway_utils:plus_max_connections(
                 Acc,
-                proplists:get_value(max_connections, SocketOpts, 0)
+                maps:get(max_connections, Conf0, 0)
             )
         end,
         0,
@@ -184,7 +186,7 @@ current_connections_count(GwName) ->
 get_listeners_status(GwName, Config) ->
     Listeners = emqx_gateway_utils:normalize_config(Config),
     lists:map(
-        fun({Type, LisName, ListenOn, _, _}) ->
+        fun({Type, LisName, ListenOn, _}) ->
             Name0 = listener_id(GwName, Type, LisName),
             Name = {Name0, ListenOn},
             LisO = #{id => Name0, type => Type, name => LisName},
@@ -257,7 +259,7 @@ authn(GwName, ListenerId) ->
     ).
 
 wrap_chain_name(ChainName, Conf) ->
-    case emqx_authentication:list_authenticators(ChainName) of
+    case emqx_authn_chains:list_authenticators(ChainName) of
         {ok, [#{id := Id} | _]} ->
             Conf#{chain_name => ChainName, id => Id};
         _ ->
@@ -378,6 +380,8 @@ client_call(GwName, ClientId, Req) ->
     of
         undefined ->
             {error, not_found};
+        ignored ->
+            {error, ignored};
         Res ->
             Res
     catch
@@ -488,13 +492,8 @@ reason2msg(
         "The authentication already exist on ~s",
         [listener_id(GwName, LType, LName)]
     );
-reason2msg(
-    {bad_ssl_config, #{
-        reason := Reason,
-        which_options := Options
-    }}
-) ->
-    fmtstr("Bad TLS configuration for ~p, reason: ~s", [Options, Reason]);
+reason2msg({bad_ssl_config, Reason}) ->
+    fmtstr("Bad TLS configuration: ~0p", [Reason]);
 reason2msg(
     {#{roots := [{gateway, _}]}, [_ | _]} = Error
 ) ->
@@ -507,35 +506,29 @@ codestr(400) -> 'BAD_REQUEST';
 codestr(404) -> 'RESOURCE_NOT_FOUND';
 codestr(405) -> 'METHOD_NOT_ALLOWED';
 codestr(409) -> 'NOT_SUPPORT';
-codestr(500) -> 'UNKNOW_ERROR';
+codestr(500) -> 'UNKNOWN_ERROR';
 codestr(501) -> 'NOT_IMPLEMENTED'.
 
 fmtstr(Fmt, Args) ->
     lists:flatten(io_lib:format(Fmt, Args)).
 
--spec with_authn(binary(), function()) -> any().
+-spec with_authn(atom(), function()) -> any().
 with_authn(GwName0, Fun) ->
     with_gateway(GwName0, fun(GwName, _GwConf) ->
         Authn = emqx_gateway_http:authn(GwName),
         Fun(GwName, Authn)
     end).
 
--spec with_listener_authn(binary(), binary(), function()) -> any().
+-spec with_listener_authn(atom(), binary(), function()) -> any().
 with_listener_authn(GwName0, Id, Fun) ->
     with_gateway(GwName0, fun(GwName, _GwConf) ->
         Authn = emqx_gateway_http:authn(GwName, Id),
         Fun(GwName, Authn)
     end).
 
--spec with_gateway(binary(), function()) -> any().
-with_gateway(GwName0, Fun) ->
+-spec with_gateway(atom(), function()) -> any().
+with_gateway(GwName, Fun) ->
     try
-        GwName =
-            try
-                binary_to_existing_atom(GwName0)
-            catch
-                _:_ -> error(badname)
-            end,
         case emqx_gateway:lookup(GwName) of
             undefined ->
                 return_http_error(404, "Gateway not loaded");

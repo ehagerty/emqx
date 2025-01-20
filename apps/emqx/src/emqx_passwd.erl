@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@
 -type salt_position() :: disable | prefix | suffix.
 -type salt() :: binary().
 
--type pbkdf2_mac_fun() :: md4 | md5 | ripemd160 | sha | sha224 | sha256 | sha384 | sha512.
+-type pbkdf2_mac_fun() :: sha | sha224 | sha256 | sha384 | sha512.
 -type pbkdf2_iterations() :: pos_integer().
 -type pbkdf2_dk_length() :: pos_integer() | undefined.
 
@@ -65,12 +65,8 @@ check_pass(Algo, Hash, Password) ->
     do_check_pass(Algo, Hash, Password).
 
 do_check_pass({pbkdf2, MacFun, Salt, Iterations, DKLength}, PasswordHash, Password) ->
-    case pbkdf2(MacFun, Password, Salt, Iterations, DKLength) of
-        {ok, HashPasswd} ->
-            compare_secure(hex(HashPasswd), PasswordHash);
-        {error, _Reason} ->
-            false
-    end;
+    HashPasswd = pbkdf2(MacFun, Password, Salt, Iterations, DKLength),
+    compare_secure(hex(HashPasswd), PasswordHash);
 do_check_pass({bcrypt, Salt}, PasswordHash, Password) ->
     case bcrypt:hashpw(Password, Salt) of
         {ok, HashPasswd} ->
@@ -83,13 +79,9 @@ do_check_pass({_SimpleHash, _Salt, _SaltPosition} = HashParams, PasswordHash, Pa
     compare_secure(Hash, PasswordHash).
 
 -spec hash(hash_params(), password()) -> password_hash().
-hash({pbkdf2, MacFun, Salt, Iterations, DKLength}, Password) ->
-    case pbkdf2(MacFun, Password, Salt, Iterations, DKLength) of
-        {ok, HashPasswd} ->
-            hex(HashPasswd);
-        {error, Reason} ->
-            error(Reason)
-    end;
+hash({pbkdf2, MacFun, Salt, Iterations, DKLength}, Password) when Iterations > 0 ->
+    HashPasswd = pbkdf2(MacFun, Password, Salt, Iterations, DKLength),
+    hex(HashPasswd);
 hash({bcrypt, Salt}, Password) ->
     case bcrypt:hashpw(Password, Salt) of
         {ok, HashPasswd} ->
@@ -102,7 +94,11 @@ hash({SimpleHash, _Salt, disable}, Password) when is_binary(Password) ->
 hash({SimpleHash, Salt, prefix}, Password) when is_binary(Password), is_binary(Salt) ->
     hash_data(SimpleHash, <<Salt/binary, Password/binary>>);
 hash({SimpleHash, Salt, suffix}, Password) when is_binary(Password), is_binary(Salt) ->
-    hash_data(SimpleHash, <<Password/binary, Salt/binary>>).
+    hash_data(SimpleHash, <<Password/binary, Salt/binary>>);
+hash({_SimpleHash, Salt, _SaltPos}, _Password) when not is_binary(Salt) ->
+    error({salt_not_string, Salt});
+hash({_SimpleHash, _Salt, _SaltPos}, Password) when not is_binary(Password) ->
+    error({password_not_string, Password}).
 
 -spec hash_data(hash_type(), binary()) -> binary().
 hash_data(plain, Data) when is_binary(Data) ->
@@ -135,10 +131,38 @@ compare_secure([X | RestX], [Y | RestY], Result) ->
 compare_secure([], [], Result) ->
     Result == 0.
 
+-define(MAX_DERIVED_KEY_LENGTH, (1 bsl 32 - 1)).
 pbkdf2(MacFun, Password, Salt, Iterations, undefined) ->
-    pbkdf2:pbkdf2(MacFun, Password, Salt, Iterations);
+    crypto:pbkdf2_hmac(MacFun, Password, Salt, Iterations, dk_length(MacFun));
+pbkdf2(_MacFun, _Password, _Salt, _Iterations, DKLength) when DKLength > ?MAX_DERIVED_KEY_LENGTH ->
+    %% backword compatible with the old implementation in pbkdf2
+    error(dklength_too_long);
 pbkdf2(MacFun, Password, Salt, Iterations, DKLength) ->
-    pbkdf2:pbkdf2(MacFun, Password, Salt, Iterations, DKLength).
+    crypto:pbkdf2_hmac(MacFun, Password, Salt, Iterations, DKLength).
 
 hex(X) when is_binary(X) ->
-    pbkdf2:to_hex(X).
+    %% TODO: change to binary:encode_hex(X, lowercase) when OTP version is always > 25
+    string:lowercase(binary:encode_hex(X)).
+
+%% @doc default derived key length for PBKDF2, backword compatible with the old implementation in pbkdf2
+-spec dk_length(pbkdf2_mac_fun()) -> non_neg_integer().
+dk_length(sha) -> 20;
+dk_length(sha224) -> 28;
+dk_length(sha256) -> 32;
+dk_length(sha384) -> 48;
+dk_length(sha512) -> 64.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+len_match(Alg) ->
+    DKLength = byte_size(crypto:mac(hmac, Alg, <<"test key">>, <<"test data">>)),
+    dk_length(Alg) =:= DKLength.
+
+dk_length_test_() ->
+    [
+        ?_assert(len_match(Alg))
+     || Alg <- [sha, sha224, sha256, sha384, sha512]
+    ].
+
+-endif.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 -compile(export_all).
 
 -import(emqx_mgmt_api_test_util, [uri/1]).
+-import(emqx_common_test_helpers, [on_exit/1]).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -73,12 +74,15 @@
 -define(HTTP_BRIDGE(URL), ?HTTP_BRIDGE(URL, ?BRIDGE_NAME)).
 
 -define(APPSPECS, [
-    emqx_conf,
     emqx,
-    emqx_authn,
+    emqx_conf,
+    emqx_auth,
+    emqx_auth_mnesia,
     emqx_management,
-    {emqx_rule_engine, "rule_engine { rules {} }"},
-    {emqx_bridge, "bridges {}"}
+    emqx_connector,
+    emqx_bridge_http,
+    {emqx_bridge, "actions {}\n bridges {}"},
+    {emqx_rule_engine, "rule_engine { rules {} }"}
 ]).
 
 -define(APPSPEC_DASHBOARD,
@@ -107,7 +111,7 @@ groups() ->
     ].
 
 suite() ->
-    [{timetrap, {seconds, 60}}].
+    [{timetrap, {seconds, 120}}].
 
 init_per_suite(Config) ->
     Config.
@@ -121,8 +125,8 @@ init_per_group(cluster = Name, Config) ->
 init_per_group(cluster_later_join = Name, Config) ->
     Nodes = [NodePrimary | _] = mk_cluster(Name, Config, #{join_to => undefined}),
     init_api([{group, Name}, {cluster_nodes, Nodes}, {node, NodePrimary} | Config]);
-init_per_group(Name, Config) ->
-    WorkDir = filename:join(?config(priv_dir, Config), Name),
+init_per_group(_Name, Config) ->
+    WorkDir = emqx_cth_suite:work_dir(Config),
     Apps = emqx_cth_suite:start(?APPSPECS ++ [?APPSPEC_DASHBOARD], #{work_dir => WorkDir}),
     init_api([{group, single}, {group_apps, Apps}, {node, node()} | Config]).
 
@@ -142,7 +146,7 @@ mk_cluster(Name, Config, Opts) ->
             {emqx_bridge_api_SUITE1, Opts#{role => core, apps => Node1Apps}},
             {emqx_bridge_api_SUITE2, Opts#{role => core, apps => Node2Apps}}
         ],
-        #{work_dir => filename:join(?config(priv_dir, Config), Name)}
+        #{work_dir => emqx_cth_suite:work_dir(Name, Config)}
     ).
 
 end_per_group(Group, Config) when
@@ -156,9 +160,10 @@ end_per_group(_, Config) ->
 
 init_per_testcase(t_broken_bpapi_vsn, Config) ->
     meck:new(emqx_bpapi, [passthrough]),
-    meck:expect(emqx_bpapi, supported_version, 1, -1),
     meck:expect(emqx_bpapi, supported_version, 2, -1),
-    init_per_testcase(commong, Config);
+    meck:new(emqx_bridge_api, [passthrough]),
+    meck:expect(emqx_bridge_api, supported_versions, 1, []),
+    init_per_testcase(common, Config);
 init_per_testcase(t_old_bpapi_vsn, Config) ->
     meck:new(emqx_bpapi, [passthrough]),
     meck:expect(emqx_bpapi, supported_version, 1, 1),
@@ -169,10 +174,10 @@ init_per_testcase(_, Config) ->
     [{port, Port}, {sock, Sock}, {acceptor, Acceptor} | Config].
 
 end_per_testcase(t_broken_bpapi_vsn, Config) ->
-    meck:unload([emqx_bpapi]),
+    meck:unload(),
     end_per_testcase(common, Config);
 end_per_testcase(t_old_bpapi_vsn, Config) ->
-    meck:unload([emqx_bpapi]),
+    meck:unload(),
     end_per_testcase(common, Config);
 end_per_testcase(_, Config) ->
     Sock = ?config(sock, Config),
@@ -184,9 +189,10 @@ end_per_testcase(_, Config) ->
     ok.
 
 clear_resources() ->
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     lists:foreach(
         fun(#{type := Type, name := Name}) ->
-            {ok, _} = emqx_bridge:remove(Type, Name)
+            ok = emqx_bridge:remove(Type, Name)
         end,
         emqx_bridge:list()
     ).
@@ -406,10 +412,7 @@ t_http_crud_apis(Config) ->
         Config
     ),
     ?assertMatch(
-        #{
-            <<"reason">> := <<"unknown_fields">>,
-            <<"unknown">> := <<"curl">>
-        },
+        #{<<"reason">> := <<"required_field">>},
         json(maps:get(<<"message">>, PutFail2))
     ),
     {ok, 400, _} = request_json(
@@ -418,11 +421,15 @@ t_http_crud_apis(Config) ->
         ?HTTP_BRIDGE(<<"localhost:1234/foo">>, Name),
         Config
     ),
-    {ok, 400, _} = request_json(
+    {ok, 400, PutFail3} = request_json(
         put,
         uri(["bridges", BridgeID]),
         ?HTTP_BRIDGE(<<"htpp://localhost:12341234/foo">>, Name),
         Config
+    ),
+    ?assertMatch(
+        #{<<"kind">> := <<"validation_error">>},
+        json(maps:get(<<"message">>, PutFail3))
     ),
 
     %% delete the bridge
@@ -462,7 +469,7 @@ t_http_crud_apis(Config) ->
     ),
 
     %% Create non working bridge
-    BrokenURL = ?URL(Port + 1, "/foo"),
+    BrokenURL = ?URL(Port + 1, "foo"),
     {ok, 201, BrokenBridge} = request(
         post,
         uri(["bridges"]),
@@ -470,6 +477,7 @@ t_http_crud_apis(Config) ->
         fun json/1,
         Config
     ),
+
     ?assertMatch(
         #{
             <<"type">> := ?BRIDGE_TYPE_HTTP,
@@ -604,9 +612,10 @@ t_check_dependent_actions_on_delete(Config) ->
         Config
     ),
     %% deleting the bridge should fail because there is a rule that depends on it
-    {ok, 400, _} = request(
+    {ok, 400, Body} = request(
         delete, uri(["bridges", BridgeID]) ++ "?also_delete_dep_actions=false", Config
     ),
+    ?assertMatch(#{<<"rules">> := [_ | _]}, emqx_utils_json:decode(Body, [return_maps])),
     %% delete the rule first
     {ok, 204, <<>>} = request(delete, uri(["rules", RuleId]), Config),
     %% then delete the bridge is OK
@@ -816,22 +825,53 @@ do_start_stop_bridges(Type, Config) ->
     %% Connecting to this endpoint should always timeout
     BadServer = iolist_to_binary(io_lib:format("localhost:~B", [ListenPort])),
     BadName = <<"bad_", (atom_to_binary(Type))/binary>>,
+    CreateRes0 = request_json(
+        post,
+        uri(["bridges"]),
+        ?MQTT_BRIDGE(BadServer, BadName),
+        Config
+    ),
     ?assertMatch(
         {ok, 201, #{
             <<"type">> := ?BRIDGE_TYPE_MQTT,
             <<"name">> := BadName,
             <<"enable">> := true,
-            <<"server">> := BadServer,
-            <<"status">> := <<"connecting">>,
-            <<"node_status">> := [_ | _]
+            <<"server">> := BadServer
         }},
-        request_json(
-            post,
-            uri(["bridges"]),
-            ?MQTT_BRIDGE(BadServer, BadName),
-            Config
-        )
+        CreateRes0
     ),
+    {ok, 201, CreateRes1} = CreateRes0,
+    case CreateRes1 of
+        #{
+            <<"node_status">> := [
+                #{
+                    <<"status">> := <<"disconnected">>,
+                    <<"status_reason">> := <<"connack_timeout">>
+                },
+                #{<<"status">> := <<"connecting">>}
+                | _
+            ],
+            %% `inconsistent': one node is `?status_disconnected' (because it has already
+            %% timed out), the other node is `?status_connecting' (started later and
+            %% haven't timed out yet)
+            <<"status">> := <<"inconsistent">>,
+            <<"status_reason">> := <<"connack_timeout">>
+        } ->
+            ok;
+        #{
+            <<"node_status">> := [_, _ | _],
+            <<"status">> := <<"disconnected">>,
+            <<"status_reason">> := <<"connack_timeout">>
+        } ->
+            ok;
+        #{
+            <<"node_status">> := [_],
+            <<"status">> := <<"connecting">>
+        } ->
+            ok;
+        _ ->
+            error({unexpected_result, CreateRes1})
+    end,
     BadBridgeID = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_MQTT, BadName),
     ?assertMatch(
         %% request from product: return 400 on such errors
@@ -864,7 +904,7 @@ start_stop_inconsistent_bridge(Type, Config) ->
         )
     end),
 
-    emqx_common_test_helpers:on_exit(fun() ->
+    on_exit(fun() ->
         erpc:call(Node, fun() ->
             meck:unload([emqx_bridge_resource])
         end)
@@ -981,6 +1021,8 @@ t_reset_bridges(Config) ->
     {ok, 200, []} = request_json(get, uri(["bridges"]), Config).
 
 t_with_redact_update(Config) ->
+    ok = snabbkaffe:start_trace(),
+    on_exit(fun() -> ok = snabbkaffe:stop() end),
     Name = <<"redact_update">>,
     Type = <<"mqtt">>,
     Password = <<"123456">>,
@@ -1005,10 +1047,34 @@ t_with_redact_update(Config) ->
     BridgeConf = emqx_utils:redact(Template),
     BridgeID = emqx_bridge_resource:bridge_id(Type, Name),
     {ok, 200, _} = request(put, uri(["bridges", BridgeID]), BridgeConf, Config),
+    %% bridge is migrated after creation
+    ConfigRootKey = connectors,
     ?assertEqual(
         Password,
-        get_raw_config([bridges, Type, Name, password], Config)
+        get_raw_config([ConfigRootKey, Type, Name, password], Config)
     ),
+
+    %% probe with new password; should not be considered redacted
+    {_, {ok, #{params := UsedParams}}} =
+        ?wait_async_action(
+            request(
+                post,
+                uri(["bridges_probe"]),
+                Template#{<<"password">> := <<"newpassword">>},
+                Config
+            ),
+            #{?snk_kind := bridge_v1_api_dry_run},
+            1_000
+        ),
+    UsedPassword0 = maps:get(<<"password">>, UsedParams),
+    %% the password field schema makes
+    %% `emqx_dashboard_swagger:filter_check_request_and_translate_body' wrap the password.
+    %% hack: this fails with `badfun' in CI only, due to cover compile, if not evaluated
+    %% in the original node...
+    PrimaryNode = ?config(node, Config),
+    erpc:call(PrimaryNode, fun() -> ?assertEqual(<<"newpassword">>, UsedPassword0()) end),
+    ok = snabbkaffe:stop(),
+
     ok.
 
 t_bridges_probe(Config) ->
@@ -1027,6 +1093,13 @@ t_bridges_probe(Config) ->
         post,
         uri(["bridges_probe"]),
         ?HTTP_BRIDGE(URL),
+        Config
+    ),
+    %% with descriptions is ok.
+    {ok, 204, <<>>} = request(
+        post,
+        uri(["bridges_probe"]),
+        (?HTTP_BRIDGE(URL))#{<<"description">> => <<"Test Description">>},
         Config
     ),
 
@@ -1081,7 +1154,7 @@ t_bridges_probe(Config) ->
     ?assertMatch(
         {ok, 400, #{
             <<"code">> := <<"TEST_FAILED">>,
-            <<"message">> := <<"Connection refused">>
+            <<"message">> := <<"Connection refused", _/binary>>
         }},
         request_json(
             post,
@@ -1124,7 +1197,7 @@ t_bridges_probe(Config) ->
         Config
     ),
 
-    emqx_common_test_helpers:on_exit(fun() ->
+    on_exit(fun() ->
         delete_user_auth(Chain, AuthenticatorID, User, Config)
     end),
 
@@ -1306,7 +1379,9 @@ t_cluster_later_join_metrics(Config) ->
     Name = ?BRIDGE_NAME,
     BridgeParams = ?HTTP_BRIDGE(URL1, Name),
     BridgeID = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_HTTP, Name),
+
     ?check_trace(
+        #{timetrap => 15_000},
         begin
             %% Create a bridge on only one of the nodes.
             ?assertMatch({ok, 201, _}, request_json(post, uri(["bridges"]), BridgeParams, Config)),
@@ -1318,8 +1393,26 @@ t_cluster_later_join_metrics(Config) ->
                 }},
                 request_json(get, uri(["bridges", BridgeID, "metrics"]), Config)
             ),
+
+            ct:print("node joining cluster"),
             %% Now join the other node join with the api node.
             ok = erpc:call(OtherNode, ekka, join, [PrimaryNode]),
+            %% Hack / workaround for the fact that `emqx_machine_boot' doesn't restart the
+            %% applications, in particular `emqx_conf' doesn't restart and synchronize the
+            %% transaction id.  It's also unclear at the moment why the equivalent test in
+            %% `emqx_bridge_v2_api_SUITE' doesn't need this hack.
+            ok = erpc:call(OtherNode, application, stop, [emqx_conf]),
+            ok = erpc:call(OtherNode, application, start, [emqx_conf]),
+            ct:print("node joined cluster"),
+
+            %% assert: wait for the bridge to be ready on the other node.
+            {_, {ok, _}} =
+                ?wait_async_action(
+                    {emqx_cluster_rpc, OtherNode} ! wake_up,
+                    #{?snk_kind := cluster_rpc_caught_up, ?snk_meta := #{node := OtherNode}},
+                    10_000
+                ),
+
             %% Check metrics; shouldn't crash even if the bridge is not
             %% ready on the node that just joined the cluster.
             ?assertMatch(
@@ -1335,19 +1428,53 @@ t_cluster_later_join_metrics(Config) ->
     ),
     ok.
 
+t_create_with_bad_name(Config) ->
+    Port = ?config(port, Config),
+    URL1 = ?URL(Port, "path1"),
+    Name = <<"test_哈哈"/utf8>>,
+    BadBridgeParams =
+        emqx_utils_maps:deep_merge(
+            ?HTTP_BRIDGE(URL1, Name),
+            #{
+                <<"ssl">> =>
+                    #{
+                        <<"enable">> => true,
+                        <<"certfile">> => cert_file("certfile")
+                    }
+            }
+        ),
+    {ok, 400, #{
+        <<"code">> := <<"BAD_REQUEST">>,
+        <<"message">> := Msg0
+    }} =
+        request_json(
+            post,
+            uri(["bridges"]),
+            BadBridgeParams,
+            Config
+        ),
+    Msg = emqx_utils_json:decode(Msg0, [return_maps]),
+    ?assertMatch(
+        #{
+            <<"kind">> := <<"validation_error">>,
+            <<"reason">> := <<"invalid_map_key">>
+        },
+        Msg
+    ),
+    ok.
+
 validate_resource_request_ttl(single, Timeout, Name) ->
     SentData = #{payload => <<"Hello EMQX">>, timestamp => 1668602148000},
-    BridgeID = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_HTTP, Name),
-    ResId = emqx_bridge_resource:resource_id(<<"webhook">>, Name),
+    _BridgeID = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_HTTP, Name),
     ?check_trace(
         begin
             {ok, Res} =
                 ?wait_async_action(
-                    emqx_bridge:send_message(BridgeID, SentData),
+                    do_send_message(?BRIDGE_TYPE_HTTP, Name, SentData),
                     #{?snk_kind := async_query},
                     1000
                 ),
-            ?assertMatch({ok, #{id := ResId, query_opts := #{timeout := Timeout}}}, Res)
+            ?assertMatch({ok, #{id := _ResId, query_opts := #{timeout := Timeout}}}, Res)
         end,
         fun(Trace0) ->
             Trace = ?of_kind(async_query, Trace0),
@@ -1357,6 +1484,10 @@ validate_resource_request_ttl(single, Timeout, Name) ->
     );
 validate_resource_request_ttl(_Cluster, _Timeout, _Name) ->
     ignore.
+
+do_send_message(BridgeV1Type, Name, Message) ->
+    Type = emqx_bridge_v2:bridge_v1_type_to_bridge_v2_type(BridgeV1Type),
+    emqx_bridge_v2:send_message(Type, Name, Message, #{}).
 
 %%
 
@@ -1407,14 +1538,22 @@ get_raw_config(Path, Config) ->
 
 add_user_auth(Chain, AuthenticatorID, User, Config) ->
     Node = ?config(node, Config),
-    erpc:call(Node, emqx_authentication, add_user, [Chain, AuthenticatorID, User]).
+    erpc:call(Node, emqx_authn_chains, add_user, [Chain, AuthenticatorID, User]).
 
 delete_user_auth(Chain, AuthenticatorID, User, Config) ->
     Node = ?config(node, Config),
-    erpc:call(Node, emqx_authentication, delete_user, [Chain, AuthenticatorID, User]).
+    erpc:call(Node, emqx_authn_chains, delete_user, [Chain, AuthenticatorID, User]).
 
 str(S) when is_list(S) -> S;
 str(S) when is_binary(S) -> binary_to_list(S).
 
 json(B) when is_binary(B) ->
     emqx_utils_json:decode(B, [return_maps]).
+
+data_file(Name) ->
+    Dir = code:lib_dir(emqx_bridge),
+    {ok, Bin} = file:read_file(filename:join([Dir, "test", "data", Name])),
+    Bin.
+
+cert_file(Name) ->
+    data_file(filename:join(["certs", Name])).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_out/3,
     handle_deliver/2,
     handle_timeout/3,
@@ -69,7 +70,7 @@
     %% Channel State
     conn_state :: conn_state(),
     %% Heartbeat
-    heartbeat :: emqx_stomp_heartbeat:heartbeat(),
+    heartbeat :: undefined | emqx_stomp_heartbeat:heartbeat(),
     %% Subscriptions
     subscriptions = [],
     %% Timer
@@ -93,7 +94,8 @@
 -define(TIMER_TABLE, #{
     incoming_timer => keepalive,
     outgoing_timer => keepalive_send,
-    clean_trans_timer => clean_trans
+    clean_trans_timer => clean_trans,
+    connection_expire_timer => connection_expire
 }).
 
 -define(TRANS_TIMEOUT, 60000).
@@ -108,6 +110,7 @@
 ).
 
 -define(INFO_KEYS, [conninfo, conn_state, clientinfo, session, will_msg]).
+-define(RAND_CLIENTID_BYETS, 16).
 
 %%--------------------------------------------------------------------
 %% Init the channel
@@ -116,7 +119,7 @@
 %% @doc Init protocol
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     Option
@@ -136,6 +139,7 @@ init(
             listener => ListenerId,
             protocol => stomp,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -276,6 +280,18 @@ assign_clientid_to_conninfo(
     NConnInfo = maps:put(clientid, ClientId, ConnInfo),
     {ok, Packet, Channel#channel{conninfo = NConnInfo}}.
 
+assign_keepalive_to_conninfo(
+    Packet,
+    Channel = #channel{
+        conninfo = ConnInfo,
+        clientinfo = ClientInfo
+    }
+) ->
+    {Cx, _Cy} = maps:get(heartbeat, ClientInfo),
+    Keepalive = floor(Cx / 1000),
+    NConnInfo = maps:put(keepalive, Keepalive, ConnInfo),
+    {ok, Packet, Channel#channel{conninfo = NConnInfo}}.
+
 feedvar(Override, Packet, ConnInfo, ClientInfo) ->
     Envs = #{
         'ConnInfo' => ConnInfo,
@@ -301,7 +317,7 @@ maybe_assign_clientid(_Packet, ClientInfo = #{clientid := ClientId}) when
     ClientId == undefined;
     ClientId == <<>>
 ->
-    {ok, ClientInfo#{clientid => emqx_guid:to_base62(emqx_guid:gen())}};
+    {ok, ClientInfo#{clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYETS)}};
 maybe_assign_clientid(_Packet, ClientInfo) ->
     {ok, ClientInfo}.
 
@@ -356,10 +372,18 @@ ensure_connected(
 ) ->
     NConnInfo = ConnInfo#{connected_at => erlang:system_time(millisecond)},
     ok = run_hooks(Ctx, 'client.connected', [ClientInfo, NConnInfo]),
-    Channel#channel{
+    schedule_connection_expire(Channel#channel{
         conninfo = NConnInfo,
         conn_state = connected
-    }.
+    }).
+
+schedule_connection_expire(Channel = #channel{ctx = Ctx, clientinfo = ClientInfo}) ->
+    case emqx_gateway_ctx:connection_expire_interval(Ctx, ClientInfo) of
+        undefined ->
+            Channel;
+        Interval ->
+            ensure_timer(connection_expire_timer, Interval, Channel)
+    end.
 
 process_connect(
     Channel = #channel{
@@ -395,7 +419,8 @@ process_connect(
                 {<<"version">>, <<"1.0,1.1,1.2">>},
                 {<<"content-type">>, <<"text/plain">>}
             ],
-            handle_out(connerr, {Headers, undefined, <<"Not Authenticated">>}, Channel)
+            ErrMsg = io_lib:format("Failed to open session: ~ts", [Reason]),
+            handle_out(connerr, {Headers, undefined, failed_to_open_session, ErrMsg}, Channel)
     end.
 
 %%--------------------------------------------------------------------
@@ -423,6 +448,7 @@ handle_in(Packet = ?PACKET(?CMD_CONNECT), Channel) ->
                 fun negotiate_version/2,
                 fun enrich_clientinfo/2,
                 fun assign_clientid_to_conninfo/2,
+                fun assign_keepalive_to_conninfo/2,
                 fun run_conn_hooks/2,
                 fun set_log_meta/2,
                 %% TODO: How to implement the banned in the gateway instance?
@@ -437,7 +463,7 @@ handle_in(Packet = ?PACKET(?CMD_CONNECT), Channel) ->
             process_connect(ensure_connected(NChannel));
         {error, ReasonCode, NChannel} ->
             ErrMsg = io_lib:format("Login Failed: ~ts", [ReasonCode]),
-            handle_out(connerr, {[], undefined, ErrMsg}, NChannel)
+            handle_out(connerr, {[], undefined, ReasonCode, ErrMsg}, NChannel)
     end;
 handle_in(
     Frame = ?PACKET(?CMD_SEND, Headers),
@@ -549,7 +575,7 @@ handle_in(
                 ok = emqx_broker:unsubscribe(MountedTopic),
                 _ = run_hooks(
                     Ctx,
-                    'session.unsubscribe',
+                    'session.unsubscribed',
                     [ClientInfo, MountedTopic, #{}]
                 ),
                 {ok, Channel#channel{subscriptions = lists:keydelete(SubId, 1, Subs)}};
@@ -653,9 +679,17 @@ handle_in(
                 ]
         end,
     {ok, Outgoings, Channel};
-handle_in({frame_error, Reason}, Channel = #channel{conn_state = idle}) ->
+handle_in(
+    ?PACKET(?CMD_HEARTBEAT),
+    Channel = #channel{heartbeat = Heartbeat}
+) ->
+    NewVal = emqx_pd:get_counter(recv_pkt),
+    NewHeartbeat = emqx_stomp_heartbeat:reset(incoming, NewVal, Heartbeat),
+    {ok, Channel#channel{heartbeat = NewHeartbeat}}.
+
+handle_frame_error(Reason, Channel = #channel{conn_state = idle}) ->
     shutdown(Reason, Channel);
-handle_in({frame_error, Reason}, Channel = #channel{conn_state = _ConnState}) ->
+handle_frame_error(Reason, Channel = #channel{conn_state = _ConnState}) ->
     ErrMsg = io_lib:format("Frame error: ~0p", [Reason]),
     Frame = error_frame(undefined, ErrMsg),
     shutdown(Reason, Frame, Channel).
@@ -762,9 +796,9 @@ do_subscribe(
     | {shutdown, Reason :: term(), channel()}
     | {shutdown, Reason :: term(), replies(), channel()}.
 
-handle_out(connerr, {Headers, ReceiptId, ErrMsg}, Channel) ->
+handle_out(connerr, {Headers, ReceiptId, ErrCode, ErrMsg}, Channel) ->
     Frame = error_frame(Headers, ReceiptId, ErrMsg),
-    shutdown(ErrMsg, Frame, Channel);
+    shutdown(ErrCode, Frame, Channel);
 handle_out(error, {ReceiptId, ErrMsg}, Channel) ->
     Frame = error_frame(ReceiptId, ErrMsg),
     {ok, {outgoing, Frame}, Channel};
@@ -869,7 +903,7 @@ handle_call(
     ok = emqx_broker:unsubscribe(MountedTopic),
     _ = run_hooks(
         Ctx,
-        'session.unsubscribe',
+        'session.unsubscribed',
         [ClientInfo, MountedTopic, #{}]
     ),
     reply(
@@ -963,13 +997,12 @@ handle_info(
     NChannel = ensure_disconnected(Reason, Channel),
     shutdown(Reason, NChannel);
 handle_info(
-    {sock_closed, Reason},
+    {sock_closed, _Reason},
     Channel = #channel{conn_state = disconnected}
 ) ->
-    ?SLOG(error, #{
-        msg => "unexpected_sock_closed",
-        reason => Reason
-    }),
+    %% This can happen as a race:
+    %% EMQX closes socket and marks 'disconnected' but 'tcp_closed' or 'ssl_closed'
+    %% is already in process mailbox
     {ok, Channel};
 handle_info(clean_authz_cache, Channel) ->
     ok = emqx_authz_cache:empty_authz_cache(),
@@ -1040,7 +1073,7 @@ handle_deliver(
                         {<<"subscription">>, Id},
                         {<<"message-id">>, next_msgid()},
                         {<<"destination">>, emqx_message:topic(NMessage)},
-                        {<<"content-type">>, <<"text/plain">>}
+                        {<<"content-type">>, content_type_from_mqtt_message(NMessage)}
                     ],
                     Headers1 =
                         case Ack of
@@ -1052,9 +1085,16 @@ handle_deliver(
                             _ ->
                                 Headers0
                         end,
+                    Headers2 = lists:foldl(
+                        fun({Key, _Val} = KV, Acc1) ->
+                            lists:keystore(Key, 1, Acc1, KV)
+                        end,
+                        Headers1,
+                        maps:get(stomp_headers, Headers, [])
+                    ),
                     Frame = #stomp_frame{
                         command = <<"MESSAGE">>,
-                        headers = Headers1 ++ maps:get(stomp_headers, Headers, []),
+                        headers = Headers2,
                         body = Payload
                     },
                     [Frame | Acc];
@@ -1073,6 +1113,13 @@ handle_deliver(
         Delivers
     ),
     {ok, [{outgoing, lists:reverse(Frames0)}], Channel}.
+
+content_type_from_mqtt_message(Message) ->
+    Properties = emqx_message:get_header(properties, Message, #{}),
+    case maps:get('Content-Type', Properties, undefined) of
+        undefined -> <<"text/plain">>;
+        ContentType -> ContentType
+    end.
 
 %%--------------------------------------------------------------------
 %% Handle timeout
@@ -1103,19 +1150,9 @@ handle_timeout(
     {keepalive_send, NewVal},
     Channel = #channel{heartbeat = HrtBt}
 ) ->
-    case emqx_stomp_heartbeat:check(outgoing, NewVal, HrtBt) of
-        {error, timeout} ->
-            NHrtBt = emqx_stomp_heartbeat:reset(outgoing, NewVal, HrtBt),
-            NChannel = Channel#channel{heartbeat = NHrtBt},
-            {ok, {outgoing, emqx_stomp_frame:make(?CMD_HEARTBEAT)},
-                reset_timer(outgoing_timer, NChannel)};
-        {ok, NHrtBt} ->
-            {ok,
-                reset_timer(
-                    outgoing_timer,
-                    Channel#channel{heartbeat = NHrtBt}
-                )}
-    end;
+    NHrtBt = emqx_stomp_heartbeat:reset(outgoing, NewVal, HrtBt),
+    NChannel = Channel#channel{heartbeat = NHrtBt},
+    {ok, {outgoing, emqx_stomp_frame:make(?CMD_HEARTBEAT)}, reset_timer(outgoing_timer, NChannel)};
 handle_timeout(_TRef, clean_trans, Channel = #channel{transaction = Trans}) ->
     Now = erlang:system_time(millisecond),
     NTrans = maps:filter(
@@ -1124,7 +1161,10 @@ handle_timeout(_TRef, clean_trans, Channel = #channel{transaction = Trans}) ->
         end,
         Trans
     ),
-    {ok, ensure_clean_trans_timer(Channel#channel{transaction = NTrans})}.
+    {ok, ensure_clean_trans_timer(Channel#channel{transaction = NTrans})};
+handle_timeout(_TRef, connection_expire, Channel) ->
+    %% No session take over implemented, just shut down
+    shutdown(expired, Channel).
 
 %%--------------------------------------------------------------------
 %% Terminate
@@ -1160,12 +1200,12 @@ do_negotiate_version(Accepts) ->
         lists:reverse(lists:sort(binary:split(Accepts, <<",">>, [global])))
     ).
 
-do_negotiate_version(Ver, []) ->
-    {error, <<"Supported protocol versions < ", Ver/binary>>};
 do_negotiate_version(Ver, [AcceptVer | _]) when Ver >= AcceptVer ->
     {ok, AcceptVer};
 do_negotiate_version(Ver, [_ | T]) ->
-    do_negotiate_version(Ver, T).
+    do_negotiate_version(Ver, T);
+do_negotiate_version(Ver, _) ->
+    {error, <<"Supported protocol versions < ", Ver/binary>>}.
 
 header(Name, Headers) ->
     get_value(Name, Headers).
@@ -1227,7 +1267,6 @@ frame2message(
         [
             <<"destination">>,
             <<"content-length">>,
-            <<"content-type">>,
             <<"transaction">>,
             <<"receipt">>
         ]

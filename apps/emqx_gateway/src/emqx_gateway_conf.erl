@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@
 ]).
 
 -include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/emqx_authentication.hrl").
+-include_lib("emqx_auth/include/emqx_authn_chains.hrl").
 -define(AUTHN_BIN, ?EMQX_AUTHENTICATION_CONFIG_ROOT_NAME_BINARY).
 
 -type atom_or_bin() :: atom() | binary().
@@ -132,7 +132,7 @@ maps_key_take([K | Ks], M, Acc) ->
 
 validate_listener_name(Name) ->
     try
-        {match, _} = re:run(Name, "^[0-9a-zA-Z_-]+$"),
+        {match, _} = re:run(Name, "^[a-zA-Z][0-9a-zA-Z_-]*$"),
         ok
     catch
         _:_ ->
@@ -140,7 +140,7 @@ validate_listener_name(Name) ->
                 {badconf, #{
                     key => name,
                     value => Name,
-                    reason => illegal_listener_name
+                    reason => bad_listener_name
                 }}
             )
     end.
@@ -208,7 +208,7 @@ listeners(GwName0) ->
     ),
     Listeners = emqx_utils_maps:jsonable_map(
         emqx_utils_maps:deep_get(
-            [<<"gateway">>, GwName, <<"listeners">>], RawConf
+            [<<"gateway">>, GwName, <<"listeners">>], RawConf, #{}
         )
     ),
     convert_listeners(GwName, Listeners).
@@ -456,7 +456,7 @@ pre_config_update(?GATEWAY, {add_authn, GwName, Conf}, RawConf) ->
     case get_authn(GwName, RawConf) of
         undefined ->
             CertsDir = authn_certs_dir(GwName, Conf),
-            Conf1 = emqx_authentication_config:convert_certs(CertsDir, Conf),
+            Conf1 = emqx_authn_config:convert_certs(CertsDir, Conf),
             {ok,
                 emqx_utils_maps:deep_merge(
                     RawConf,
@@ -473,7 +473,7 @@ pre_config_update(?GATEWAY, {add_authn, GwName, {LType, LName}, Conf}, RawConf) 
             case maps:get(?AUTHN_BIN, Listener, undefined) of
                 undefined ->
                     CertsDir = authn_certs_dir(GwName, LType, LName, Conf),
-                    Conf1 = emqx_authentication_config:convert_certs(CertsDir, Conf),
+                    Conf1 = emqx_authn_config:convert_certs(CertsDir, Conf),
                     NListener = maps:put(?AUTHN_BIN, Conf1, Listener),
                     NGateway = #{
                         GwName =>
@@ -494,7 +494,7 @@ pre_config_update(?GATEWAY, {update_authn, GwName, Conf}, RawConf) ->
             badres_authn(not_found, GwName);
         _OldConf ->
             CertsDir = authn_certs_dir(GwName, Conf),
-            Conf1 = emqx_authentication_config:convert_certs(CertsDir, Conf),
+            Conf1 = emqx_authn_config:convert_certs(CertsDir, Conf),
             {ok, emqx_utils_maps:deep_put(Path, RawConf, Conf1)}
     end;
 pre_config_update(?GATEWAY, {update_authn, GwName, {LType, LName}, Conf}, RawConf) ->
@@ -508,7 +508,7 @@ pre_config_update(?GATEWAY, {update_authn, GwName, {LType, LName}, Conf}, RawCon
                     badres_listener_authn(not_found, GwName, LType, LName);
                 OldAuthnConf ->
                     CertsDir = authn_certs_dir(GwName, LType, LName, OldAuthnConf),
-                    Conf1 = emqx_authentication_config:convert_certs(CertsDir, Conf),
+                    Conf1 = emqx_authn_config:convert_certs(CertsDir, Conf),
                     NListener = maps:put(
                         ?AUTHN_BIN,
                         Conf1,
@@ -872,12 +872,12 @@ certs_dir(GwName) when is_binary(GwName) ->
 
 authn_certs_dir(GwName, ListenerType, ListenerName, AuthnConf) ->
     ChainName = emqx_gateway_utils:listener_chain(GwName, ListenerType, ListenerName),
-    emqx_authentication_config:certs_dir(ChainName, AuthnConf).
+    emqx_authn_config:certs_dir(ChainName, AuthnConf).
 
 authn_certs_dir(GwName, AuthnConf) when is_binary(GwName) ->
     authn_certs_dir(binary_to_existing_atom(GwName), AuthnConf);
 authn_certs_dir(GwName, AuthnConf) ->
-    emqx_authentication_config:certs_dir(
+    emqx_authn_config:certs_dir(
         emqx_gateway_utils:global_chain(GwName),
         AuthnConf
     ).
@@ -887,12 +887,12 @@ convert_certs(SubDir, Conf) ->
 
 convert_certs(Type, SubDir, Conf) ->
     SSL = maps:get(Type, Conf, undefined),
-    case is_map(SSL) andalso emqx_tls_lib:ensure_ssl_files(SubDir, SSL) of
+    case is_map(SSL) andalso emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(SubDir, SSL) of
         false ->
             Conf;
         {ok, NSSL = #{}} ->
             Conf#{Type => NSSL};
         {error, Reason} ->
-            ?SLOG(error, Reason#{msg => bad_ssl_config}),
+            ?SLOG(error, Reason#{msg => "bad_ssl_config", reason => Reason}),
             throw({bad_ssl_config, Reason})
     end.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,17 +19,10 @@
 -include("emqx.hrl").
 
 -export([
-    delete_direct_route/2,
     delete_trie_route/2,
-    delete_session_trie_route/2,
-    insert_direct_route/2,
     insert_trie_route/2,
-    insert_session_trie_route/2,
     maybe_trans/3
 ]).
-
-insert_direct_route(Tab, Route) ->
-    mria:dirty_write(Tab, Route).
 
 insert_trie_route(RouteTab, Route = #route{topic = Topic}) ->
     case mnesia:wread({RouteTab, Topic}) of
@@ -38,31 +31,12 @@ insert_trie_route(RouteTab, Route = #route{topic = Topic}) ->
     end,
     mnesia:write(RouteTab, Route, sticky_write).
 
-insert_session_trie_route(RouteTab, Route = #route{topic = Topic}) ->
-    case mnesia:wread({RouteTab, Topic}) of
-        [] -> emqx_trie:insert_session(Topic);
-        _ -> ok
-    end,
-    mnesia:write(RouteTab, Route, sticky_write).
-
-delete_direct_route(RouteTab, Route) ->
-    mria:dirty_delete_object(RouteTab, Route).
-
-delete_trie_route(RouteTab, Route) ->
-    delete_trie_route(RouteTab, Route, normal).
-
-delete_session_trie_route(RouteTab, Route) ->
-    delete_trie_route(RouteTab, Route, session).
-
-delete_trie_route(RouteTab, Route = #route{topic = Topic}, Type) ->
+delete_trie_route(RouteTab, Route = #route{topic = Topic}) ->
     case mnesia:wread({RouteTab, Topic}) of
         [R] when R =:= Route ->
             %% Remove route and trie
             ok = mnesia:delete_object(RouteTab, Route, sticky_write),
-            case Type of
-                normal -> emqx_trie:delete(Topic);
-                session -> emqx_trie:delete_session(Topic)
-            end;
+            emqx_trie:delete(Topic);
         [_ | _] ->
             %% Remove route only
             mnesia:delete_object(RouteTab, Route, sticky_write);

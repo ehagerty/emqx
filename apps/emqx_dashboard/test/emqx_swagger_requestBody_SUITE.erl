@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 -compile(export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -import(hoconsc, [mk/2]).
@@ -30,11 +31,19 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    _ = emqx_mgmt_api_test_util:init_suite([emqx_conf]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 t_object(_Config) ->
@@ -310,7 +319,7 @@ t_nest_ref(_Config) ->
 t_none_ref(_Config) ->
     Path = "/ref/none",
     ?assertError(
-        {failed_to_generate_swagger_spec, ?MODULE, Path},
+        {failed_to_generate_swagger_spec, ?MODULE, Path, error, _FunctionClause, _Stacktrace},
         emqx_dashboard_swagger:parse_spec_ref(?MODULE, Path, #{})
     ),
     ok.
@@ -359,7 +368,7 @@ t_bad_ref(_Config) ->
     Refs = [{?MODULE, bad_ref}],
     Fields = fields(bad_ref),
     ?assertThrow(
-        {error, #{msg := <<"Object only supports not empty proplists">>, args := Fields}},
+        {error, #{msg := <<"Object only supports non-empty fields list">>, args := Fields}},
         validate(Path, Spec, Refs)
     ),
     ok.
@@ -813,10 +822,14 @@ to_schema(Body) ->
         post => #{requestBody => Body, responses => #{200 => <<"ok">>}}
     }.
 
+roots() -> [].
+
+namespace() -> atom_to_list(?MODULE).
+
 fields(good_ref) ->
     [
         {'webhook-host', mk(emqx_schema:ip_port(), #{default => <<"127.0.0.1:80">>})},
-        {log_dir, mk(emqx_schema:file(), #{example => "var/log/emqx"})},
+        {log_dir, mk(string(), #{example => "var/log/emqx"})},
         {tag, mk(binary(), #{desc => <<"tag">>})}
     ];
 fields(nest_ref) ->

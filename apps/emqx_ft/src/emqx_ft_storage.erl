@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
         store_filemeta/2,
         store_segment/2,
         assemble/3,
+        kickoff/1,
 
         files/0,
         files/1,
@@ -68,7 +69,7 @@
     transfer := emqx_ft:transfer(),
     name := file:name(),
     size := _Bytes :: non_neg_integer(),
-    timestamp := emqx_datetime:epoch_second(),
+    timestamp := emqx_utils_calendar:epoch_second(),
     uri => uri_string:uri_string(),
     meta => emqx_ft:filemeta()
 }.
@@ -99,7 +100,7 @@
 -callback start(storage()) -> any().
 -callback stop(storage()) -> any().
 
--callback update_config(_OldConfig :: maybe(storage()), _NewConfig :: maybe(storage())) ->
+-callback update_config(_OldConfig :: option(storage()), _NewConfig :: option(storage())) ->
     any().
 
 %%--------------------------------------------------------------------
@@ -120,6 +121,13 @@ store_segment(Transfer, Segment) ->
     ok | {async, pid()} | {error, term()}.
 assemble(Transfer, Size, FinOpts) ->
     dispatch(assemble, [Transfer, Size, FinOpts]).
+
+-spec kickoff(pid()) -> ok.
+kickoff(Pid) ->
+    _ = erlang:send(Pid, kickoff),
+    ok.
+
+%%
 
 -spec files() ->
     {ok, page(file_info(), _)} | {error, term()}.

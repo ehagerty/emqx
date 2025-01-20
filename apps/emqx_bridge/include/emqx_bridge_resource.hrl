@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,5 +18,6 @@
 -define(EMQX_BRIDGE_RESOURCE_HRL, true).
 
 -define(BRIDGE_HOOKPOINT(BridgeId), <<"$bridges/", BridgeId/binary>>).
+-define(SOURCE_HOOKPOINT(BridgeId), <<"$sources/", BridgeId/binary>>).
 
 -endif.

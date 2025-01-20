@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% Kafka connection configuration
@@ -24,15 +24,15 @@ hosts(Hosts) when is_list(Hosts) ->
     kpro:parse_endpoints(Hosts).
 
 %% Client ID is better to be unique to make it easier for Kafka side trouble shooting.
-make_client_id(KafkaType0, BridgeName0) ->
-    KafkaType = to_bin(KafkaType0),
+make_client_id(BridgeType0, BridgeName0) ->
+    BridgeType = to_bin(BridgeType0),
     BridgeName = to_bin(BridgeName0),
-    iolist_to_binary([KafkaType, ":", BridgeName, ":", atom_to_list(node())]).
+    iolist_to_binary([BridgeType, ":", BridgeName, ":", atom_to_list(node())]).
 
 sasl(none) ->
     undefined;
-sasl(#{mechanism := Mechanism, username := Username, password := Password}) ->
-    {Mechanism, Username, emqx_secret:wrap(Password)};
+sasl(#{mechanism := Mechanism, username := Username, password := Secret}) ->
+    {Mechanism, Username, Secret};
 sasl(#{
     kerberos_principal := Principal,
     kerberos_keytab_file := KeyTabFile
@@ -69,20 +69,8 @@ adjust_socket_buffer(Bytes, Opts) ->
             [{buffer, max(Bytes1, Bytes)} | Acc1]
     end.
 
-tcp_keepalive(None) when None =:= "none"; None =:= <<"none">> ->
-    [];
-tcp_keepalive(KeepAlive) ->
-    {Idle, Interval, Probes} = emqx_schema:parse_tcp_keepalive(KeepAlive),
-    case emqx_utils:tcp_keepalive_opts(os:type(), Idle, Interval, Probes) of
-        {ok, Opts} ->
-            Opts;
-        {error, {unsupported_os, OS}} ->
-            ?SLOG(warning, #{
-                msg => "Unsupported operation: set TCP keepalive",
-                os => OS
-            }),
-            []
-    end.
+tcp_keepalive(String) ->
+    emqx_schema:tcp_keepalive_opts(String).
 
 to_bin(A) when is_atom(A) ->
     atom_to_binary(A);

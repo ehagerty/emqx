@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@
     transfer := transfer(),
     name := file:name(),
     uri := uri_string:uri_string(),
-    timestamp := emqx_datetime:epoch_second(),
+    timestamp := emqx_utils_calendar:epoch_second(),
     size := _Bytes :: non_neg_integer(),
     filemeta => filemeta()
 }.
@@ -69,11 +69,9 @@
 -spec start_export(options(), transfer(), filemeta()) ->
     {ok, export_st()} | {error, term()}.
 start_export(_Options, Transfer, Filemeta) ->
-    Options = #{
-        key => s3_key(Transfer, Filemeta),
-        headers => s3_headers(Transfer, Filemeta)
-    },
-    case emqx_s3:start_uploader(?S3_PROFILE_ID, Options) of
+    Key = s3_key(Transfer, Filemeta),
+    UploadOpts = #{headers => s3_headers(Transfer, Filemeta)},
+    case emqx_s3:start_uploader(?S3_PROFILE_ID, Key, UploadOpts) of
         {ok, Pid} ->
             true = erlang:link(Pid),
             {ok, #{filemeta => Filemeta, pid => Pid}};
@@ -180,22 +178,24 @@ list_pages(Client, Marker, Limit, Acc) ->
     ListOptions = [{marker, Marker} || Marker =/= undefined],
     case list_key_info(Client, [{max_keys, MaxKeys} | ListOptions]) of
         {ok, {Exports, NextMarker}} ->
-            list_accumulate(Client, Limit, NextMarker, [Exports | Acc]);
+            Left = update_limit(Limit, Exports),
+            NextAcc = [Exports | Acc],
+            case NextMarker of
+                undefined ->
+                    {ok, {flatten_pages(NextAcc), undefined}};
+                _ when Left =< 0 ->
+                    {ok, {flatten_pages(NextAcc), NextMarker}};
+                _ ->
+                    list_pages(Client, NextMarker, Left, NextAcc)
+            end;
         {error, _Reason} = Error ->
             Error
     end.
 
-list_accumulate(_Client, _Limit, undefined, Acc) ->
-    {ok, {flatten_pages(Acc), undefined}};
-list_accumulate(Client, undefined, Marker, Acc) ->
-    list_pages(Client, Marker, undefined, Acc);
-list_accumulate(Client, Limit, Marker, Acc = [Exports | _]) ->
-    case Limit - length(Exports) of
-        0 ->
-            {ok, {flatten_pages(Acc), Marker}};
-        Left ->
-            list_pages(Client, Marker, Left, Acc)
-    end.
+update_limit(undefined, _Exports) ->
+    undefined;
+update_limit(Limit, Exports) ->
+    Limit - length(Exports).
 
 flatten_pages(Pages) ->
     lists:append(lists:reverse(Pages)).

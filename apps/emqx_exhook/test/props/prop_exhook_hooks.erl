@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -496,6 +496,9 @@ nodestr() ->
 peerhost(#{peername := {Host, _}}) ->
     ntoa(Host).
 
+peerport(#{peername := {_, Port}}) ->
+    Port.
+
 sockport(#{sockname := {_, Port}}) ->
     Port.
 
@@ -506,8 +509,8 @@ ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
 ntoa(IP) ->
     list_to_binary(inet_parse:ntoa(IP)).
 
-maybe(undefined) -> <<>>;
-maybe(B) -> B.
+option(undefined) -> <<>>;
+option(B) -> B.
 
 properties(undefined) ->
     [];
@@ -527,7 +530,10 @@ properties(M) when is_map(M) ->
     ).
 
 topicfilters(Tfs) when is_list(Tfs) ->
-    [#{name => Topic, qos => Qos} || {Topic, #{qos := Qos}} <- Tfs].
+    [
+        #{name => emqx_topic:maybe_format_share(Topic), subopts => subopts(SubOpts)}
+     || {Topic, SubOpts} <- Tfs
+    ].
 
 %% @private
 stringfy(Term) when is_binary(Term) ->
@@ -546,8 +552,7 @@ subopts(SubOpts) ->
         qos => maps:get(qos, SubOpts, 0),
         rh => maps:get(rh, SubOpts, 0),
         rap => maps:get(rap, SubOpts, 0),
-        nl => maps:get(nl, SubOpts, 0),
-        share => maps:get(share, SubOpts, <<>>)
+        nl => maps:get(nl, SubOpts, 0)
     }.
 
 authresult_to_bool(AuthResult) ->
@@ -563,8 +568,9 @@ from_conninfo(ConnInfo) ->
     #{
         node => nodestr(),
         clientid => maps:get(clientid, ConnInfo),
-        username => maybe(maps:get(username, ConnInfo, <<>>)),
+        username => option(maps:get(username, ConnInfo, <<>>)),
         peerhost => peerhost(ConnInfo),
+        peerport => peerport(ConnInfo),
         sockport => sockport(ConnInfo),
         proto_name => maps:get(proto_name, ConnInfo),
         proto_ver => stringfy(maps:get(proto_ver, ConnInfo)),
@@ -572,19 +578,21 @@ from_conninfo(ConnInfo) ->
     }.
 
 from_clientinfo(ClientInfo) ->
+    {PeerHost, PeerPort} = maps:get(peername, ClientInfo),
     #{
         node => nodestr(),
         clientid => maps:get(clientid, ClientInfo),
-        username => maybe(maps:get(username, ClientInfo, <<>>)),
-        password => maybe(maps:get(password, ClientInfo, <<>>)),
-        peerhost => ntoa(maps:get(peerhost, ClientInfo)),
+        username => option(maps:get(username, ClientInfo, <<>>)),
+        password => option(maps:get(password, ClientInfo, <<>>)),
+        peerhost => ntoa(PeerHost),
+        peerport => PeerPort,
         sockport => maps:get(sockport, ClientInfo),
         protocol => stringfy(maps:get(protocol, ClientInfo)),
-        mountpoint => maybe(maps:get(mountpoint, ClientInfo, <<>>)),
+        mountpoint => option(maps:get(mountpoint, ClientInfo, <<>>)),
         is_superuser => maps:get(is_superuser, ClientInfo, false),
         anonymous => maps:get(anonymous, ClientInfo, true),
-        cn => maybe(maps:get(cn, ClientInfo, <<>>)),
-        dn => maybe(maps:get(dn, ClientInfo, <<>>))
+        cn => option(maps:get(cn, ClientInfo, <<>>)),
+        dn => option(maps:get(dn, ClientInfo, <<>>))
     }.
 
 from_message(Msg) ->
@@ -642,7 +650,7 @@ unsub_properties() ->
     #{}.
 
 shutdown_reason() ->
-    oneof([utf8(), {shutdown, emqx_proper_types:limited_atom()}]).
+    oneof([utf8(), {shutdown, emqx_proper_types:limited_latin_atom()}]).
 
 authresult() ->
     ?LET(

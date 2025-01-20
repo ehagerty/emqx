@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,22 +23,22 @@
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
+init_per_suite(Config) ->
+    ok = application:load(emqx),
+    Config.
+
+end_per_suite(_) ->
+    ok = application:unload(emqx).
+
 t_is_enabled(_) ->
     try
         ok = application:set_env(emqx, boot_modules, all),
-        ?assert(emqx_boot:is_enabled(router)),
         ?assert(emqx_boot:is_enabled(broker)),
         ?assert(emqx_boot:is_enabled(listeners)),
-        ok = application:set_env(emqx, boot_modules, [router]),
-        ?assert(emqx_boot:is_enabled(router)),
-        ?assertNot(emqx_boot:is_enabled(broker)),
-        ?assertNot(emqx_boot:is_enabled(listeners)),
-        ok = application:set_env(emqx, boot_modules, [router, broker]),
-        ?assert(emqx_boot:is_enabled(router)),
+        ok = application:set_env(emqx, boot_modules, [broker]),
         ?assert(emqx_boot:is_enabled(broker)),
         ?assertNot(emqx_boot:is_enabled(listeners)),
-        ok = application:set_env(emqx, boot_modules, [router, broker, listeners]),
-        ?assert(emqx_boot:is_enabled(router)),
+        ok = application:set_env(emqx, boot_modules, [broker, listeners]),
         ?assert(emqx_boot:is_enabled(broker)),
         ?assert(emqx_boot:is_enabled(listeners))
     after

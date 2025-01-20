@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -35,9 +35,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3,
-    format_status/2
+    terminate/2
 ]).
 
 -export([
@@ -112,7 +110,7 @@
 -spec connect(
     limiter_id(),
     limiter_type(),
-    hocons:config() | undefined
+    hocon:config() | undefined
 ) ->
     {ok, emqx_htb_limiter:limiter()} | {error, _}.
 %% undefined is the default situation, no limiter setting by default
@@ -128,7 +126,7 @@ connect(Id, Type, Cfg) ->
         maps:get(Type, Cfg, undefined)
     ).
 
--spec add_bucket(limiter_id(), limiter_type(), hocons:config() | undefined) -> ok.
+-spec add_bucket(limiter_id(), limiter_type(), hocon:config() | undefined) -> ok.
 add_bucket(_Id, _Type, undefined) ->
     ok;
 %% a bucket with an infinity rate shouldn't be added to this server, because it is always full
@@ -153,7 +151,7 @@ name(Type) ->
 restart(Type) ->
     ?CALL(Type).
 
--spec update_config(limiter_type(), hocons:config()) -> ok | {error, _}.
+-spec update_config(limiter_type(), hocon:config()) -> ok | {error, _}.
 update_config(Type, Config) ->
     ?CALL(Type, {update_config, Type, Config}).
 
@@ -166,7 +164,7 @@ whereis(Type) ->
 %% Starts the server
 %% @end
 %%--------------------------------------------------------------------
--spec start_link(limiter_type(), hocons:config()) -> _.
+-spec start_link(limiter_type(), hocon:config()) -> _.
 start_link(Type, Cfg) ->
     gen_server:start_link({local, name(Type)}, ?MODULE, [Type, Cfg], []).
 
@@ -275,37 +273,6 @@ terminate(_Reason, #{type := Type}) ->
     ok.
 
 %%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Convert process state when code is changed
-%% @end
-%%--------------------------------------------------------------------
--spec code_change(
-    OldVsn :: term() | {down, term()},
-    State :: term(),
-    Extra :: term()
-) ->
-    {ok, NewState :: term()}
-    | {error, Reason :: term()}.
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called for changing the form and appearance
-%% of gen_server status when it is returned from sys:get_status/1,2
-%% or when it appears in termination error logs.
-%% @end
-%%--------------------------------------------------------------------
--spec format_status(
-    Opt :: normal | terminate,
-    Status :: list()
-) -> Status :: term().
-format_status(_Opt, Status) ->
-    Status.
-
-%%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
 oscillate(Interval) ->
@@ -383,7 +350,7 @@ longitudinal(
 
     case lists:min([ShouldAlloc, Flow, Capacity]) of
         Available when Available > 0 ->
-            {Inc, Bucket2} = emqx_limiter_correction:add(Available, Bucket),
+            {Inc, Bucket2} = emqx_limiter_decimal:precisely_add(Available, Bucket),
             counters:add(Counter, Index, Inc),
 
             {Available, Buckets#{Name := Bucket2#{obtained := Obtained + Available}}};
@@ -419,7 +386,7 @@ maybe_adjust_root_tokens(#{root := #{rate := Rate} = Root, counter := Counter} =
             State;
         _ ->
             Available = erlang:min(Rate - Token, InFlow),
-            {Inc, Root2} = emqx_limiter_correction:add(Available, Root),
+            {Inc, Root2} = emqx_limiter_decimal:precisely_add(Available, Root),
             counters:add(Counter, ?ROOT_COUNTER_IDX, Inc),
             State#{root := Root2}
     end.
@@ -473,7 +440,7 @@ dispatch_burst_to_buckets([Bucket | T], InFlow, Alloced, Buckets) ->
         index := Index,
         obtained := Obtained
     } = Bucket,
-    {Inc, Bucket2} = emqx_limiter_correction:add(InFlow, Bucket),
+    {Inc, Bucket2} = emqx_limiter_decimal:precisely_add(InFlow, Bucket),
 
     counters:add(Counter, Index, Inc),
 
@@ -484,7 +451,7 @@ dispatch_burst_to_buckets([], _, Alloced, Buckets) ->
 
 -spec init_tree(emqx_limiter_schema:limiter_type()) -> state().
 init_tree(Type) when is_atom(Type) ->
-    Cfg = emqx_limiter_schema:get_node_opts(Type),
+    Cfg = emqx_limiter_utils:get_node_opts(Type),
     init_tree(Type, Cfg).
 
 init_tree(Type, #{rate := Rate} = Cfg) ->
@@ -500,7 +467,7 @@ init_tree(Type, #{rate := Rate} = Cfg) ->
         buckets => #{}
     }.
 
--spec make_root(hocons:confg()) -> root().
+-spec make_root(hocon:config()) -> root().
 make_root(#{rate := Rate, burst := Burst}) ->
     #{
         rate => Rate,
@@ -515,7 +482,7 @@ do_add_bucket(Id, #{rate := Rate} = Cfg, #{buckets := Buckets} = State) ->
         undefined ->
             make_bucket(Id, Cfg, State);
         Bucket ->
-            Bucket2 = Bucket#{rate := Rate, capacity := emqx_limiter_schema:calc_capacity(Cfg)},
+            Bucket2 = Bucket#{rate := Rate, capacity := emqx_limiter_utils:calc_capacity(Cfg)},
             State#{buckets := Buckets#{Id := Bucket2}}
     end.
 
@@ -536,7 +503,7 @@ make_bucket(
         rate => Rate,
         obtained => Initial,
         correction => 0,
-        capacity => emqx_limiter_schema:calc_capacity(Cfg),
+        capacity => emqx_limiter_utils:calc_capacity(Cfg),
         counter => Counter,
         index => NewIndex
     },
@@ -554,7 +521,7 @@ do_del_bucket(Id, #{type := Type, buckets := Buckets} = State) ->
             State#{buckets := maps:remove(Id, Buckets)}
     end.
 
--spec get_initial_val(hocons:config()) -> decimal().
+-spec get_initial_val(hocon:config()) -> decimal().
 get_initial_val(
     #{
         initial := Initial,
@@ -601,7 +568,7 @@ create_limiter_without_client(Id, Type, BucketCfg) ->
         false ->
             {ok, emqx_htb_limiter:make_infinity_limiter()};
         {ok, Bucket, RefCfg} ->
-            ClientCfg = emqx_limiter_schema:default_client_config(),
+            ClientCfg = emqx_limiter_utils:default_client_config(),
             create_limiter_with_ref(Bucket, ClientCfg, RefCfg);
         Error ->
             Error
@@ -622,12 +589,12 @@ find_referenced_bucket(Id, Type, #{rate := Rate} = Cfg) when Rate =/= infinity -
         {ok, Bucket} ->
             {ok, Bucket, Cfg};
         _ ->
-            ?SLOG(error, #{msg => "bucket not found", type => Type, id => Id}),
+            ?SLOG(error, #{msg => "bucket_not_found", type => Type, id => Id}),
             {error, invalid_bucket}
     end;
 %% this is a node-level reference
 find_referenced_bucket(_Id, Type, _) ->
-    case emqx_limiter_schema:get_node_opts(Type) of
+    case emqx_limiter_utils:get_node_opts(Type) of
         #{rate := infinity} ->
             false;
         NodeCfg ->

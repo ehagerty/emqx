@@ -39,7 +39,9 @@ ONLY_UP='no'
 ATTACH='no'
 STOP='no'
 IS_CI='no'
-ODBC_REQUEST='no'
+SQLSERVER_ODBC_REQUEST='no'
+SNOWFLAKE_ODBC_REQUEST='no'
+UP='up'
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -72,6 +74,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --ci)
             IS_CI='yes'
+            UP='up --quiet-pull'
             shift 1
             ;;
         --)
@@ -98,33 +101,59 @@ if [ ! -d "${WHICH_APP}" ]; then
     exit 1
 fi
 
-if [[ "${WHICH_APP}" == lib-ee* && (-z "${PROFILE+x}" || "${PROFILE}" != emqx-enterprise) ]]; then
-    echo 'You are trying to run an enterprise test case without the emqx-enterprise profile.'
-    echo 'This will most likely not work.'
-    echo ''
-    echo 'Run "export PROFILE=emqx-enterprise" and "make" to fix this'
-    exit 1
-fi
-
 ERLANG_CONTAINER='erlang'
 DOCKER_CT_ENVS_FILE="${WHICH_APP}/docker-ct"
 
-case "${WHICH_APP}" in
-    lib-ee*)
-        ## ensure enterprise profile when testing lib-ee applications
-        export PROFILE='emqx-enterprise'
-        ;;
-    apps/*)
-        if [[ -f "${WHICH_APP}/BSL.txt" ]]; then
-          export PROFILE='emqx-enterprise'
-        else
-          export PROFILE='emqx'
-        fi
-        ;;
-    *)
-        export PROFILE="${PROFILE:-emqx}"
-        ;;
-esac
+if [ -f "${WHICH_APP}/BSL.txt" ]; then
+    if [ -n "${PROFILE:-}" ] && [ "${PROFILE}" != 'emqx-enterprise' ]; then
+        echo "bad_profile: PROFILE=${PROFILE} will not work for app ${WHICH_APP}"
+        exit 1
+    fi
+fi
+
+if [ -z "${PROFILE+x}" ]; then
+    case "${WHICH_APP}" in
+        apps/emqx)
+            export PROFILE='emqx-enterprise'
+            ;;
+        apps/emqx_bridge)
+            export PROFILE='emqx-enterprise'
+            ;;
+        # emqx_connector test suite is using kafka bridge which is only available in emqx-enterprise
+        apps/emqx_connector)
+            export PROFILE='emqx-enterprise'
+            ;;
+        apps/emqx_dashboard)
+            export PROFILE='emqx-enterprise'
+            ;;
+        apps/emqx_rule_engine)
+            export PROFILE='emqx-enterprise'
+            ;;
+        # emqx_auth_http has scram:http support which is only available in emqx-enterprise
+        apps/emqx_auth_http)
+            export PROFILE='emqx-enterprise'
+            ;;
+        apps/emqx_fdb*)
+            export PROFILE='emqx-platform'
+            ;;
+        apps/emqx_ds_fdb_backend)
+            export PROFILE='emqx-platform'
+            ;;
+        apps/emqx_event_history)
+            export PROFILE='emqx-platform'
+            ;;
+        apps/*)
+            if [[ -f "${WHICH_APP}/BSL.txt" ]]; then
+                export PROFILE='emqx-enterprise'
+            else
+                export PROFILE='emqx'
+            fi
+            ;;
+        *)
+            export PROFILE="${PROFILE:-emqx}"
+            ;;
+    esac
+fi
 
 if [ -f "$DOCKER_CT_ENVS_FILE" ]; then
     # shellcheck disable=SC2002
@@ -185,13 +214,14 @@ for dep in ${CT_DEPS}; do
             FILES+=( '.ci/docker-compose-file/docker-compose-dynamo.yaml' )
             ;;
         rocketmq)
-            FILES+=( '.ci/docker-compose-file/docker-compose-rocketmq.yaml' )
+            FILES+=( '.ci/docker-compose-file/docker-compose-rocketmq.yaml'
+                     '.ci/docker-compose-file/docker-compose-rocketmq-ssl.yaml' )
             ;;
         cassandra)
             FILES+=( '.ci/docker-compose-file/docker-compose-cassandra.yaml' )
             ;;
         sqlserver)
-            ODBC_REQUEST='yes'
+            SQLSERVER_ODBC_REQUEST='yes'
             FILES+=( '.ci/docker-compose-file/docker-compose-sqlserver.yaml' )
             ;;
         opents)
@@ -228,6 +258,36 @@ for dep in ${CT_DEPS}; do
         ldap)
             FILES+=( '.ci/docker-compose-file/docker-compose-ldap.yaml' )
             ;;
+        otel)
+            FILES+=( '.ci/docker-compose-file/docker-compose-otel.yaml' )
+            ;;
+        elasticsearch)
+            FILES+=( '.ci/docker-compose-file/docker-compose-elastic-search-tls.yaml' )
+            ;;
+        azurite)
+            FILES+=( '.ci/docker-compose-file/docker-compose-azurite.yaml' )
+            ;;
+        couchbase)
+            FILES+=( '.ci/docker-compose-file/docker-compose-couchbase.yaml' )
+            ;;
+        kdc)
+            FILES+=( '.ci/docker-compose-file/docker-compose-kdc.yaml' )
+            ;;
+        datalayers)
+            FILES+=( '.ci/docker-compose-file/docker-compose-datalayers-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-datalayers-tls.yaml' )
+            ;;
+        snowflake)
+            if [[ -z "${SNOWFLAKE_ACCOUNT_ID:-}" ]]; then
+                echo "Snowflake environment requested, but SNOWFLAKE_ACCOUNT_ID is undefined"
+                echo "Will NOT install Snowflake's ODBC drivers"
+            else
+                SNOWFLAKE_ODBC_REQUEST='yes'
+            fi
+            ;;
+        schema-registry)
+          FILES+=( '.ci/docker-compose-file/docker-compose-confluent-schema-registry.yaml' )
+            ;;
         *)
             echo "unknown_ct_dependency $dep"
             exit 1
@@ -235,16 +295,20 @@ for dep in ${CT_DEPS}; do
     esac
 done
 
-if [ "$ODBC_REQUEST" = 'yes' ]; then
-    INSTALL_ODBC="./scripts/install-msodbc-driver.sh"
+if [ "$SQLSERVER_ODBC_REQUEST" = 'yes' ]; then
+    INSTALL_SQLSERVER_ODBC="./scripts/install-msodbc-driver.sh"
 else
-    INSTALL_ODBC="echo 'msodbc driver not requested'"
+    INSTALL_SQLSERVER_ODBC="echo 'msodbc driver not requested'"
 fi
 
-F_OPTIONS=""
+if [ "$SNOWFLAKE_ODBC_REQUEST" = 'yes' ]; then
+    INSTALL_SNOWFLAKE_ODBC="./scripts/install-snowflake-driver.sh"
+else
+    INSTALL_SNOWFLAKE_ODBC="echo 'snowflake driver not requested'"
+fi
 
 for file in "${FILES[@]}"; do
-    F_OPTIONS="$F_OPTIONS -f $file"
+    DC="$DC -f $file"
 done
 
 DOCKER_USER="$(id -u)"
@@ -262,28 +326,34 @@ if [ "$STOP" = 'no' ]; then
     # some left-over log file has to be deleted before a new docker-compose up
     rm -f '.ci/docker-compose-file/redis/*.log'
     set +e
-    # shellcheck disable=2086 # no quotes for F_OPTIONS
-    $DC $F_OPTIONS up -d --build --remove-orphans
+    # shellcheck disable=2086 # no quotes for UP
+    $DC $UP -d --build --remove-orphans
     RESULT=$?
     if [ $RESULT -ne 0 ]; then
         mkdir -p _build/test/logs
         LOG='_build/test/logs/docker-compose.log'
         echo "Dumping docker-compose log to $LOG"
-        # shellcheck disable=2086 # no quotes for F_OPTIONS
-        $DC $F_OPTIONS logs --no-color --timestamps > "$LOG"
+        $DC logs --no-color --timestamps > "$LOG"
         exit 1
     fi
     set -e
 fi
 
-# rebar, mix and hex cache directory need to be writable by $DOCKER_USER
-docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c "mkdir -p /.cache /.hex /.mix && chown $DOCKER_USER /.cache /.hex /.mix"
-# need to initialize .erlang.cookie manually here because / is not writable by $DOCKER_USER
-docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c "openssl rand -base64 -hex 16 > /.erlang.cookie && chown $DOCKER_USER /.erlang.cookie && chmod 0400 /.erlang.cookie"
-# the user must exist inside the container for `whoami` to work
-docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c "useradd --uid $DOCKER_USER -M -d / emqx" || true
-docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c "chown -R $DOCKER_USER /var/lib/secret" || true
-docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c "$INSTALL_ODBC" || true
+if [ "$DOCKER_USER" != "root" ]; then
+    # the user must exist inside the container for `whoami` to work
+  docker exec -i $TTY -u root:root \
+         -e "SFACCOUNT=${SFACCOUNT:-myorg-myacc}" \
+         "$ERLANG_CONTAINER" bash -c \
+         "useradd --uid $DOCKER_USER -M -d / emqx || true && \
+          mkdir -p /.cache /.hex /.mix && \
+          chown $DOCKER_USER /.cache /.hex /.mix && \
+          openssl rand -base64 -hex 16 > /.erlang.cookie && \
+          chown $DOCKER_USER /.erlang.cookie && \
+          chmod 0400 /.erlang.cookie && \
+          chown -R $DOCKER_USER /var/lib/secret && \
+          $INSTALL_SQLSERVER_ODBC && \
+          $INSTALL_SNOWFLAKE_ODBC" || true
+fi
 
 if [ "$ONLY_UP" = 'yes' ]; then
     exit 0
@@ -292,8 +362,7 @@ fi
 set +e
 
 if [ "$STOP" = 'yes' ]; then
-    # shellcheck disable=2086 # no quotes for F_OPTIONS
-    $DC $F_OPTIONS down --remove-orphans
+    $DC down -t 0 --remove-orphans
 elif [ "$ATTACH" = 'yes' ]; then
     docker exec -it "$ERLANG_CONTAINER" bash
 elif [ "$CONSOLE" = 'yes' ]; then
@@ -303,6 +372,7 @@ else
         docker exec -e IS_CI="$IS_CI" \
                     -e PROFILE="$PROFILE" \
                     -e SUITEGROUP="${SUITEGROUP:-}" \
+                    -e ENABLE_COVER_COMPILE="${ENABLE_COVER_COMPILE:-}" \
                     -e CT_COVER_EXPORT_PREFIX="${CT_COVER_EXPORT_PREFIX:-}" \
                     -i $TTY "$ERLANG_CONTAINER" \
                     bash -c "BUILD_WITHOUT_QUIC=1 make ${WHICH_APP}-ct"
@@ -317,12 +387,10 @@ else
     if [ "$RESULT" -ne 0 ]; then
         LOG='_build/test/logs/docker-compose.log'
         echo "Dumping docker-compose log to $LOG"
-        # shellcheck disable=2086 # no quotes for F_OPTIONS
-        $DC $F_OPTIONS logs --no-color --timestamps > "$LOG"
+        $DC logs --no-color --timestamps > "$LOG"
     fi
     if [ "$KEEP_UP" != 'yes' ]; then
-        # shellcheck disable=2086 # no quotes for F_OPTIONS
-        $DC $F_OPTIONS down
+        $DC down
     fi
     exit "$RESULT"
 fi

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ t_status(_Config) ->
         [binary, {active, false}, {packet, raw}]
     ),
     ok = gen_tcp:send(Socket, ranch_proxy_header:header(ProxyInfo)),
-    {ok, Token} = emqx_dashboard_admin:sign_token(<<"admin">>, <<"public">>),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(<<"admin">>, <<"public">>),
     ok = gen_tcp:send(
         Socket,
         "GET /status HTTP/1.1\r\n"

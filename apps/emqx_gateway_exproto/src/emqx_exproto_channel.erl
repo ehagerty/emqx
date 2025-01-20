@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     handle_call/3,
@@ -50,15 +51,15 @@
     %% Conn info
     conninfo :: emqx_types:conninfo(),
     %% Client info from `register` function
-    clientinfo :: maybe(map()),
+    clientinfo :: option(map()),
     %% Connection state
     conn_state :: conn_state(),
     %% Subscription
     subscriptions = #{},
     %% Keepalive
-    keepalive :: maybe(emqx_keepalive:keepalive()),
+    keepalive :: option(emqx_keepalive:keepalive()),
     %% Timers
-    timers :: #{atom() => disabled | maybe(reference())},
+    timers :: #{atom() => disabled | option(reference())},
     %% Closed reason
     closed_reason = undefined
 }).
@@ -73,12 +74,6 @@
     | {close, Reason :: atom()}.
 
 -type replies() :: emqx_types:packet() | reply() | [reply()].
-
--define(TIMER_TABLE, #{
-    alive_timer => keepalive,
-    force_timer => force_close,
-    idle_timer => force_close_idle
-}).
 
 -define(INFO_KEYS, [conninfo, conn_state, clientinfo, session, will_msg]).
 
@@ -137,7 +132,7 @@ stats(#channel{subscriptions = Subs}) ->
 %% Init the channel
 %%--------------------------------------------------------------------
 
--spec init(emqx_exproto_types:conninfo(), map()) -> channel().
+-spec init(emqx_types:conninfo(), map()) -> channel().
 init(
     ConnInfo = #{
         socktype := Socktype,
@@ -224,7 +219,7 @@ address({Host, Port}) ->
 
 %% avoid udp connection process leak
 start_idle_checking_timer(Channel = #channel{conninfo = #{socktype := udp}}) ->
-    ensure_timer(idle_timer, Channel);
+    ensure_timer(force_close_idle, Channel);
 start_idle_checking_timer(Channel) ->
     Channel.
 
@@ -238,6 +233,9 @@ start_idle_checking_timer(Channel) ->
 handle_in(Data, Channel) ->
     Req = #{bytes => Data},
     {ok, dispatch(on_received_bytes, Req, Channel)}.
+
+handle_frame_error(Reason, Channel) ->
+    {shutdown, Reason, Channel}.
 
 -spec handle_deliver(list(emqx_types:deliver()), channel()) ->
     {ok, channel()}
@@ -293,10 +291,10 @@ handle_timeout(
     case emqx_keepalive:check(StatVal, Keepalive) of
         {ok, NKeepalive} ->
             NChannel = Channel#channel{keepalive = NKeepalive},
-            {ok, reset_timer(alive_timer, NChannel)};
+            {ok, reset_timer(keepalive, NChannel)};
         {error, timeout} ->
             Req = #{type => 'KEEPALIVE'},
-            NChannel = remove_timer_ref(alive_timer, Channel),
+            NChannel = remove_timer_ref(keepalive, Channel),
             %% close connection if keepalive timeout
             Replies = [{event, disconnected}, {close, keepalive_timeout}],
             NChannel1 = dispatch(on_timer_timeout, Req, NChannel#channel{
@@ -308,6 +306,9 @@ handle_timeout(_TRef, force_close, Channel = #channel{closed_reason = Reason}) -
     {shutdown, Reason, Channel};
 handle_timeout(_TRef, force_close_idle, Channel) ->
     {shutdown, idle_timeout, Channel};
+handle_timeout(_TRef, connection_expire, Channel) ->
+    NChannel = remove_timer_ref(connection_expire, Channel),
+    {ok, [{event, disconnected}, {close, expired}], NChannel};
 handle_timeout(_TRef, Msg, Channel) ->
     ?SLOG(warning, #{
         msg => "unexpected_timeout_signal",
@@ -346,67 +347,31 @@ handle_call(
         request_clientinfo => ClientInfo
     }),
     {reply, {error, ?RESP_PERMISSION_DENY, <<"Client socket disconnected">>}, Channel};
-handle_call(
-    {auth, ClientInfo0, Password},
-    _From,
-    Channel = #channel{
-        ctx = Ctx,
-        conninfo = ConnInfo,
-        clientinfo = ClientInfo
-    }
-) ->
-    ClientInfo1 = enrich_clientinfo(ClientInfo0, ClientInfo),
-    ConnInfo1 = enrich_conninfo(ClientInfo0, ConnInfo),
-
-    Channel1 = Channel#channel{
-        conninfo = ConnInfo1,
-        clientinfo = ClientInfo1
-    },
-
-    #{clientid := ClientId, username := Username} = ClientInfo1,
-
+handle_call({auth, ClientInfo0, Password}, _From, Channel) ->
+    ClientInfo1 = ClientInfo0#{password => Password},
     case
-        emqx_gateway_ctx:authenticate(
-            Ctx, ClientInfo1#{password => Password}
+        emqx_utils:pipeline(
+            [
+                fun enrich_conninfo/2,
+                fun run_conn_hooks/2,
+                fun enrich_clientinfo/2,
+                fun set_log_meta/2,
+                fun auth_connect/2
+            ],
+            ClientInfo1,
+            Channel#channel{conn_state = connecting}
         )
     of
-        {ok, NClientInfo} ->
-            SessFun = fun(_, _) -> #{} end,
-            emqx_logger:set_metadata_clientid(ClientId),
-            case
-                emqx_gateway_ctx:open_session(
-                    Ctx,
-                    true,
-                    NClientInfo,
-                    ConnInfo1,
-                    SessFun
-                )
-            of
-                {ok, _Session} ->
-                    ?SLOG(debug, #{
-                        msg => "client_login_succeed",
-                        clientid => ClientId,
-                        username => Username
-                    }),
-                    {reply, ok, [{event, connected}],
-                        ensure_connected(Channel1#channel{clientinfo = NClientInfo})};
-                {error, Reason} ->
-                    ?SLOG(warning, #{
-                        msg => "client_login_failed",
-                        clientid => ClientId,
-                        username => Username,
-                        reason => Reason
-                    }),
-                    {reply, {error, ?RESP_PERMISSION_DENY, Reason}, Channel}
-            end;
-        {error, Reason} ->
+        {ok, _, NChannel} ->
+            process_connect(NChannel);
+        {error, Reason, NChannel} ->
             ?SLOG(warning, #{
                 msg => "client_login_failed",
-                clientid => ClientId,
-                username => Username,
+                clientid => maps:get(clientid, ClientInfo0, undefined),
+                username => maps:get(username, ClientInfo0, undefined),
                 reason => Reason
             }),
-            {reply, {error, ?RESP_PERMISSION_DENY, Reason}, Channel}
+            {reply, {error, ?RESP_PERMISSION_DENY, Reason}, NChannel}
     end;
 handle_call(
     {start_timer, keepalive, Interval},
@@ -419,7 +384,7 @@ handle_call(
     NConnInfo = ConnInfo#{keepalive => Interval},
     NClientInfo = ClientInfo#{keepalive => Interval},
     NChannel = Channel#channel{conninfo = NConnInfo, clientinfo = NClientInfo},
-    {reply, ok, [{event, updated}], ensure_keepalive(cancel_timer(idle_timer, NChannel))};
+    {reply, ok, [{event, updated}], ensure_keepalive(cancel_timer(force_close_idle, NChannel))};
 handle_call(
     {subscribe_from_client, TopicFilter, Qos},
     _From,
@@ -529,7 +494,7 @@ handle_info(
                     _ ->
                         Channel
                 end,
-            Channel2 = ensure_timer(force_timer, Channel1),
+            Channel2 = ensure_timer(force_close, Channel1),
             {ok, ensure_disconnected(Reason, Channel2)}
     end;
 handle_info(
@@ -547,13 +512,13 @@ handle_info(
 
     ShutdownNow =
         emqx_exproto_gcli:is_empty(GClient) andalso
-            maps:get(force_timer, Timers, undefined) =/= undefined,
+            maps:get(force_close, Timers, undefined) =/= undefined,
     case Result of
         ok when not ShutdownNow ->
             GClient1 = emqx_exproto_gcli:maybe_shoot(GClient),
             {ok, Channel#channel{gcli = GClient1}};
         ok when ShutdownNow ->
-            Channel1 = cancel_timer(force_timer, Channel),
+            Channel1 = cancel_timer(force_close, Channel),
             {shutdown, Channel1#channel.closed_reason, Channel1};
         {error, Reason} ->
             {shutdown, {error, {FunName, Reason}}, Channel}
@@ -672,10 +637,18 @@ ensure_connected(
 ) ->
     NConnInfo = ConnInfo#{connected_at => erlang:system_time(millisecond)},
     ok = run_hooks(Ctx, 'client.connected', [ClientInfo, NConnInfo]),
-    Channel#channel{
+    schedule_connection_expire(Channel#channel{
         conninfo = NConnInfo,
         conn_state = connected
-    }.
+    }).
+
+schedule_connection_expire(Channel = #channel{ctx = Ctx, clientinfo = ClientInfo}) ->
+    case emqx_gateway_ctx:connection_expire_interval(Ctx, ClientInfo) of
+        undefined ->
+            Channel;
+        Interval ->
+            ensure_timer(connection_expire, Interval, Channel)
+    end.
 
 ensure_disconnected(
     Reason,
@@ -697,6 +670,10 @@ run_hooks(Ctx, Name, Args) ->
     emqx_gateway_ctx:metrics_inc(Ctx, Name),
     emqx_hooks:run(Name, Args).
 
+run_hooks(Ctx, Name, Args, Acc) ->
+    emqx_gateway_ctx:metrics_inc(Ctx, Name),
+    emqx_hooks:run_fold(Name, Args, Acc).
+
 metrics_inc(Ctx, Name) ->
     emqx_gateway_ctx:metrics_inc(Ctx, Name).
 
@@ -710,8 +687,8 @@ ensure_keepalive_timer(Interval, Channel) when Interval =< 0 ->
     Channel;
 ensure_keepalive_timer(Interval, Channel) ->
     StatVal = emqx_gateway_conn:keepalive_stats(recv),
-    Keepalive = emqx_keepalive:init(StatVal, timer:seconds(Interval)),
-    ensure_timer(alive_timer, Channel#channel{keepalive = Keepalive}).
+    Keepalive = emqx_keepalive:init(default, StatVal, Interval),
+    ensure_timer(keepalive, Channel#channel{keepalive = Keepalive}).
 
 ensure_timer(Name, Channel = #channel{timers = Timers}) ->
     TRef = maps:get(Name, Timers, undefined),
@@ -723,8 +700,7 @@ ensure_timer(Name, Channel = #channel{timers = Timers}) ->
     end.
 
 ensure_timer(Name, Time, Channel = #channel{timers = Timers}) ->
-    Msg = maps:get(Name, ?TIMER_TABLE),
-    TRef = emqx_utils:start_timer(Time, Msg),
+    TRef = emqx_utils:start_timer(Time, Name),
     Channel#channel{timers = Timers#{Name => TRef}}.
 
 reset_timer(Name, Channel) ->
@@ -737,12 +713,12 @@ cancel_timer(Name, Channel = #channel{timers = Timers}) ->
 remove_timer_ref(Name, Channel = #channel{timers = Timers}) ->
     Channel#channel{timers = maps:remove(Name, Timers)}.
 
-interval(idle_timer, #channel{conninfo = #{idle_timeout := IdleTimeout}}) ->
+interval(force_close_idle, #channel{conninfo = #{idle_timeout := IdleTimeout}}) ->
     IdleTimeout;
-interval(force_timer, _) ->
+interval(force_close, _) ->
     15000;
-interval(alive_timer, #channel{keepalive = Keepalive}) ->
-    emqx_keepalive:info(interval, Keepalive).
+interval(keepalive, #channel{keepalive = Keepalive}) ->
+    emqx_keepalive:info(check_interval, Keepalive).
 
 %%--------------------------------------------------------------------
 %% Dispatch
@@ -757,11 +733,22 @@ dispatch(FunName, Req, Channel = #channel{gcli = GClient}) ->
 %% Format
 %%--------------------------------------------------------------------
 
-enrich_conninfo(InClientInfo, ConnInfo) ->
+enrich_conninfo(
+    InClientInfo,
+    Channel = #channel{
+        conninfo = ConnInfo
+    }
+) ->
     Ks = [proto_name, proto_ver, clientid, username],
-    maps:merge(ConnInfo, maps:with(Ks, InClientInfo)).
+    NConnInfo = maps:merge(ConnInfo, maps:with(Ks, InClientInfo)),
+    {ok, Channel#channel{conninfo = NConnInfo}}.
 
-enrich_clientinfo(InClientInfo = #{proto_name := ProtoName}, ClientInfo) ->
+enrich_clientinfo(
+    InClientInfo = #{proto_name := ProtoName},
+    Channel = #channel{
+        clientinfo = ClientInfo
+    }
+) ->
     Ks = [clientid, username],
     case maps:get(mountpoint, InClientInfo, <<>>) of
         <<>> ->
@@ -780,7 +767,87 @@ enrich_clientinfo(InClientInfo = #{proto_name := ProtoName}, ClientInfo) ->
             )
     end,
     NClientInfo = maps:merge(ClientInfo, maps:with(Ks, InClientInfo)),
-    NClientInfo#{protocol => proto_name_to_protocol(ProtoName)}.
+    NClientInfo1 = NClientInfo#{protocol => proto_name_to_protocol(ProtoName)},
+    {ok, Channel#channel{clientinfo = NClientInfo1}}.
+
+set_log_meta(_InClientInfo, #channel{clientinfo = #{clientid := ClientId}}) ->
+    emqx_logger:set_metadata_clientid(ClientId),
+    ok.
+
+run_conn_hooks(
+    InClientInfo,
+    Channel = #channel{
+        ctx = Ctx,
+        conninfo = ConnInfo
+    }
+) ->
+    ConnProps = #{},
+    case run_hooks(Ctx, 'client.connect', [ConnInfo], ConnProps) of
+        Error = {error, _Reason} -> Error;
+        _NConnProps -> {ok, InClientInfo, Channel}
+    end.
+
+auth_connect(
+    _InClientInfo = #{password := Password},
+    Channel = #channel{
+        ctx = Ctx,
+        clientinfo = ClientInfo
+    }
+) ->
+    #{
+        clientid := ClientId,
+        username := Username
+    } = ClientInfo,
+    case emqx_gateway_ctx:authenticate(Ctx, ClientInfo#{password => Password}) of
+        {ok, NClientInfo} ->
+            {ok, Channel#channel{clientinfo = NClientInfo}};
+        {error, Reason} ->
+            ?SLOG(warning, #{
+                msg => "client_login_failed",
+                clientid => ClientId,
+                username => Username,
+                reason => Reason
+            }),
+            {error, Reason}
+    end.
+
+process_connect(
+    Channel = #channel{
+        ctx = Ctx,
+        conninfo = ConnInfo,
+        clientinfo = ClientInfo
+    }
+) ->
+    #{
+        clientid := ClientId,
+        username := Username
+    } = ClientInfo,
+    SessFun = fun(_, _) -> #{} end,
+    case
+        emqx_gateway_ctx:open_session(
+            Ctx,
+            true,
+            ClientInfo,
+            ConnInfo,
+            SessFun
+        )
+    of
+        {ok, _Session} ->
+            ?SLOG(debug, #{
+                msg => "client_login_succeed",
+                clientid => ClientId,
+                username => Username
+            }),
+            {reply, ok, [{event, connected}], ensure_connected(Channel)};
+        {error, Reason} ->
+            ?SLOG(warning, #{
+                msg => "client_login_failed",
+                clientid => ClientId,
+                username => Username,
+                reason => Reason
+            }),
+            {reply, {error, ?RESP_PERMISSION_DENY, Reason}, Channel}
+    end.
 
 default_conninfo(ConnInfo) ->
     ConnInfo#{
@@ -798,7 +865,7 @@ default_conninfo(ConnInfo) ->
     }.
 
 default_clientinfo(#{
-    peername := {PeerHost, _},
+    peername := {PeerHost, _} = PeerName,
     sockname := {_, SockPort},
     clientid := ClientId
 }) ->
@@ -806,6 +873,7 @@ default_clientinfo(#{
         zone => default,
         protocol => exproto,
         peerhost => PeerHost,
+        peername => PeerName,
         sockport => SockPort,
         clientid => ClientId,
         username => undefined,

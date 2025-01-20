@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
@@ -42,7 +43,7 @@ t_printable_maps(_) ->
         peerhost => {127, 0, 0, 1},
         peername => {{127, 0, 0, 1}, 9980},
         sockname => {{127, 0, 0, 1}, 1883},
-        redispatch_to => {<<"group">>, <<"sub/topic/+">>},
+        redispatch_to => ?REDISPATCH_TO(<<"group">>, <<"sub/topic/+">>),
         shared_dispatch_ack => {self(), ref}
     },
     Converted = emqx_rule_events:printable_maps(Headers),

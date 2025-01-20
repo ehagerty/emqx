@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,11 +20,10 @@
 
 %% Mnesia bootstrap
 -export([
-    mnesia/1,
+    create_trie/0,
+    wait_for_tables/0,
     create_session_trie/1
 ]).
-
--boot_mnesia({mnesia, [boot]}).
 
 %% Trie APIs
 -export([
@@ -64,8 +63,8 @@
 %%--------------------------------------------------------------------
 
 %% @doc Create or replicate topics table.
--spec mnesia(boot | copy) -> ok.
-mnesia(boot) ->
+-spec create_trie() -> [mria:table()].
+create_trie() ->
     %% Optimize storage
     StoreProps = [
         {ets, [
@@ -79,7 +78,8 @@ mnesia(boot) ->
         {attributes, record_info(fields, ?TRIE)},
         {type, ordered_set},
         {storage_properties, StoreProps}
-    ]).
+    ]),
+    [?TRIE].
 
 create_session_trie(Type) ->
     Storage =
@@ -104,6 +104,10 @@ create_session_trie(Type) ->
             {storage_properties, StoreProps}
         ]
     ).
+
+-spec wait_for_tables() -> ok | {error, _Reason}.
+wait_for_tables() ->
+    mria:wait_for_tables([?TRIE]).
 
 %%--------------------------------------------------------------------
 %% Topics APIs

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -118,10 +118,26 @@ t_hash(_) ->
         "01dbee7f4a9e243e988b62c73cda935d"
         "a05378b93244ec8f48a99e61ad799d86"
     >>,
-    Pbkdf2 = emqx_passwd:hash({pbkdf2, sha, Pbkdf2Salt, 2, 32}, Password),
+    _Pbkdf2 = emqx_passwd:hash({pbkdf2, sha, Pbkdf2Salt, 2, 32}, Password),
     true = emqx_passwd:check_pass({pbkdf2, sha, Pbkdf2Salt, 2, 32}, Pbkdf2, Password),
     false = emqx_passwd:check_pass({pbkdf2, sha, Pbkdf2Salt, 2, 32}, Pbkdf2, WrongPassword),
-    false = emqx_passwd:check_pass({pbkdf2, sha, Pbkdf2Salt, 2, BadDKlen}, Pbkdf2, Password),
+    ?assertException(
+        error, _, emqx_passwd:check_pass({pbkdf2, sha, Pbkdf2Salt, 2, BadDKlen}, Pbkdf2, Password)
+    ),
 
     %% Invalid derived_length, pbkdf2 fails
-    ?assertException(error, _, emqx_passwd:hash({pbkdf2, sha, Pbkdf2Salt, 2, BadDKlen}, Password)).
+    ?assertException(error, _, emqx_passwd:hash({pbkdf2, sha, Pbkdf2Salt, 2, BadDKlen}, Password)),
+
+    %% invalid salt (not binary)
+    ?assertException(
+        error,
+        {salt_not_string, false},
+        emqx_passwd:hash({sha256, false, suffix}, Password)
+    ),
+
+    %% invalid password (not binary)
+    ?assertException(
+        error,
+        {password_not_string, bad_password_type},
+        emqx_passwd:hash({sha256, Salt, suffix}, bad_password_type)
+    ).

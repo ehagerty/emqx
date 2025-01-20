@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,7 +28,9 @@
 ]).
 
 %% config schema provides
--export([fields/1, desc/1]).
+-export([namespace/0, fields/1, desc/1]).
+
+namespace() -> "gateway".
 
 fields(exproto) ->
     [

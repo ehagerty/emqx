@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -49,9 +49,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3,
-    format_status/2
+    terminate/2
 ]).
 
 -type limiter_id() :: emqx_limiter_schema:limiter_id().
@@ -77,7 +75,7 @@
 start_server(Type) ->
     emqx_limiter_server_sup:start(Type).
 
--spec start_server(limiter_type(), hocons:config()) -> _.
+-spec start_server(limiter_type(), hocon:config()) -> _.
 start_server(Type, Cfg) ->
     emqx_limiter_server_sup:start(Type, Cfg).
 
@@ -131,7 +129,7 @@ delete_root(Type) ->
     delete_bucket(?ROOT_ID, Type).
 
 post_config_update([limiter], _Config, NewConf, _OldConf, _AppEnvs) ->
-    Conf = emqx_limiter_schema:convert_node_opts(NewConf),
+    Conf = emqx_limiter_utils:convert_node_opts(NewConf),
     _ = [on_post_config_update(Type, Cfg) || {Type, Cfg} <- maps:to_list(Conf)],
     ok.
 
@@ -242,37 +240,6 @@ handle_info(Info, State) ->
 terminate(_Reason, _State) ->
     emqx_config_handler:remove_handler([limiter]),
     ok.
-
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Convert process state when code is changed
-%% @end
-%%--------------------------------------------------------------------
--spec code_change(
-    OldVsn :: term() | {down, term()},
-    State :: term(),
-    Extra :: term()
-) ->
-    {ok, NewState :: term()}
-    | {error, Reason :: term()}.
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called for changing the form and appearance
-%% of gen_server status when it is returned from sys:get_status/1,2
-%% or when it appears in termination error logs.
-%% @end
-%%--------------------------------------------------------------------
--spec format_status(
-    Opt :: normal | terminate,
-    Status :: list()
-) -> Status :: term().
-format_status(_Opt, Status) ->
-    Status.
 
 %%--------------------------------------------------------------------
 %%  Internal functions

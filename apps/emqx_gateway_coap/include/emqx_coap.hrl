@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 %%--------------------------------------------------------------------
+
+-ifndef(EMQX_COAP_HRL).
 
 -define(APP, emqx_coap).
 -define(DEFAULT_COAP_PORT, 5683).
@@ -79,3 +81,20 @@
 }).
 
 -type coap_message() :: #coap_message{}.
+
+-define(QUERY_PARAMS_MAPPING, [
+    {<<"c">>, <<"clientid">>},
+    {<<"t">>, <<"token">>},
+    {<<"u">>, <<"username">>},
+    {<<"p">>, <<"password">>},
+    {<<"q">>, <<"qos">>},
+    {<<"r">>, <<"retain">>}
+]).
+
+-type sub_data() :: #{
+    topic := emqx_types:topic(),
+    token := binary(),
+    subopts := emqx_types:subopts()
+}.
+
+-endif.

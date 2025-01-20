@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 %%--------------------------------------------------------------------
 
 -module(emqx_vm).
+
+-include("logger.hrl").
 
 -export([
     schedulers/0,
@@ -44,7 +46,7 @@
     get_otp_version/0
 ]).
 
--export([cpu_util/0]).
+-export([cpu_util/0, cpu_util/1]).
 
 -ifdef(TEST).
 -compile(export_all).
@@ -376,19 +378,28 @@ avg15() ->
     compat_windows(fun cpu_sup:avg15/0).
 
 cpu_util() ->
-    compat_windows(fun cpu_sup:util/0).
+    compat_windows(fun() -> emqx_cpu_sup_worker:cpu_util() end).
 
-compat_windows(Fun) ->
-    case os:type() of
-        {win32, nt} ->
-            0.0;
-        _Type ->
-            case catch Fun() of
+cpu_util(Args) ->
+    compat_windows(fun() -> emqx_cpu_sup_worker:cpu_util(Args) end).
+
+-spec compat_windows(function()) -> any().
+compat_windows(Fun) when is_function(Fun, 0) ->
+    case emqx_os_mon:is_os_check_supported() of
+        true ->
+            try Fun() of
                 Val when is_float(Val) -> floor(Val * 100) / 100;
                 Val when is_number(Val) -> Val;
-                _Error -> 0.0
-            end
-    end.
+                Val when is_tuple(Val) -> Val;
+                _ -> 0.0
+            catch
+                _:_ -> 0.0
+            end;
+        false ->
+            0.0
+    end;
+compat_windows(Fun) ->
+    error({badarg, Fun}).
 
 load(Avg) ->
     floor((Avg / 256) * 100) / 100.
@@ -409,6 +420,9 @@ get_otp_version() ->
     end.
 
 read_otp_version() ->
+    string:trim(do_read_otp_version()).
+
+do_read_otp_version() ->
     ReleasesDir = filename:join([code:root_dir(), "releases"]),
     Filename = filename:join([ReleasesDir, emqx_app:get_release(), "BUILD_INFO"]),
     case file:read_file(Filename) of

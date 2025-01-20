@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 -include("types.hrl").
 -include("logger.hrl").
 -include("emqx_hooks.hrl").
+-include("emqx_mqtt.hrl").
 
 -export([
     start_link/0,
@@ -65,8 +66,8 @@
 -import(emqx_utils, [start_timer/2]).
 
 -record(state, {
-    heartbeat :: maybe(reference()),
-    ticker :: maybe(reference()),
+    heartbeat :: option(reference()),
+    ticker :: option(reference()),
     sysdescr :: binary()
 }).
 
@@ -279,7 +280,7 @@ on_client_subscribed(
         clientid => ClientId,
         username => Username,
         protocol => Protocol,
-        topic => Topic,
+        topic => emqx_topic:maybe_format_share(Topic),
         subopts => SubOpts,
         ts => erlang:system_time(millisecond)
     },
@@ -298,7 +299,7 @@ on_client_unsubscribed(
         clientid => ClientId,
         username => Username,
         protocol => Protocol,
-        topic => Topic,
+        topic => emqx_topic:maybe_format_share(Topic),
         ts => erlang:system_time(millisecond)
     },
     publish(unsubscribed, Payload).

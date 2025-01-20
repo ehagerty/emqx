@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,8 +28,16 @@
 -import(emqx_coap_channel, [run_hooks/3]).
 
 -define(UNSUB(Topic, Msg), #{subscribe => {Topic, Msg}}).
--define(SUB(Topic, Token, Msg), #{subscribe => {{Topic, Token}, Msg}}).
--define(SUBOPTS, #{qos => 0, rh => 1, rap => 0, nl => 0, is_new => false}).
+-define(SUB(Topic, Token, Opts, Msg), #{
+    subscribe => {
+        #{
+            topic => Topic,
+            token => Token,
+            subopts => Opts
+        },
+        Msg
+    }
+}).
 
 %% TODO maybe can merge this code into emqx_coap_session, simplify the call chain
 
@@ -74,15 +82,23 @@ check_topic([]) ->
 check_topic(Path) ->
     {ok, emqx_http_lib:uri_decode(iolist_to_binary(lists:join(<<"/">>, Path)))}.
 
-get_sub_opts(#coap_message{options = Opts} = Msg) ->
-    SubOpts = maps:fold(fun parse_sub_opts/3, #{}, Opts),
+get_sub_opts(Msg) ->
+    SubOpts = maps:fold(
+        fun parse_sub_opts/3, #{}, emqx_coap_message:extract_uri_query(Msg)
+    ),
     case SubOpts of
         #{qos := _} ->
-            maps:merge(SubOpts, ?SUBOPTS);
+            maps:merge(mk_subopts(), SubOpts);
         _ ->
             CfgType = emqx_conf:get([gateway, coap, subscribe_qos], ?QOS_0),
-            maps:merge(SubOpts, ?SUBOPTS#{qos => type_to_qos(CfgType, Msg)})
+            maps:merge(mk_subopts(type_to_qos(CfgType, Msg)), SubOpts)
     end.
+
+mk_subopts() ->
+    mk_subopts(?QOS_0).
+
+mk_subopts(QoS) ->
+    #{qos => QoS, rh => 1, rap => 0, nl => 0, is_new => false}.
 
 parse_sub_opts(<<"qos">>, V, Opts) ->
     Opts#{qos => erlang:binary_to_integer(V)};
@@ -108,28 +124,24 @@ type_to_qos(coap, #coap_message{type = Type}) ->
     end.
 
 get_publish_opts(Msg) ->
-    case emqx_coap_message:get_option(uri_query, Msg) of
-        undefined ->
-            #{};
-        Qs ->
-            maps:fold(
-                fun
-                    (<<"retain">>, V, Acc) ->
-                        Val = V =:= <<"true">>,
-                        Acc#{retain => Val};
-                    (<<"expiry">>, V, Acc) ->
-                        Val = erlang:binary_to_integer(V),
-                        Acc#{expiry_interval => Val};
-                    (<<"qos">>, V, Acc) ->
-                        Val = erlang:binary_to_integer(V),
-                        Acc#{qos => Val};
-                    (_, _, Acc) ->
-                        Acc
-                end,
-                #{},
-                Qs
-            )
-    end.
+    Qs = emqx_coap_message:extract_uri_query(Msg),
+    maps:fold(
+        fun
+            (<<"retain">>, V, Acc) ->
+                Val = V =:= <<"true">>,
+                Acc#{retain => Val};
+            (<<"expiry">>, V, Acc) ->
+                Val = erlang:binary_to_integer(V),
+                Acc#{expiry_interval => Val};
+            (<<"qos">>, V, Acc) ->
+                Val = erlang:binary_to_integer(V),
+                Acc#{qos => Val};
+            (_, _, Acc) ->
+                Acc
+        end,
+        #{},
+        Qs
+    ).
 
 get_publish_qos(Msg, PublishOpts) ->
     case PublishOpts of
@@ -174,7 +186,7 @@ subscribe(#coap_message{token = Token} = Msg, Topic, Ctx, CInfo) ->
             MountTopic = mount(CInfo, Topic),
             emqx_broker:subscribe(MountTopic, ClientId, SubOpts),
             run_hooks(Ctx, 'session.subscribed', [CInfo, MountTopic, SubOpts]),
-            ?SUB(MountTopic, Token, Msg);
+            ?SUB(MountTopic, Token, SubOpts, Msg);
         _ ->
             reply({error, unauthorized}, Msg)
     end.
@@ -182,7 +194,7 @@ subscribe(#coap_message{token = Token} = Msg, Topic, Ctx, CInfo) ->
 unsubscribe(Msg, Topic, Ctx, CInfo) ->
     MountTopic = mount(CInfo, Topic),
     emqx_broker:unsubscribe(MountTopic),
-    run_hooks(Ctx, 'session.unsubscribed', [CInfo, Topic, ?SUBOPTS]),
+    run_hooks(Ctx, 'session.unsubscribed', [CInfo, Topic, mk_subopts()]),
     ?UNSUB(MountTopic, Msg).
 
 mount(#{mountpoint := Mountpoint}, Topic) ->

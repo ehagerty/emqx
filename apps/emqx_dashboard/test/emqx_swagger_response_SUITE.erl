@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,8 +20,7 @@
 -behaviour(hocon_schema).
 
 -include_lib("eunit/include/eunit.hrl").
-
--include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -import(hoconsc, [mk/2]).
@@ -36,16 +35,20 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    end_suite(),
-    Config.
-
-end_suite() ->
-    application:unload(emqx_management),
-    emqx_mgmt_api_test_util:end_suite([emqx_conf]).
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 t_simple_binary(_config) ->
     Path = "/simple/bin",
@@ -189,7 +192,7 @@ t_nest_object(_Config) ->
 t_empty(_Config) ->
     ?assertThrow(
         {error, #{
-            msg := <<"Object only supports not empty proplists">>,
+            msg := <<"Object only supports non-empty fields list">>,
             args := [],
             module := ?MODULE
         }},
@@ -273,7 +276,7 @@ t_bad_ref(_Config) ->
     ?assertThrow(
         {error, #{
             module := ?MODULE,
-            msg := <<"Object only supports not empty proplists">>
+            msg := <<"Object only supports non-empty fields list">>
         }},
         validate(Path, Object, ExpectRefs)
     ),
@@ -282,7 +285,7 @@ t_bad_ref(_Config) ->
 t_none_ref(_Config) ->
     Path = "/ref/none",
     ?assertError(
-        {failed_to_generate_swagger_spec, ?MODULE, Path},
+        {failed_to_generate_swagger_spec, ?MODULE, Path, error, _FunctionClause, _Stacktrace},
         validate(Path, #{}, [])
     ),
     ok.
@@ -317,68 +320,68 @@ t_sub_fields(_Config) ->
     validate(Path, Object, ExpectRefs),
     ok.
 
-t_complicated_type(_Config) ->
+t_complex_type(_Config) ->
     Path = "/ref/complex_type",
-    Object = #{
-        <<"content">> => #{
-            <<"application/json">> =>
-                #{
-                    <<"schema">> => #{
-                        <<"properties">> =>
-                            [
-                                {<<"no_neg_integer">>, #{minimum => 0, type => integer}},
-                                {<<"url">>, #{example => <<"http://127.0.0.1">>, type => string}},
-                                {<<"server">>, #{example => <<"127.0.0.1:80">>, type => string}},
-                                {<<"connect_timeout">>, #{
-                                    example => infinity,
-                                    <<"oneOf">> => [
-                                        #{example => infinity, type => string},
-                                        #{type => integer}
-                                    ]
-                                }},
-                                {<<"pool_type">>, #{enum => [random, hash], type => string}},
-                                {<<"timeout">>, #{
-                                    example => infinity,
-                                    <<"oneOf">> => [
-                                        #{example => infinity, type => string}, #{type => integer}
-                                    ]
-                                }},
-                                {<<"bytesize">>, #{example => <<"32MB">>, type => string}},
-                                {<<"wordsize">>, #{example => <<"1024KB">>, type => string}},
-                                {<<"maps">>, #{example => #{}, type => object}},
-                                {<<"comma_separated_list">>, #{
-                                    example => <<"item1,item2">>, type => string
-                                }},
-                                {<<"comma_separated_atoms">>, #{
-                                    example => <<"item1,item2">>, type => string
-                                }},
-                                {<<"log_level">>, #{
-                                    enum => [
-                                        debug,
-                                        info,
-                                        notice,
-                                        warning,
-                                        error,
-                                        critical,
-                                        alert,
-                                        emergency,
-                                        all
-                                    ],
-                                    type => string
-                                }},
-                                {<<"fix_integer">>, #{
-                                    default => 100, enum => [100], type => integer
-                                }}
-                            ],
-                        <<"type">> => object
-                    }
-                }
-        }
-    },
     {OperationId, Spec, Refs, #{}} = emqx_dashboard_swagger:parse_spec_ref(?MODULE, Path, #{}),
     ?assertEqual(test, OperationId),
     Response = maps:get(responses, maps:get(post, Spec)),
-    ?assertEqual(Object, maps:get(<<"200">>, Response)),
+    ResponseBody = maps:get(<<"200">>, Response),
+    Content = maps:get(<<"content">>, ResponseBody),
+    JsonContent = maps:get(<<"application/json">>, Content),
+    Schema = maps:get(<<"schema">>, JsonContent),
+    ?assertMatch(#{<<"type">> := object}, Schema),
+    Properties = maps:get(<<"properties">>, Schema),
+    ?assertMatch(
+        [
+            {<<"no_neg_integer">>, #{minimum := 0, type := integer}},
+            {<<"url">>, #{
+                example := <<"http://127.0.0.1">>, type := string
+            }},
+            {<<"server">>, #{
+                example := <<"127.0.0.1:80">>, type := string
+            }},
+            {<<"connect_timeout">>, #{
+                example := _, type := string
+            }},
+            {<<"pool_type">>, #{
+                enum := [random, hash], type := string
+            }},
+            {<<"timeout">>, #{
+                <<"oneOf">> := [
+                    #{example := _, type := string},
+                    #{enum := [infinity], type := string}
+                ]
+            }},
+            {<<"bytesize">>, #{
+                example := <<"32MB">>, type := string
+            }},
+            {<<"wordsize">>, #{
+                example := <<"1024KB">>, type := string
+            }},
+            {<<"maps">>, #{example := #{}, type := object}},
+            {<<"comma_separated_list">>, #{
+                example := <<"item1,item2">>, type := string
+            }},
+            {<<"comma_separated_atoms">>, #{
+                example := <<"item1,item2">>, type := string
+            }},
+            {<<"log_level">>, #{
+                enum := [
+                    debug,
+                    info,
+                    notice,
+                    warning,
+                    error,
+                    critical,
+                    alert,
+                    emergency,
+                    all
+                ],
+                type := string
+            }}
+        ],
+        Properties
+    ),
     ?assertEqual([], Refs),
     ok.
 
@@ -410,7 +413,7 @@ t_ref_array_with_key(_Config) ->
                         {<<"percent_ex">>, #{
                             description => <<"percent example">>,
                             example => <<"12%">>,
-                            type => number
+                            type => string
                         }},
                         {<<"duration_ms_ex">>, #{
                             description => <<"duration ms example">>,
@@ -647,17 +650,16 @@ schema("/ref/complex_type") ->
                     {no_neg_integer, hoconsc:mk(non_neg_integer(), #{})},
                     {url, hoconsc:mk(url(), #{})},
                     {server, hoconsc:mk(emqx_schema:ip_port(), #{})},
-                    {connect_timeout,
-                        hoconsc:mk(emqx_bridge_http_connector:connect_timeout(), #{})},
-                    {pool_type, hoconsc:mk(emqx_bridge_http_connector:pool_type(), #{})},
-                    {timeout, hoconsc:mk(timeout(), #{})},
+                    {connect_timeout, hoconsc:mk(emqx_schema:timeout_duration(), #{})},
+                    {pool_type, hoconsc:mk(hoconsc:enum([random, hash]), #{})},
+                    {timeout,
+                        hoconsc:mk(hoconsc:union([infinity, emqx_schema:timeout_duration()]), #{})},
                     {bytesize, hoconsc:mk(emqx_schema:bytesize(), #{})},
                     {wordsize, hoconsc:mk(emqx_schema:wordsize(), #{})},
                     {maps, hoconsc:mk(map(), #{})},
                     {comma_separated_list, hoconsc:mk(emqx_schema:comma_separated_list(), #{})},
                     {comma_separated_atoms, hoconsc:mk(emqx_schema:comma_separated_atoms(), #{})},
-                    {log_level, hoconsc:mk(emqx_conf_schema:log_level(), #{})},
-                    {fix_integer, hoconsc:mk(typerefl:integer(100), #{})}
+                    {log_level, hoconsc:mk(emqx_conf_schema:log_level(), #{})}
                 ]
             }
         }
@@ -681,10 +683,13 @@ to_schema(Object) ->
         post => #{responses => #{200 => Object, 201 => Object}}
     }.
 
+roots() -> [].
+namespace() -> undefined.
+
 fields(good_ref) ->
     [
         {'webhook-host', mk(emqx_schema:ip_port(), #{default => <<"127.0.0.1:80">>})},
-        {log_dir, mk(emqx_schema:file(), #{example => "var/log/emqx"})},
+        {log_dir, mk(string(), #{example => "var/log/emqx"})},
         {tag, mk(binary(), #{desc => <<"tag">>})}
     ];
 fields(nest_ref) ->

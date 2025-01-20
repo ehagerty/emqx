@@ -40,7 +40,7 @@ check_api_docs() {
     local status
     status="$(curl -s -o /dev/null -w "%{http_code}" "$url")"
     if [ "$status" != "200" ]; then
-        echo "emqx is not responding on $API_DOCS_URL"
+        echo "emqx return non-200 responses($status) on $url"
         exit 1
     fi
 }
@@ -82,8 +82,10 @@ main() {
     ## The json status feature was added after hotconf and bridges schema API
     if [ "$JSON_STATUS" != 'NOT_JSON' ]; then
         check_swagger_json
-        check_schema_json hotconf "EMQX Hot Conf API Schema"
-        check_schema_json bridges "EMQX Data Bridge API Schema"
+        check_schema_json hotconf "Hot Conf Schema"
+        check_schema_json bridges "Data Bridge Schema"
+        check_schema_json actions "Actions and Sources Schema"
+        check_schema_json connectors "Connectors Schema"
     fi
 }
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ get_stats(Node) ->
 
 -spec get_metrics(node()) -> [{emqx_metrics:metric_name(), non_neg_integer()}] | {badrpc, _}.
 get_metrics(Node) ->
-    rpc:call(Node, emqx_metrics, all, []).
+    rpc:call(Node, emqx_metrics, all, [], timer:seconds(5)).
 
 -spec clean_authz_cache(node(), emqx_types:clientid()) ->
     ok

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_sqlserver_SUITE).
@@ -7,7 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_bridge_sqlserver/include/emqx_bridge_sqlserver.hrl").
+-include("../include/emqx_bridge_sqlserver.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -47,7 +47,7 @@
 -define(SQL_SERVER_USERNAME, "sa").
 -define(SQL_SERVER_PASSWORD, "mqtt_public1").
 -define(BATCH_SIZE, 10).
--define(REQUEST_TIMEOUT_MS, 500).
+-define(REQUEST_TIMEOUT_MS, 2_000).
 
 -define(WORKER_POOL_SIZE, 4).
 
@@ -122,19 +122,21 @@ init_per_group(_Group, Config) ->
 end_per_group(Group, Config) when Group =:= with_batch; Group =:= without_batch ->
     connect_and_drop_table(Config),
     connect_and_drop_db(Config),
+    Apps = ?config(apps, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
 
 init_per_suite(Config) ->
-    Config.
+    Passfile = filename:join(?config(priv_dir, Config), "passfile"),
+    ok = file:write_file(Passfile, <<?SQL_SERVER_PASSWORD>>),
+    [{sqlserver_passfile, Passfile} | Config].
 
 end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_common_test_helpers:stop_apps([emqx_bridge, emqx_conf]),
     ok.
 
 init_per_testcase(_Testcase, Config) ->
@@ -187,13 +189,42 @@ t_setup_via_config_and_publish(Config) ->
     ),
     ok.
 
+t_undefined_vars_as_null(Config) ->
+    ?assertMatch(
+        {ok, _},
+        create_bridge(Config, #{<<"undefined_vars_as_null">> => true})
+    ),
+    SentData = maps:put(payload, undefined, sent_data("tmp")),
+    ?check_trace(
+        begin
+            ?wait_async_action(
+                ?assertEqual(ok, send_message(Config, SentData)),
+                #{?snk_kind := sqlserver_connector_query_return},
+                10_000
+            ),
+            ?assertMatch(
+                [{null}],
+                connect_and_get_payload(Config)
+            ),
+            ok
+        end,
+        fun(Trace0) ->
+            Trace = ?of_kind(sqlserver_connector_query_return, Trace0),
+            ?assertMatch([#{result := ok}], Trace),
+            ok
+        end
+    ),
+    ok.
+
 t_setup_via_http_api_and_publish(Config) ->
     BridgeType = ?config(sqlserver_bridge_type, Config),
     Name = ?config(sqlserver_name, Config),
     SQLServerConfig0 = ?config(sqlserver_config, Config),
     SQLServerConfig = SQLServerConfig0#{
         <<"name">> => Name,
-        <<"type">> => BridgeType
+        <<"type">> => BridgeType,
+        %% NOTE: using literal password with HTTP API requests.
+        <<"password">> => <<?SQL_SERVER_PASSWORD>>
     },
     ?assertMatch(
         {ok, _},
@@ -245,6 +276,7 @@ t_create_disconnected(Config) ->
         ?assertMatch({ok, _}, create_bridge(Config)),
         health_check_resource_down(Config)
     end),
+    timer:sleep(10_000),
     health_check_resource_ok(Config),
     ok.
 
@@ -313,7 +345,8 @@ t_simple_query(Config) ->
         {ok, _},
         create_bridge(Config)
     ),
-    {Requests, Vals} = gen_batch_req(BatchSize),
+
+    {Requests, Vals} = gen_batch_req(Config, BatchSize),
     ?check_trace(
         begin
             ?wait_async_action(
@@ -348,7 +381,7 @@ t_simple_query(Config) ->
     ok.
 
 -define(MISSING_TINYINT_ERROR,
-    "[Microsoft][ODBC Driver 17 for SQL Server][SQL Server]"
+    "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
     "Conversion failed when converting the varchar value 'undefined' to data type tinyint. SQLSTATE IS: 22018"
 ).
 
@@ -416,16 +449,23 @@ common_init(ConfigT) ->
             ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
             ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            % Ensure enterprise bridge module is loaded
-            ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_bridge, odbc]),
-            _ = emqx_bridge_enterprise:module_info(),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx_conf,
+                    emqx_bridge_sqlserver,
+                    emqx_bridge,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
             % Connect to sqlserver directly
             % drop old db and table, and then create new ones
             connect_and_create_db_and_table(Config0),
             {Name, SQLServerConf} = sqlserver_config(BridgeType, Config0),
             Config =
                 [
+                    {apps, Apps},
                     {sqlserver_config, SQLServerConf},
                     {sqlserver_bridge_type, BridgeType},
                     {sqlserver_name, Name},
@@ -449,6 +489,7 @@ sqlserver_config(BridgeType, Config) ->
     Name = atom_to_binary(?MODULE),
     BatchSize = batch_size(Config),
     QueryMode = ?config(query_mode, Config),
+    Passfile = ?config(sqlserver_passfile, Config),
     ConfigString =
         io_lib:format(
             "bridges.~s.~s {\n"
@@ -472,7 +513,7 @@ sqlserver_config(BridgeType, Config) ->
                 Server,
                 ?SQL_SERVER_DATABASE,
                 ?SQL_SERVER_USERNAME,
-                ?SQL_SERVER_PASSWORD,
+                "file://" ++ Passfile,
                 ?SQL_BRIDGE,
                 ?SQL_SERVER_DRIVER,
                 BatchSize,
@@ -514,14 +555,15 @@ create_bridge_http(Params) ->
 send_message(Config, Payload) ->
     Name = ?config(sqlserver_name, Config),
     BridgeType = ?config(sqlserver_bridge_type, Config),
-    BridgeID = emqx_bridge_resource:bridge_id(BridgeType, Name),
-    emqx_bridge:send_message(BridgeID, Payload).
+    ActionId = emqx_bridge_v2:id(BridgeType, Name),
+    emqx_bridge_v2:query(BridgeType, Name, {ActionId, Payload}, #{}).
 
 query_resource(Config, Request) ->
     Name = ?config(sqlserver_name, Config),
     BridgeType = ?config(sqlserver_bridge_type, Config),
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
-    emqx_resource:query(ResourceID, Request, #{timeout => 1_000}).
+    ID = emqx_bridge_v2:id(BridgeType, Name),
+    ResID = emqx_connector_resource:resource_id(BridgeType, Name),
+    emqx_resource:query(ID, Request, #{timeout => 1_000, connector_resource_id => ResID}).
 
 query_resource_async(Config, Request) ->
     Name = ?config(sqlserver_name, Config),
@@ -540,7 +582,17 @@ resource_id(Config) ->
     _ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name).
 
 health_check_resource_ok(Config) ->
-    ?assertEqual({ok, connected}, emqx_resource_manager:health_check(resource_id(Config))).
+    BridgeType = ?config(sqlserver_bridge_type, Config),
+    Name = ?config(sqlserver_name, Config),
+    % Wait for reconnection.
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 10,
+        begin
+            ?assertEqual({ok, connected}, emqx_resource_manager:health_check(resource_id(Config))),
+            ?assertMatch(#{status := connected}, emqx_bridge_v2:health_check(BridgeType, Name))
+        end
+    ).
 
 health_check_resource_down(Config) ->
     case emqx_resource_manager:health_check(resource_id(Config)) of
@@ -629,11 +681,7 @@ batch_size(Config) ->
     end.
 
 conn_str([], Acc) ->
-    %% TODO: for msodbc 18+, we need to add "Encrypt=YES;TrustServerCertificate=YES"
-    %% but havn't tested now
-    %% we should use this for msodbcsql 18+
-    %% lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
-    lists:join(";", Acc);
+    lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
 conn_str([{driver, Driver} | Opts], Acc) ->
     conn_str(Opts, ["Driver=" ++ str(Driver) | Acc]);
 conn_str([{host, Host} | Opts], Acc) ->
@@ -661,13 +709,16 @@ sent_data(Payload) ->
         qos => 0
     }.
 
-gen_batch_req(Count) when
+gen_batch_req(Config, Count) when
     is_integer(Count) andalso Count > 0
 ->
+    BridgeType = ?config(sqlserver_bridge_type, Config),
+    Name = ?config(sqlserver_name, Config),
+    ActionId = emqx_bridge_v2:id(BridgeType, Name),
     Vals = [{str(erlang:unique_integer())} || _Seq <- lists:seq(1, Count)],
-    Requests = [{send_message, sent_data(Payload)} || {Payload} <- Vals],
+    Requests = [{ActionId, sent_data(Payload)} || {Payload} <- Vals],
     {Requests, Vals};
-gen_batch_req(Count) ->
+gen_batch_req(_Config, Count) ->
     ct:pal("Gen batch requests failed with unexpected Count: ~p", [Count]).
 
 str(List) when is_list(List) ->

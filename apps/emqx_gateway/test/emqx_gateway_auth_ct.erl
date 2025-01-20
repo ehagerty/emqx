@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -27,9 +27,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3,
-    format_status/2
+    terminate/2
 ]).
 
 -import(
@@ -40,12 +38,12 @@
     ]
 ).
 
--include_lib("emqx_authn/include/emqx_authn.hrl").
+-include_lib("emqx_auth/include/emqx_authn.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("emqx/include/emqx_placeholder.hrl").
 
--define(CALL(Msg), gen_server:call(?MODULE, {?FUNCTION_NAME, Msg})).
+-define(CALL(Msg), gen_server:call(?MODULE, {?FUNCTION_NAME, Msg}, 15000)).
 
 -define(AUTHN_HTTP_PORT, 37333).
 -define(AUTHN_HTTP_PATH, "/auth").
@@ -123,12 +121,6 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-format_status(_Opt, Status) ->
-    Status.
 
 %%------------------------------------------------------------------------------
 %% Authenticators
@@ -238,8 +230,11 @@ http_authz_config() ->
 init_gateway_conf() ->
     ok = emqx_common_test_helpers:load_config(
         emqx_gateway_schema,
-        merge_conf([X:default_config() || X <- ?CONFS], [])
+        merge_conf(list_gateway_conf(), [])
     ).
+
+list_gateway_conf() ->
+    [X:default_config() || X <- ?CONFS].
 
 merge_conf([Conf | T], Acc) ->
     case re:run(Conf, "\s*gateway\\.(.*)", [global, {capture, all_but_first, list}, dotall]) of

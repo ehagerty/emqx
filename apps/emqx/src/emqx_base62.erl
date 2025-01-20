@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -27,9 +27,7 @@
 %%--------------------------------------------------------------------
 
 %% @doc Encode any data to base62 binary
--spec encode(string() | integer() | binary()) -> binary().
-encode(I) when is_integer(I) ->
-    encode(integer_to_binary(I));
+-spec encode(string() | binary()) -> binary().
 encode(S) when is_list(S) ->
     encode(unicode:characters_to_binary(S));
 encode(B) when is_binary(B) ->

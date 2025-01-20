@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 -module(emqx_utils_maps_tests).
 -include_lib("eunit/include/eunit.hrl").
+
+-import(emqx_utils_maps, [indent/3, unindent/2]).
 
 best_effort_recursive_sum_test_() ->
     DummyLogger = fun(_) -> ok end,
@@ -108,5 +110,69 @@ best_effort_recursive_sum_test_() ->
             emqx_utils_maps:best_effort_recursive_sum(
                 #{foo => #{bar => #{foo => []}}}, #{foo => 1}, DummyLogger
             )
+        )
+    ].
+
+key_comparer_test() ->
+    Comp = emqx_utils_maps:key_comparer(foo),
+    ?assertEqual(
+        [
+            #{},
+            #{baz => 42},
+            #{foo => 1},
+            #{foo => 42},
+            #{foo => bar, baz => 42}
+        ],
+        lists:sort(Comp, [
+            #{foo => 42},
+            #{baz => 42},
+            #{foo => bar, baz => 42},
+            #{foo => 1},
+            #{}
+        ])
+    ).
+
+map_indent_unindent_test_() ->
+    M = #{a => 1, b => 2},
+    [
+        ?_assertEqual(
+            #{a => 1, c => #{b => 2}},
+            indent(c, [b], M)
+        ),
+        ?_assertEqual(
+            M,
+            unindent(c, indent(c, [b], M))
+        ),
+        ?_assertEqual(
+            #{a => 1, b => #{b => 2}},
+            indent(b, [b], M)
+        ),
+        ?_assertEqual(
+            M,
+            unindent(b, #{a => 1, b => #{b => 2}})
+        ),
+        ?_assertEqual(
+            #{a => 2},
+            unindent(b, #{a => 1, b => #{a => 2}})
+        ),
+        ?_assertEqual(
+            #{c => #{a => 1, b => 2}},
+            indent(c, [a, b], M)
+        ),
+        ?_assertEqual(
+            #{a => 1, b => 2, c => #{}},
+            indent(c, [], M)
+        ),
+        ?_assertEqual(
+            #{a => 1, b => 2, c => #{}},
+            indent(c, [d, e, f], M)
+        ),
+        ?_assertEqual(
+            #{a => 1, b => 2},
+            unindent(c, M)
+        ),
+        ?_assertEqual(
+            #{a => #{c => 3, d => 4}},
+            unindent(b, #{a => #{c => 3}, b => #{a => #{d => 4}}})
         )
     ].

@@ -1,5 +1,5 @@
-%%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%-------------------------------------------------------------------
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,6 +16,10 @@
 
 -module(emqx_bridge_mqtt_connector_schema).
 
+-feature(maybe_expr, enable).
+
+-behaviour(emqx_connector_examples).
+
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
@@ -30,13 +34,18 @@
     parse_server/1
 ]).
 
+-export([
+    connector_examples/1
+]).
+
 -import(emqx_schema, [mk_duration/2]).
 
 -import(hoconsc, [mk/2, ref/2]).
 
+-define(CONNECTOR_TYPE, mqtt).
 -define(MQTT_HOST_OPTS, #{default_port => 1883}).
 
-namespace() -> "connector-mqtt".
+namespace() -> "connector_mqtt".
 
 roots() ->
     fields("config").
@@ -61,6 +70,14 @@ fields("config") ->
                     }
                 )}
         ];
+fields("config_connector") ->
+    emqx_connector_schema:common_fields() ++ fields("specific_connector_config");
+fields("specific_connector_config") ->
+    [{pool_size, fun egress_pool_size/1}] ++
+        emqx_connector_schema:resource_opts_ref(?MODULE, resource_opts) ++
+        fields("server_configs");
+fields(resource_opts) ->
+    emqx_connector_schema:resource_opts_fields();
 fields("server_configs") ->
     [
         {mode,
@@ -74,6 +91,15 @@ fields("server_configs") ->
             )},
         {server, emqx_schema:servers_sc(#{desc => ?DESC("server")}, ?MQTT_HOST_OPTS)},
         {clientid_prefix, mk(binary(), #{required => false, desc => ?DESC("clientid_prefix")})},
+        {static_clientids,
+            mk(
+                hoconsc:array(ref(?MODULE, static_clientid_entry)),
+                #{
+                    desc => ?DESC("static_clientid_entry"),
+                    default => [],
+                    validator => fun static_clientid_validator/1
+                }
+            )},
         {reconnect_interval, mk(string(), #{deprecated => {since, "v5.0.16"}})},
         {proto_ver,
             mk(
@@ -99,13 +125,9 @@ fields("server_configs") ->
                 }
             )},
         {password,
-            mk(
-                binary(),
+            emqx_schema_secret:mk(
                 #{
-                    format => <<"password">>,
-                    sensitive => true,
-                    desc => ?DESC("password"),
-                    converter => fun emqx_schema:password_converter/2
+                    desc => ?DESC("password")
                 }
             )},
         {clean_start,
@@ -116,7 +138,7 @@ fields("server_configs") ->
                     desc => ?DESC("clean_start")
                 }
             )},
-        {keepalive, mk_duration("MQTT Keepalive.", #{default => <<"300s">>})},
+        {keepalive, mk_duration("MQTT Keepalive.", #{default => <<"160s">>})},
         {retry_interval,
             mk_duration(
                 "Message retry interval. Delay for the MQTT bridge to retry sending the QoS1/QoS2 "
@@ -135,6 +157,7 @@ fields("server_configs") ->
 fields("ingress") ->
     [
         {pool_size, fun ingress_pool_size/1},
+        %% array
         {remote,
             mk(
                 ref(?MODULE, "ingress_remote"),
@@ -148,7 +171,24 @@ fields("ingress") ->
                 }
             )}
     ];
+fields(connector_ingress) ->
+    [
+        {remote,
+            mk(
+                ref(?MODULE, "ingress_remote"),
+                #{desc => ?DESC("ingress_remote")}
+            )},
+        {local,
+            mk(
+                ref(?MODULE, "ingress_local"),
+                #{
+                    desc => ?DESC("ingress_local"),
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )}
+    ];
 fields("ingress_remote") ->
+    %% Avoid modifying this field, as it's used by bridge v1 API/schema.
     [
         {topic,
             mk(
@@ -169,10 +209,11 @@ fields("ingress_remote") ->
             )}
     ];
 fields("ingress_local") ->
+    %% Avoid modifying this field, as it's used by bridge v1 API/schema.
     [
         {topic,
             mk(
-                binary(),
+                emqx_schema:template(),
                 #{
                     validator => fun emqx_schema:non_empty_string/1,
                     desc => ?DESC("ingress_local_topic"),
@@ -189,7 +230,7 @@ fields("ingress_local") ->
             )},
         {retain,
             mk(
-                hoconsc:union([boolean(), binary()]),
+                hoconsc:union([boolean(), emqx_schema:template()]),
                 #{
                     default => <<"${retain}">>,
                     desc => ?DESC("retain")
@@ -197,7 +238,7 @@ fields("ingress_local") ->
             )},
         {payload,
             mk(
-                binary(),
+                emqx_schema:template(),
                 #{
                     default => undefined,
                     desc => ?DESC("payload")
@@ -225,6 +266,7 @@ fields("egress") ->
             )}
     ];
 fields("egress_local") ->
+    %% Avoid modifying this field, as it's used by bridge v1 API/schema.
     [
         {topic,
             mk(
@@ -237,10 +279,11 @@ fields("egress_local") ->
             )}
     ];
 fields("egress_remote") ->
+    %% Avoid modifying this field, as it's used by bridge v1 API/schema.
     [
         {topic,
             mk(
-                binary(),
+                emqx_schema:template(),
                 #{
                     required => true,
                     validator => fun emqx_schema:non_empty_string/1,
@@ -258,7 +301,7 @@ fields("egress_remote") ->
             )},
         {retain,
             mk(
-                hoconsc:union([boolean(), binary()]),
+                hoconsc:union([boolean(), emqx_schema:template()]),
                 #{
                     required => false,
                     default => false,
@@ -267,13 +310,32 @@ fields("egress_remote") ->
             )},
         {payload,
             mk(
-                binary(),
+                emqx_schema:template(),
                 #{
                     default => undefined,
                     desc => ?DESC("payload")
                 }
             )}
-    ].
+    ];
+fields(static_clientid_entry) ->
+    [
+        {node, mk(binary(), #{desc => ?DESC("static_clientid_entry_node"), required => true})},
+        {ids,
+            mk(hoconsc:array(binary()), #{
+                desc => ?DESC("static_clientid_entry_ids"),
+                required => true,
+                validator => fun static_clientid_validate_clientids_length/1
+            })}
+    ];
+fields(Field) when
+    Field == "get_connector";
+    Field == "put_connector";
+    Field == "post_connector"
+->
+    Fields = fields("specific_connector_config"),
+    emqx_connector_schema:api_fields(Field, ?CONNECTOR_TYPE, Fields);
+fields(What) ->
+    error({?MODULE, missing_field_handler, What}).
 
 ingress_pool_size(desc) ->
     ?DESC("ingress_pool_size");
@@ -287,6 +349,8 @@ egress_pool_size(Prop) ->
 
 desc("server_configs") ->
     ?DESC("server_configs");
+desc("config_connector") ->
+    ?DESC("config_connector");
 desc("ingress") ->
     ?DESC("ingress_desc");
 desc("ingress_remote") ->
@@ -299,12 +363,78 @@ desc("egress_remote") ->
     ?DESC("egress_remote");
 desc("egress_local") ->
     ?DESC("egress_local");
+desc(resource_opts) ->
+    ?DESC(emqx_resource_schema, <<"resource_opts">>);
+desc(static_clientid_entry) ->
+    ?DESC("static_clientid_entry");
 desc(_) ->
     undefined.
 
 qos() ->
-    hoconsc:union([emqx_schema:qos(), binary()]).
+    hoconsc:union([emqx_schema:qos(), emqx_schema:template()]).
 
 parse_server(Str) ->
     #{hostname := Host, port := Port} = emqx_schema:parse_server(Str, ?MQTT_HOST_OPTS),
     {Host, Port}.
+
+connector_examples(_Method) ->
+    [#{}].
+
+static_clientid_validator([]) ->
+    ok;
+static_clientid_validator([#{node := _} | _] = Entries0) ->
+    Entries = lists:map(fun emqx_utils_maps:binary_key_map/1, Entries0),
+    static_clientid_validator(Entries);
+static_clientid_validator([_ | _] = Entries) ->
+    maybe
+        ok ?= static_clientid_validate_distinct_nodes(Entries),
+        ok ?= static_clientid_validate_at_least_one_clientid(Entries),
+        ok ?= static_clientid_validate_distinct_clientids(Entries)
+    end.
+
+static_clientid_validate_at_least_one_clientid(Entries) ->
+    AllIds = lists:flatmap(fun(#{<<"ids">> := Ids}) -> Ids end, Entries),
+    case AllIds of
+        [] ->
+            {error, <<"must specify at least one static clientid">>};
+        [_ | _] ->
+            ok
+    end.
+
+static_clientid_validate_distinct_nodes(Entries) ->
+    AllNodes = lists:map(fun(#{<<"node">> := Node}) -> Node end, Entries),
+    UniqueNodes = lists:uniq(AllNodes),
+    case AllNodes -- UniqueNodes of
+        [] ->
+            ok;
+        [_ | _] = DuplicatedNodes0 ->
+            DuplicatedNodes = lists:join(<<", ">>, lists:usort(DuplicatedNodes0)),
+            Msg = iolist_to_binary([
+                <<"nodes must be unique; duplicated nodes: ">>,
+                DuplicatedNodes
+            ]),
+            {error, Msg}
+    end.
+
+static_clientid_validate_distinct_clientids(Entries) ->
+    AllIds = lists:flatmap(fun(#{<<"ids">> := Ids}) -> Ids end, Entries),
+    UniqueIds = lists:uniq(AllIds),
+    case AllIds -- UniqueIds of
+        [] ->
+            ok;
+        [_ | _] = DuplicatedIds0 ->
+            DuplicatedIds = lists:join(<<", ">>, lists:usort(DuplicatedIds0)),
+            Msg = iolist_to_binary([
+                <<"clientids must be unique; duplicated clientids: ">>,
+                DuplicatedIds
+            ]),
+            {error, Msg}
+    end.
+
+static_clientid_validate_clientids_length(Ids) ->
+    case lists:any(fun(Id) -> Id == <<"">> end, Ids) of
+        true ->
+            {error, <<"clientids must be non-empty">>};
+        false ->
+            ok
+    end.

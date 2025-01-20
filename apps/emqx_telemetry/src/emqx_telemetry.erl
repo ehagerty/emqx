@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -303,6 +303,9 @@ active_plugins() ->
 num_clients() ->
     emqx_stats:getstat('live_connections.count').
 
+num_cluster_sessions() ->
+    emqx_stats:getstat('cluster_sessions.count').
+
 messages_sent() ->
     emqx_metrics:val('messages.sent').
 
@@ -348,6 +351,7 @@ get_telemetry(State0 = #state{node_uuid = NodeUUID, cluster_uuid = ClusterUUID})
         {nodes_uuid, nodes_uuid()},
         {active_plugins, active_plugins()},
         {num_clients, num_clients()},
+        {num_cluster_sessions, num_cluster_sessions()},
         {messages_received, messages_received()},
         {messages_sent, messages_sent()},
         {build_info, build_info()},
@@ -416,10 +420,9 @@ read_raw_build_info() ->
     file:read_file(Filename).
 
 vm_specs() ->
-    SysMemData = memsup:get_system_memory_data(),
     [
         {num_cpus, erlang:system_info(logical_processors)},
-        {total_memory, proplists:get_value(total_memory, SysMemData)}
+        {total_memory, emqx_mgmt:vm_stats('total.memory')}
     ].
 
 -spec mqtt_runtime_insights(state()) -> {map(), state()}.

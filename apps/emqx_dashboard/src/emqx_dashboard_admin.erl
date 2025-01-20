@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,22 +18,21 @@
 
 -module(emqx_dashboard_admin).
 
+-feature(maybe_expr, enable).
+
 -include("emqx_dashboard.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 
--boot_mnesia({mnesia, [boot]}).
-
 -behaviour(emqx_db_backup).
 
-%% Mnesia bootstrap
--export([mnesia/1]).
+-export([create_tables/0]).
 
 -export([
-    add_user/3,
-    force_add_user/3,
+    add_user/4,
+    force_add_user/4,
     remove_user/1,
-    update_user/2,
+    update_user/3,
     lookup_user/1,
     change_password/2,
     change_password/3,
@@ -43,7 +42,7 @@
 
 -export([
     sign_token/2,
-    verify_token/1,
+    verify_token/2,
     destroy_token_by_username/2
 ]).
 -export([
@@ -56,16 +55,27 @@
     default_username/0
 ]).
 
+-export([role/1]).
+
 -export([backup_tables/0]).
 
+-if(?EMQX_RELEASE_EDITION == ee).
+-export([add_sso_user/4, lookup_user/2]).
+-endif.
+
+-ifdef(TEST).
+-export([unsafe_update_user/1]).
+-endif.
+
 -type emqx_admin() :: #?ADMIN{}.
--define(BOOTSTRAP_USER_TAG, <<"bootstrap user">>).
+
+-define(USERNAME_ALREADY_EXISTS_ERROR, <<"username_already_exists">>).
 
 %%--------------------------------------------------------------------
 %% Mnesia bootstrap
 %%--------------------------------------------------------------------
 
-mnesia(boot) ->
+create_tables() ->
     ok = mria:create_table(?ADMIN, [
         {type, set},
         {rlog_shard, ?DASHBOARD_SHARD},
@@ -78,13 +88,14 @@ mnesia(boot) ->
                 {write_concurrency, true}
             ]}
         ]}
-    ]).
+    ]),
+    [?ADMIN].
 
 %%--------------------------------------------------------------------
 %% Data backup
 %%--------------------------------------------------------------------
 
-backup_tables() -> [?ADMIN].
+backup_tables() -> {<<"dashboard_users">>, [?ADMIN]}.
 
 %%--------------------------------------------------------------------
 %% bootstrap API
@@ -98,18 +109,18 @@ add_default_user() ->
 %% API
 %%--------------------------------------------------------------------
 
--spec add_user(binary(), binary(), binary()) -> {ok, map()} | {error, any()}.
-add_user(Username, Password, Desc) when
-    is_binary(Username), is_binary(Password)
-->
-    case {legal_username(Username), legal_password(Password)} of
-        {ok, ok} -> do_add_user(Username, Password, Desc);
-        {{error, Reason}, _} -> {error, Reason};
-        {_, {error, Reason}} -> {error, Reason}
+-spec add_user(dashboard_username(), binary(), dashboard_user_role(), binary()) ->
+    {ok, map()} | {error, any()}.
+add_user(Username, Password, Role, Desc) when is_binary(Username), is_binary(Password) ->
+    case {legal_username(Username), legal_password(Password), legal_role(Role)} of
+        {ok, ok, ok} -> do_add_user(Username, Password, Role, Desc);
+        {{error, Reason}, _, _} -> {error, Reason};
+        {_, {error, Reason}, _} -> {error, Reason};
+        {_, _, {error, Reason}} -> {error, Reason}
     end.
 
-do_add_user(Username, Password, Desc) ->
-    Res = mria:transaction(?DASHBOARD_SHARD, fun add_user_/3, [Username, Password, Desc]),
+do_add_user(Username, Password, Role, Desc) ->
+    Res = mria:sync_transaction(?DASHBOARD_SHARD, fun add_user_/4, [Username, Password, Role, Desc]),
     return(Res).
 
 %% 0-9 or A-Z or a-z or $_
@@ -177,39 +188,54 @@ ascii_character_validate(Password) ->
 contain(Xs, Spec) -> lists:any(fun(X) -> lists:member(X, Spec) end, Xs).
 
 %% black-magic: force overwrite a user
-force_add_user(Username, Password, Desc) ->
+force_add_user(Username, Password, Role, Desc) ->
     AddFun = fun() ->
         mnesia:write(#?ADMIN{
             username = Username,
             pwdhash = hash(Password),
-            description = Desc
+            role = Role,
+            description = Desc,
+            extra = #{password_ts => erlang:system_time(second)}
         })
     end,
-    case mria:transaction(?DASHBOARD_SHARD, AddFun) of
+    case mria:sync_transaction(?DASHBOARD_SHARD, AddFun) of
         {atomic, ok} -> ok;
         {aborted, Reason} -> {error, Reason}
     end.
 
 %% @private
-add_user_(Username, Password, Desc) ->
+add_user_(Username, Password, Role, Desc) ->
     case mnesia:wread({?ADMIN, Username}) of
         [] ->
-            Admin = #?ADMIN{username = Username, pwdhash = hash(Password), description = Desc},
+            Admin = #?ADMIN{
+                username = Username,
+                pwdhash = hash(Password),
+                role = Role,
+                description = Desc,
+                extra = #{password_ts => erlang:system_time(second)}
+            },
             mnesia:write(Admin),
-            #{username => Username, description => Desc};
+            ?SLOG(info, #{msg => "dashboard_sso_user_added", username => Username, role => Role}),
+            flatten_username(#{username => Username, role => Role, description => Desc});
         [_] ->
-            mnesia:abort(<<"username_already_exist">>)
+            ?SLOG(info, #{
+                msg => "dashboard_sso_user_add_failed",
+                reason => "username_already_exists",
+                username => Username,
+                role => Role
+            }),
+            mnesia:abort(?USERNAME_ALREADY_EXISTS_ERROR)
     end.
 
--spec remove_user(binary()) -> {ok, any()} | {error, any()}.
-remove_user(Username) when is_binary(Username) ->
+-spec remove_user(dashboard_username()) -> {ok, any()} | {error, any()}.
+remove_user(Username) ->
     Trans = fun() ->
         case lookup_user(Username) of
             [] -> mnesia:abort(<<"username_not_found">>);
             _ -> mnesia:delete({?ADMIN, Username})
         end
     end,
-    case return(mria:transaction(?DASHBOARD_SHARD, Trans)) of
+    case return(mria:sync_transaction(?DASHBOARD_SHARD, Trans)) of
         {ok, Result} ->
             _ = emqx_dashboard_token:destroy_by_username(Username),
             {ok, Result};
@@ -217,9 +243,32 @@ remove_user(Username) when is_binary(Username) ->
             {error, Reason}
     end.
 
--spec update_user(binary(), binary()) -> {ok, map()} | {error, term()}.
-update_user(Username, Desc) when is_binary(Username) ->
-    return(mria:transaction(?DASHBOARD_SHARD, fun update_user_/2, [Username, Desc])).
+-spec update_user(dashboard_username(), dashboard_user_role(), binary()) ->
+    {ok, map()} | {error, term()}.
+update_user(Username, Role, Desc) ->
+    case legal_role(Role) of
+        ok ->
+            case
+                return(
+                    mria:sync_transaction(
+                        ?DASHBOARD_SHARD,
+                        fun update_user_/3,
+                        [Username, Role, Desc]
+                    )
+                )
+            of
+                {ok, {true, Result}} ->
+                    {ok, Result};
+                {ok, {false, Result}} ->
+                    %% role has changed, destroy the related token
+                    _ = emqx_dashboard_token:destroy_by_username(Username),
+                    {ok, Result};
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
 
 hash(Password) ->
     SaltBin = emqx_dashboard_token:salt(),
@@ -239,19 +288,37 @@ verify_hash(Origin, SaltHash) ->
 sha256(SaltBin, Password) ->
     crypto:hash('sha256', <<SaltBin/binary, Password/binary>>).
 
+verify_password_expiration(0, _User) ->
+    {ok, #{}};
+verify_password_expiration(ValidityDuration, #?ADMIN{extra = #{password_ts := Ts}}) ->
+    Diff = Ts + ValidityDuration - erlang:system_time(second),
+    {ok, #{password_expire_in_seconds => Diff}};
+verify_password_expiration(ValidityDuration, #?ADMIN{extra = Extra} = User) ->
+    case
+        unsafe_update_user(User#?ADMIN{extra = Extra#{password_ts => erlang:system_time(second)}})
+    of
+        ok ->
+            {ok, #{password_expire_in_seconds => ValidityDuration}};
+        Error ->
+            Error
+    end.
+
 %% @private
-update_user_(Username, Desc) ->
+update_user_(Username, Role, Desc) ->
     case mnesia:wread({?ADMIN, Username}) of
         [] ->
             mnesia:abort(<<"username_not_found">>);
         [Admin] ->
-            mnesia:write(Admin#?ADMIN{description = Desc}),
-            #{username => Username, description => Desc}
+            mnesia:write(Admin#?ADMIN{role = Role, description = Desc}),
+            {
+                role(Admin) =:= Role,
+                flatten_username(#{username => Username, role => Role, description => Desc})
+            }
     end.
 
 change_password(Username, OldPasswd, NewPasswd) when is_binary(Username) ->
     case check(Username, OldPasswd) of
-        ok -> change_password(Username, NewPasswd);
+        {ok, _} -> change_password(Username, NewPasswd);
         Error -> Error
     end.
 
@@ -264,7 +331,11 @@ change_password(Username, Password) when is_binary(Username), is_binary(Password
 change_password_hash(Username, PasswordHash) ->
     ChangePWD =
         fun(User) ->
-            User#?ADMIN{pwdhash = PasswordHash}
+            Extra = User#?ADMIN.extra,
+            User#?ADMIN{
+                pwdhash = PasswordHash,
+                extra = Extra#{password_ts => erlang:system_time(second)}
+            }
         end,
     case update_pwd(Username, ChangePWD) of
         {ok, Result} ->
@@ -284,10 +355,18 @@ update_pwd(Username, Fun) ->
                 end,
             mnesia:write(Fun(User))
         end,
-    return(mria:transaction(?DASHBOARD_SHARD, Trans)).
+    return(mria:sync_transaction(?DASHBOARD_SHARD, Trans)).
 
--spec lookup_user(binary()) -> [emqx_admin()].
-lookup_user(Username) when is_binary(Username) ->
+%% used to directly update user data
+unsafe_update_user(User) ->
+    Trans = fun() -> mnesia:write(User) end,
+    case mria:sync_transaction(?DASHBOARD_SHARD, Trans) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {error, Reason}
+    end.
+
+-spec lookup_user(dashboard_username()) -> [emqx_admin()].
+lookup_user(Username) ->
     Fun = fun() -> mnesia:read(?ADMIN, Username) end,
     {atomic, User} = mria:ro_transaction(?DASHBOARD_SHARD, Fun),
     User.
@@ -298,13 +377,15 @@ all_users() ->
         fun(
             #?ADMIN{
                 username = Username,
-                description = Desc
+                description = Desc,
+                role = Role
             }
         ) ->
-            #{
+            flatten_username(#{
                 username => Username,
-                description => Desc
-            }
+                description => Desc,
+                role => ensure_role(Role)
+            })
         end,
         ets:tab2list(?ADMIN)
     ).
@@ -320,9 +401,9 @@ check(_, undefined) ->
     {error, <<"password_not_provided">>};
 check(Username, Password) ->
     case lookup_user(Username) of
-        [#?ADMIN{pwdhash = PwdHash}] ->
+        [#?ADMIN{pwdhash = PwdHash} = User] ->
             case verify_hash(Password, PwdHash) of
-                ok -> ok;
+                ok -> {ok, User};
                 error -> {error, <<"password_error">>}
             end;
         [] ->
@@ -332,15 +413,20 @@ check(Username, Password) ->
 %%--------------------------------------------------------------------
 %% token
 sign_token(Username, Password) ->
-    case check(Username, Password) of
-        ok ->
-            emqx_dashboard_token:sign(Username, Password);
-        Error ->
-            Error
+    ExpiredTime = emqx:get_config([dashboard, password_expired_time], 0),
+    maybe
+        {ok, User} ?= check(Username, Password),
+        {ok, Result} ?= verify_password_expiration(ExpiredTime, User),
+        {ok, Role, Token} ?= emqx_dashboard_token:sign(User, Password),
+        {ok, Result#{role => Role, token => Token}}
     end.
 
-verify_token(Token) ->
-    emqx_dashboard_token:verify(Token).
+-spec verify_token(_, Token :: binary()) ->
+    Result ::
+        {ok, binary()}
+        | {error, token_timeout | not_found | unauthorized_role}.
+verify_token(Req, Token) ->
+    emqx_dashboard_token:verify(Req, Token).
 
 destroy_token_by_username(Username, Token) ->
     case emqx_dashboard_token:lookup(Token) of
@@ -363,9 +449,70 @@ add_default_user(Username, Password) when ?EMPTY_KEY(Username) orelse ?EMPTY_KEY
     {ok, empty};
 add_default_user(Username, Password) ->
     case lookup_user(Username) of
-        [] -> do_add_user(Username, Password, <<"administrator">>);
-        _ -> {ok, default_user_exists}
+        [] ->
+            case do_add_user(Username, Password, ?ROLE_SUPERUSER, <<"administrator">>) of
+                {error, ?USERNAME_ALREADY_EXISTS_ERROR} ->
+                    %% race condition: multiple nodes booting at the same time?
+                    {ok, default_user_exists};
+                Res ->
+                    Res
+            end;
+        _ ->
+            {ok, default_user_exists}
     end.
+
+%% ensure the `role` is correct when it is directly read from the table
+%% this value in old data is `undefined`
+-dialyzer({no_match, ensure_role/1}).
+ensure_role(undefined) ->
+    ?ROLE_SUPERUSER;
+ensure_role(Role) when is_binary(Role) ->
+    Role.
+
+-if(?EMQX_RELEASE_EDITION == ee).
+legal_role(Role) ->
+    emqx_dashboard_rbac:valid_dashboard_role(Role).
+
+role(Data) ->
+    emqx_dashboard_rbac:role(Data).
+
+flatten_username(#{username := ?SSO_USERNAME(Backend, Name)} = Data) ->
+    Data#{
+        username := Name,
+        backend => Backend
+    };
+flatten_username(#{username := Username} = Data) when is_binary(Username) ->
+    Data#{backend => ?BACKEND_LOCAL}.
+
+-spec add_sso_user(dashboard_sso_backend(), binary(), dashboard_user_role(), binary()) ->
+    {ok, map()} | {error, any()}.
+add_sso_user(Backend, Username0, Role, Desc) when is_binary(Username0) ->
+    case legal_role(Role) of
+        ok ->
+            Username = ?SSO_USERNAME(Backend, Username0),
+            do_add_user(Username, <<>>, Role, Desc);
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec lookup_user(dashboard_sso_backend(), binary()) -> [emqx_admin()].
+lookup_user(Backend, Username) when is_atom(Backend) ->
+    lookup_user(?SSO_USERNAME(Backend, Username)).
+-else.
+
+-dialyzer({no_match, [add_user/4, update_user/3]}).
+
+legal_role(?ROLE_DEFAULT) ->
+    ok;
+legal_role(_) ->
+    {error, <<"Role does not exist">>}.
+
+role(_) ->
+    ?ROLE_DEFAULT.
+
+flatten_username(Data) ->
+    Data.
+-endif.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 -module(emqx_bpapi_static_checks).
 
--export([run/0, dump/1, dump/0, check_compat/1, versions_file/0, dumps_dir/0]).
+-export([run/0, dump/1, dump/0, check_compat/1, versions_file/0, dumps_dir/0, dump_file_extension/0]).
 
 %% Using an undocumented API here :(
 -include_lib("dialyzer/src/dialyzer.hrl").
@@ -48,16 +48,29 @@
 
 %% Applications and modules we wish to ignore in the analysis:
 -define(IGNORED_APPS,
-    "gen_rpc, recon, redbug, observer_cli, snabbkaffe, ekka, mria, amqp_client, rabbit_common"
+    "gen_rpc, recon, redbug, observer_cli, snabbkaffe, ekka, mria, amqp_client, rabbit_common, esaml, ra"
 ).
 -define(IGNORED_MODULES, "emqx_rpc").
 -define(FORCE_DELETED_MODULES, [
     emqx_statsd,
-    emqx_statsd_proto_v1
+    emqx_statsd_proto_v1,
+    emqx_persistent_session_proto_v1,
+    emqx_ds_proto_v1,
+    emqx_ds_proto_v2,
+    emqx_ds_proto_v3,
+    emqx_ds_shared_sub_proto_v1,
+    emqx_ds_shared_sub_proto_v2
 ]).
 -define(FORCE_DELETED_APIS, [
     {emqx_statsd, 1},
-    {emqx_plugin_libs, 1}
+    {emqx_plugin_libs, 1},
+    {emqx_persistent_session, 1},
+    {emqx_ds, 1},
+    {emqx_ds, 2},
+    {emqx_ds, 3},
+    {emqx_node_rebalance_purge, 1},
+    {emqx_ds_shared_sub, 1},
+    {emqx_ds_shared_sub, 2}
 ]).
 %% List of known RPC backend modules:
 -define(RPC_MODULES, "gen_rpc, erpc, rpc, emqx_rpc").
@@ -75,8 +88,16 @@
     % Reason: legacy code. A fun and a QC query are
     % passed in the args, it's futile to try to statically
     % check it
-    "emqx_mgmt_api:do_query/2, emqx_mgmt_api:collect_total_from_tail_nodes/2"
+    "emqx_mgmt_api:do_query/2, emqx_mgmt_api:collect_total_from_tail_nodes/2,"
+    %% Reason: `emqx_machine' should not depend on `emqx', where the `bpapi' modules live.
+    " emqx_machine_replicant_health_probe:get_core_custom_infos/0"
 ).
+
+%% Only the APIs for the features that haven't reached General
+%% Availability can be added here:
+-define(EXPERIMENTAL_APIS, [
+    {emqx_ds, 4}
+]).
 
 -define(XREF, myxref).
 
@@ -88,7 +109,7 @@
 run() ->
     case dump() of
         true ->
-            Dumps = filelib:wildcard(dumps_dir() ++ "/*.bpapi"),
+            Dumps = filelib:wildcard(dumps_dir() ++ "/*" ++ dump_file_extension()),
             case Dumps of
                 [] ->
                     logger:error("No BPAPI dumps are found in ~s, abort", [dumps_dir()]),
@@ -108,7 +129,7 @@ check_compat(DumpFilenames) ->
     Dumps = lists:map(
         fun(FN) ->
             {ok, [Dump]} = file:consult(FN),
-            Dump
+            Dump#{release => filename:basename(FN)}
         end,
         DumpFilenames
     ),
@@ -117,47 +138,57 @@ check_compat(DumpFilenames) ->
 
 %% Note: sets nok flag
 -spec check_compat(fulldump(), fulldump()) -> ok.
-check_compat(Dump1 = #{release := Rel1}, Dump2 = #{release := Rel2}) ->
+check_compat(Dump1 = #{release := Rel1}, Dump2 = #{release := Rel2}) when Rel2 >= Rel1 ->
     check_api_immutability(Dump1, Dump2),
-    Rel2 >= Rel1 andalso
-        typecheck_apis(Dump1, Dump2).
+    typecheck_apis(Dump1, Dump2);
+check_compat(_, _) ->
+    ok.
 
 %% It's not allowed to change BPAPI modules. Check that no changes
 %% have been made. (sets nok flag)
 -spec check_api_immutability(fulldump(), fulldump()) -> ok.
-check_api_immutability(#{release := Rel1, api := APIs1}, #{release := Rel2, api := APIs2}) when
-    Rel2 >= Rel1
-->
+check_api_immutability(#{release := Rel1, api := APIs1}, #{release := Rel2, api := APIs2}) ->
     %% TODO: Handle API deprecation
     _ = maps:map(
-        fun(Key = {API, Version}, Val) ->
-            case maps:get(Key, APIs2, undefined) of
-                Val ->
+        fun(Key, Val) ->
+            case lists:member(Key, ?EXPERIMENTAL_APIS) of
+                true ->
                     ok;
-                undefined ->
-                    case lists:member({API, Version}, ?FORCE_DELETED_APIS) of
-                        true ->
-                            ok;
-                        false ->
-                            setnok(),
-                            logger:error(
-                                "API ~p v~p was removed in release ~p without being deprecated.",
-                                [API, Version, Rel2]
-                            )
-                    end;
-                _Val ->
-                    setnok(),
-                    logger:error(
-                        "API ~p v~p was changed between ~p and ~p. Backplane API should be immutable.",
-                        [API, Version, Rel1, Rel2]
-                    )
+                false ->
+                    do_check_api_immutability(Rel1, Rel2, APIs2, Key, Val)
             end
         end,
         APIs1
     ),
-    ok;
-check_api_immutability(_, _) ->
     ok.
+
+do_check_api_immutability(Rel1, Rel2, APIs2, Key = {API, Version}, Val) ->
+    case maps:get(Key, APIs2, undefined) of
+        Val ->
+            ok;
+        undefined ->
+            case lists:member(Key, ?FORCE_DELETED_APIS) of
+                true ->
+                    ok;
+                false ->
+                    setnok(),
+                    logger:error(
+                        "API ~p v~p was removed in release ~p without being deprecated. "
+                        "Old release: ~p",
+                        [API, Version, Rel2, Rel1]
+                    )
+            end;
+        OldVal ->
+            setnok(),
+            logger:error(
+                "API ~p v~p was changed between ~p and ~p. Backplane API should be immutable.",
+                [API, Version, Rel1, Rel2]
+            ),
+            D21 = maps:get(calls, Val) -- maps:get(calls, OldVal),
+            D12 = maps:get(calls, OldVal) -- maps:get(calls, Val),
+            logger:error("Added calls:~n  ~p", [D21]),
+            logger:error("Removed calls:~n  ~p", [D12])
+    end.
 
 filter_calls(Calls) ->
     F = fun({{Mf, _, _}, {Mt, _, _}}) ->
@@ -179,8 +210,8 @@ typecheck_apis(
     AllCalls = filter_calls(AllCalls0),
     lists:foreach(
         fun({From, To}) ->
-            Caller = get_param_types(CallerSigs, From),
-            Callee = get_param_types(CalleeSigs, To),
+            Caller = get_param_types(CallerSigs, From, From),
+            Callee = get_param_types(CalleeSigs, From, To),
             %% TODO: check return types
             case typecheck_rpc(Caller, Callee) of
                 [] ->
@@ -224,8 +255,8 @@ typecheck_rpc(Caller, Callee) ->
         Callee
     ).
 
--spec get_param_types(dialyzer_dump(), emqx_bpapi:call()) -> param_types().
-get_param_types(Signatures, {M, F, A}) ->
+%%-spec get_param_types(dialyzer_dump(), emqx_bpapi:call()) -> param_types().
+get_param_types(Signatures, From, {M, F, A}) ->
     Arity = length(A),
     case Signatures of
         #{{M, F, Arity} := {_RetType, AttrTypes}} ->
@@ -233,7 +264,7 @@ get_param_types(Signatures, {M, F, A}) ->
             Arity = length(AttrTypes),
             maps:from_list(lists:zip(A, AttrTypes));
         _ ->
-            logger:critical("Call ~p:~p/~p is not found in PLT~n", [M, F, Arity]),
+            logger:critical("Call ~p:~p/~p from ~p is not found in PLT~n", [M, F, Arity, From]),
             error({badkey, {M, F, A}})
     end.
 
@@ -242,19 +273,28 @@ get_param_types(Signatures, {M, F, A}) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 dump() ->
-    case
-        {
-            filelib:wildcard(project_root_dir() ++ "/*_plt"),
-            filelib:wildcard(project_root_dir() ++ "/_build/check/lib")
-        }
-    of
+    RootDir = project_root_dir(),
+    TryRelDir = RootDir ++ "/_build/check/lib",
+    case {filelib:wildcard(RootDir ++ "/*_plt"), filelib:wildcard(TryRelDir)} of
         {[PLT | _], [RelDir | _]} ->
             dump(#{
                 plt => PLT,
                 reldir => RelDir
             });
-        _ ->
-            error("failed to guess run options")
+        {[], _} ->
+            logger:error(
+                "No usable PLT files found in \"~s\", abort ~n"
+                "Try running `rebar3 as check dialyzer` at least once first",
+                [RootDir]
+            ),
+            error(run_failed);
+        {_, []} ->
+            logger:error(
+                "No built applications found in \"~s\", abort ~n"
+                "Try running `rebar3 as check compile` at least once first",
+                [TryRelDir]
+            ),
+            error(run_failed)
     end.
 
 %% Collect the local BPAPI modules to a dump file
@@ -282,7 +322,7 @@ prepare(#{reldir := RelDir, plt := PLT}) ->
     xref:add_release(?XREF, RelDir),
     %% Now to the dialyzer stuff:
     logger:info("Loading PLT...", []),
-    dialyzer_plt:from_file(PLT).
+    load_plt(PLT).
 
 %% erlfmt-ignore
 find_remote_calls(_Opts) ->
@@ -320,7 +360,7 @@ is_bpapi_call({Module, _Function, _Arity}) ->
 
 -spec dump_api(fulldump()) -> ok.
 dump_api(Term = #{api := _, signatures := _, release := Release}) ->
-    Filename = filename:join(dumps_dir(), Release ++ ".bpapi"),
+    Filename = filename:join(dumps_dir(), Release ++ dump_file_extension()),
     ok = filelib:ensure_dir(Filename),
     file:write_file(Filename, io_lib:format("~0p.~n", [Term])).
 
@@ -409,10 +449,34 @@ setnok() ->
     put(bpapi_ok, false).
 
 dumps_dir() ->
-    filename:join(project_root_dir(), "apps/emqx/test/emqx_static_checks_data").
-
-project_root_dir() ->
-    string:trim(os:cmd("git rev-parse --show-toplevel")).
+    filename:join(emqx_app_dir(), "test/emqx_static_checks_data").
 
 versions_file() ->
-    filename:join(project_root_dir(), "apps/emqx/priv/bpapi.versions").
+    filename:join(emqx_app_dir(), "priv/bpapi.versions").
+
+emqx_app_dir() ->
+    Info = ?MODULE:module_info(compile),
+    case proplists:get_value(source, Info) of
+        Source when is_list(Source) ->
+            filename:dirname(filename:dirname(Source));
+        undefined ->
+            "apps/emqx"
+    end.
+
+project_root_dir() ->
+    filename:dirname(filename:dirname(emqx_app_dir())).
+
+-if(?OTP_RELEASE >= 26).
+load_plt(File) ->
+    dialyzer_cplt:from_file(File).
+
+dump_file_extension() ->
+    %% OTP26 changes the internal format for the types:
+    ".bpapi2".
+-else.
+load_plt(File) ->
+    dialyzer_plt:from_file(File).
+
+dump_file_extension() ->
+    ".bpapi".
+-endif.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("../../emqx/include/asserts.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(SOCKOPTS, [
@@ -87,13 +88,13 @@ t_pipeline(_) ->
 t_start_timer(_) ->
     TRef = emqx_utils:start_timer(1, tmsg),
     timer:sleep(2),
-    ?assertEqual([{timeout, TRef, tmsg}], drain()),
+    ?assertEqual([{timeout, TRef, tmsg}], ?drainMailbox()),
     ok = emqx_utils:cancel_timer(TRef).
 
 t_cancel_timer(_) ->
     Timer = emqx_utils:start_timer(0, foo),
     ok = emqx_utils:cancel_timer(Timer),
-    ?assertEqual([], drain()),
+    ?assertEqual([], ?drainMailbox()),
     ok = emqx_utils:cancel_timer(undefined).
 
 t_proc_name(_) ->
@@ -127,7 +128,7 @@ t_drain_down(_) ->
     {Pid1, _Ref1} = erlang:spawn_monitor(fun() -> ok end),
     {Pid2, _Ref2} = erlang:spawn_monitor(fun() -> ok end),
     timer:sleep(100),
-    ?assertEqual([Pid1, Pid2], lists:sort(emqx_utils:drain_down(2))),
+    ?assertEqual(lists:sort([Pid1, Pid2]), lists:sort(emqx_utils:drain_down(2))),
     ?assertEqual([], emqx_utils:drain_down(1)).
 
 t_index_of(_) ->
@@ -149,18 +150,24 @@ t_check(_) ->
     ?assertEqual(ok, emqx_utils:check_oom(Policy)),
     [self() ! {msg, I} || I <- lists:seq(1, 6)],
     ?assertEqual(
-        {shutdown, #{reason => message_queue_too_long, value => 11, max => 10}},
+        {shutdown, #{reason => mailbox_overflow, value => 11, max => 10}},
         emqx_utils:check_oom(Policy)
     ).
 
-drain() ->
-    drain([]).
-
-drain(Acc) ->
-    receive
-        Msg -> drain([Msg | Acc])
-    after 0 ->
-        lists:reverse(Acc)
+t_tune_heap_size(_Config) ->
+    Policy = #{
+        max_mailbox_size => 10,
+        max_heap_size => 1024 * 1024 * 8,
+        enable => true
+    },
+    ?assertEqual(ignore, emqx_utils:tune_heap_size(Policy#{enable := false})),
+    %% Setting it to 0 disables the check.
+    ?assertEqual(ignore, emqx_utils:tune_heap_size(Policy#{max_heap_size := 0})),
+    {max_heap_size, PreviousHeapSize} = process_info(self(), max_heap_size),
+    try
+        ?assertMatch(PreviousHeapSize, emqx_utils:tune_heap_size(Policy))
+    after
+        process_flag(max_heap_size, PreviousHeapSize)
     end.
 
 t_rand_seed(_) ->
@@ -240,3 +247,47 @@ t_pmap_late_reply(_) ->
         []
     ),
     ok.
+
+t_flattermap(_) ->
+    ?assertEqual(
+        [42],
+        emqx_utils:flattermap(fun identity/1, [42])
+    ),
+    ?assertEqual(
+        [42, 42],
+        emqx_utils:flattermap(fun duplicate/1, [42])
+    ),
+    ?assertEqual(
+        [],
+        emqx_utils:flattermap(fun nil/1, [42])
+    ),
+    ?assertEqual(
+        [1, 1, 2, 2, 3, 3],
+        emqx_utils:flattermap(fun duplicate/1, [1, 2, 3])
+    ),
+    ?assertEqual(
+        [],
+        emqx_utils:flattermap(fun nil/1, [1, 2, 3])
+    ),
+    ?assertEqual(
+        [1, 2, 2, 4, 5, 5],
+        emqx_utils:flattermap(
+            fun(X) ->
+                case X rem 3 of
+                    0 -> [];
+                    1 -> X;
+                    2 -> [X, X]
+                end
+            end,
+            [1, 2, 3, 4, 5]
+        )
+    ).
+
+duplicate(X) ->
+    [X, X].
+
+nil(_) ->
+    [].
+
+identity(X) ->
+    X.

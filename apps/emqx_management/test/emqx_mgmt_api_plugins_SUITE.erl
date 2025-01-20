@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,33 +19,57 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
--define(EMQX_PLUGIN_TEMPLATE_NAME, "emqx_plugin_template").
--define(EMQX_PLUGIN_TEMPLATE_VSN, "5.0.0").
+-define(EMQX_PLUGIN_TEMPLATE_NAME, "my_emqx_plugin").
+-define(EMQX_PLUGIN_TEMPLATE_VSN, "5.1.0").
 -define(PACKAGE_SUFFIX, ".tar.gz").
+
+-define(CLUSTER_API_SERVER(PORT), ("http://127.0.0.1:" ++ (integer_to_list(PORT)))).
+
+-import(emqx_common_test_helpers, [on_exit/1]).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
     WorkDir = proplists:get_value(data_dir, Config),
-    ok = filelib:ensure_dir(WorkDir),
     DemoShDir1 = string:replace(WorkDir, "emqx_mgmt_api_plugins", "emqx_plugins"),
     DemoShDir = lists:flatten(string:replace(DemoShDir1, "emqx_management", "emqx_plugins")),
-    OrigInstallDir = emqx_plugins:get_config(install_dir, undefined),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_plugins,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
     ok = filelib:ensure_dir(DemoShDir),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_plugins]),
-    emqx_plugins:put_config(install_dir, DemoShDir),
-    [{demo_sh_dir, DemoShDir}, {orig_install_dir, OrigInstallDir} | Config].
+    emqx_plugins:put_config_internal(install_dir, DemoShDir),
+    [{apps, Apps}, {demo_sh_dir, DemoShDir} | Config].
 
 end_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    %% restore config
-    case proplists:get_value(orig_install_dir, Config) of
-        undefined -> ok;
-        OrigInstallDir -> emqx_plugins:put_config(install_dir, OrigInstallDir)
-    end,
-    emqx_mgmt_api_test_util:end_suite([emqx_plugins, emqx_conf]),
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(t_cluster_update_order = TestCase, Config0) ->
+    Config = [{api_port, 18085} | Config0],
+    Cluster = [Node1 | _] = cluster(TestCase, Config),
+    {ok, API} = init_api(Node1),
+    [
+        {api, API},
+        {cluster, Cluster}
+        | Config
+    ];
+init_per_testcase(_TestCase, Config) ->
+    Config.
+
+end_per_testcase(t_cluster_update_order, Config) ->
+    Cluster = ?config(cluster, Config),
+    emqx_cth_cluster:stop(Cluster),
+    end_per_testcase(common, Config);
+end_per_testcase(_TestCase, _Config) ->
+    emqx_common_test_helpers:call_janitor(),
     ok.
 
 t_plugins(Config) ->
@@ -114,10 +138,14 @@ t_install_plugin_matching_exisiting_name(Config) ->
 t_bad_plugin(Config) ->
     DemoShDir = proplists:get_value(demo_sh_dir, Config),
     PackagePathOrig = get_demo_plugin_package(DemoShDir),
+    BackupPath = filename:join(["/tmp", [filename:basename(PackagePathOrig), ".backup"]]),
+    {ok, _} = file:copy(PackagePathOrig, BackupPath),
+    on_exit(fun() -> {ok, _} = file:rename(BackupPath, PackagePathOrig) end),
     PackagePath = filename:join([
         filename:dirname(PackagePathOrig),
         "bad_plugin-1.0.0.tar.gz"
     ]),
+    on_exit(fun() -> file:delete(PackagePath) end),
     ct:pal("package_location:~p orig:~p", [PackagePath, PackagePathOrig]),
     %% rename plugin tarball
     file:copy(PackagePathOrig, PackagePath),
@@ -141,9 +169,83 @@ t_delete_non_existing(_Config) ->
     ),
     ok.
 
-list_plugins() ->
-    Path = emqx_mgmt_api_test_util:api_path(["plugins"]),
-    case emqx_mgmt_api_test_util:request_api(get, Path) of
+t_cluster_update_order(Config) ->
+    DemoShDir = proplists:get_value(demo_sh_dir, Config),
+    PackagePath1 = get_demo_plugin_package(DemoShDir),
+    NameVsn1 = filename:basename(PackagePath1, ?PACKAGE_SUFFIX),
+    Name2Str = ?EMQX_PLUGIN_TEMPLATE_NAME ++ "_a",
+    NameVsn2 = Name2Str ++ "-" ++ ?EMQX_PLUGIN_TEMPLATE_VSN,
+    PackagePath2 = create_renamed_package(PackagePath1, NameVsn2),
+    Name1 = list_to_binary(?EMQX_PLUGIN_TEMPLATE_NAME),
+    Name2 = list_to_binary(Name2Str),
+
+    ok = install_plugin(Config, PackagePath1),
+    ok = install_plugin(Config, PackagePath2),
+    %% to get them configured...
+    {ok, _} = update_plugin(Config, NameVsn1, "start"),
+    {ok, _} = update_plugin(Config, NameVsn2, "start"),
+
+    ?assertMatch(
+        {ok, [
+            #{<<"name">> := Name1},
+            #{<<"name">> := Name2}
+        ]},
+        list_plugins(Config)
+    ),
+
+    ct:pal("moving to rear"),
+    ?assertMatch({ok, _}, update_boot_order(NameVsn1, #{position => rear}, Config)),
+    ?assertMatch(
+        {ok, [
+            #{<<"name">> := Name2},
+            #{<<"name">> := Name1}
+        ]},
+        list_plugins(Config)
+    ),
+
+    ct:pal("moving to front"),
+    ?assertMatch({ok, _}, update_boot_order(NameVsn1, #{position => front}, Config)),
+    ?assertMatch(
+        {ok, [
+            #{<<"name">> := Name1},
+            #{<<"name">> := Name2}
+        ]},
+        list_plugins(Config)
+    ),
+
+    ct:pal("moving after"),
+    NameVsn2Bin = list_to_binary(NameVsn2),
+    ?assertMatch(
+        {ok, _},
+        update_boot_order(NameVsn1, #{position => <<"after:", NameVsn2Bin/binary>>}, Config)
+    ),
+    ?assertMatch(
+        {ok, [
+            #{<<"name">> := Name2},
+            #{<<"name">> := Name1}
+        ]},
+        list_plugins(Config)
+    ),
+
+    ct:pal("moving before"),
+    ?assertMatch(
+        {ok, _},
+        update_boot_order(NameVsn1, #{position => <<"before:", NameVsn2Bin/binary>>}, Config)
+    ),
+    ?assertMatch(
+        {ok, [
+            #{<<"name">> := Name1},
+            #{<<"name">> := Name2}
+        ]},
+        list_plugins(Config)
+    ),
+
+    ok.
+
+list_plugins(Config) ->
+    #{host := Host, auth := Auth} = get_host_and_auth(Config),
+    Path = emqx_mgmt_api_test_util:api_path(Host, ["plugins"]),
+    case emqx_mgmt_api_test_util:request_api(get, Path, Auth) of
         {ok, Apps} -> {ok, emqx_utils_json:decode(Apps, [return_maps])};
         Error -> Error
     end.
@@ -156,7 +258,7 @@ describe_plugins(Name) ->
     end.
 
 install_plugin(FilePath) ->
-    {ok, Token} = emqx_dashboard_admin:sign_token(<<"admin">>, <<"public">>),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(<<"admin">>, <<"public">>),
     Path = emqx_mgmt_api_test_util:api_path(["plugins", "install"]),
     case
         emqx_mgmt_api_test_util:upload_request(
@@ -168,7 +270,24 @@ install_plugin(FilePath) ->
             Token
         )
     of
-        {ok, {{"HTTP/1.1", 200, "OK"}, _Headers, <<>>}} -> ok;
+        {ok, {{"HTTP/1.1", 204, "No Content"}, _Headers, <<>>}} -> ok;
+        Error -> Error
+    end.
+
+install_plugin(Config, FilePath) ->
+    #{host := Host, auth := Auth} = get_host_and_auth(Config),
+    Path = emqx_mgmt_api_test_util:api_path(Host, ["plugins", "install"]),
+    case
+        emqx_mgmt_api_test_util:upload_request(
+            Path,
+            FilePath,
+            "plugin",
+            <<"application/gzip">>,
+            [],
+            Auth
+        )
+    of
+        {ok, {{"HTTP/1.1", 204, "No Content"}, _Headers, <<>>}} -> ok;
         Error -> Error
     end.
 
@@ -176,12 +295,26 @@ update_plugin(Name, Action) ->
     Path = emqx_mgmt_api_test_util:api_path(["plugins", Name, Action]),
     emqx_mgmt_api_test_util:request_api(put, Path).
 
-update_boot_order(Name, MoveBody) ->
-    Auth = emqx_mgmt_api_test_util:auth_header_(),
-    Path = emqx_mgmt_api_test_util:api_path(["plugins", Name, "move"]),
-    case emqx_mgmt_api_test_util:request_api(post, Path, "", Auth, MoveBody) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
-        Error -> Error
+update_plugin(Config, Name, Action) when is_list(Config) ->
+    #{host := Host, auth := Auth} = get_host_and_auth(Config),
+    Path = emqx_mgmt_api_test_util:api_path(Host, ["plugins", Name, Action]),
+    emqx_mgmt_api_test_util:request_api(put, Path, Auth).
+
+update_boot_order(Name, MoveBody, Config) ->
+    #{host := Host, auth := Auth} = get_host_and_auth(Config),
+    Path = emqx_mgmt_api_test_util:api_path(Host, ["plugins", Name, "move"]),
+    Opts = #{return_all => true},
+    case emqx_mgmt_api_test_util:request_api(post, Path, "", Auth, MoveBody, Opts) of
+        {ok, Res} ->
+            Resp =
+                case emqx_utils_json:safe_decode(Res, [return_maps]) of
+                    {ok, Decoded} -> Decoded;
+                    {error, _} -> Res
+                end,
+            ct:pal("update_boot_order response:\n  ~p", [Resp]),
+            {ok, Resp};
+        Error ->
+            Error
     end.
 
 uninstall_plugin(Name) ->
@@ -218,3 +351,51 @@ update_release_json(["release.json"], FileContent, NewName) ->
     emqx_utils_json:encode(ContentMap#{<<"name">> => NewName});
 update_release_json(_FileName, FileContent, _NewName) ->
     FileContent.
+
+cluster(TestCase, Config) ->
+    APIPort = ?config(api_port, Config),
+    AppSpecs = app_specs(Config),
+    Node1Apps = AppSpecs ++ [app_spec_dashboard(APIPort)],
+    Node2Apps = AppSpecs,
+    Node1Name = emqx_mgmt_api_plugins_SUITE1,
+    Node1 = emqx_cth_cluster:node_name(Node1Name),
+    emqx_cth_cluster:start(
+        [
+            {Node1Name, #{role => core, apps => Node1Apps, join_to => Node1}},
+            {emqx_mgmt_api_plugins_SUITE2, #{role => core, apps => Node2Apps, join_to => Node1}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
+    ).
+
+app_specs(_Config) ->
+    [
+        emqx,
+        emqx_conf,
+        emqx_management,
+        emqx_plugins
+    ].
+
+app_spec_dashboard(APIPort) ->
+    {emqx_dashboard, #{
+        config =>
+            #{
+                dashboard =>
+                    #{
+                        listeners =>
+                            #{
+                                http =>
+                                    #{bind => APIPort}
+                            }
+                    }
+            }
+    }}.
+
+init_api(Node) ->
+    erpc:call(Node, emqx_common_test_http, create_default_app, []).
+
+get_host_and_auth(Config) when is_list(Config) ->
+    API = ?config(api, Config),
+    APIPort = ?config(api_port, Config),
+    Host = ?CLUSTER_API_SERVER(APIPort),
+    Auth = emqx_common_test_http:auth_header(API),
+    #{host => Host, auth => Auth}.

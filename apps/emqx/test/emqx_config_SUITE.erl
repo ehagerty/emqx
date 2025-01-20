@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,12 +25,21 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    Config.
+    WorkDir = emqx_cth_suite:work_dir(Config),
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx, #{
+                override_env => [
+                    {cluster_override_conf_file, filename:join(WorkDir, "cluster_override.conf")}
+                ]
+            }}
+        ],
+        #{work_dir => WorkDir}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(TestCase, Config) ->
     try
@@ -67,8 +76,7 @@ t_fill_default_values(C) when is_list(C) ->
                             <<"trie_compaction">> := true
                         },
                     <<"route_batch_clean">> := false,
-                    <<"session_locking_strategy">> := <<"quorum">>,
-                    <<"shared_subscription_strategy">> := <<"round_robin">>
+                    <<"session_history_retain">> := <<"0s">>
                 }
         },
         WithDefaults
@@ -84,7 +92,7 @@ t_init_load(C) when is_list(C) ->
     emqx_config:erase_all(),
     {ok, DeprecatedFile} = application:get_env(emqx, cluster_override_conf_file),
     ?assertEqual(false, filelib:is_regular(DeprecatedFile), DeprecatedFile),
-    %% Don't has deprecated file
+    %% Don't have deprecated file
     ok = emqx_config:init_load(emqx_schema, [ConfFile]),
     ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
     ?assertMatch({ok, #{raw_config := 256}}, emqx:update_config([mqtt, max_topic_levels], 256)),
@@ -95,6 +103,32 @@ t_init_load(C) when is_list(C) ->
     ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
     ?assertMatch({ok, #{raw_config := 128}}, emqx:update_config([mqtt, max_topic_levels], 128)),
     ok = file:delete(DeprecatedFile).
+
+t_init_load_with_base_hocon(C) when is_list(C) ->
+    BaseHocon = emqx_config:base_hocon_file(),
+    ClusterHocon = emqx_config:cluster_hocon_file(),
+    ConfFile = "./test_emqx_2.conf",
+    ok = filelib:ensure_dir(BaseHocon),
+    ok = file:write_file(
+        BaseHocon,
+        "mqtt.max_topic_levels = 123\n"
+        "mqtt.max_clientid_len=12\n"
+        "mqtt.max_inflight=12\n"
+    ),
+    ok = file:write_file(
+        ClusterHocon,
+        "mqtt.max_clientid_len = 123\n"
+        "mqtt.max_inflight=22\n"
+    ),
+    ok = file:write_file(ConfFile, "mqtt.max_inflight = 123\n"),
+    ok = emqx_config:init_load(emqx_schema, [ConfFile]),
+    ?assertEqual(123, emqx:get_config([mqtt, max_topic_levels])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_clientid_len])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_inflight])),
+    emqx_config:erase_all(),
+    ok = file:delete(BaseHocon),
+    ok = file:delete(ClusterHocon),
+    ok.
 
 t_unknown_root_keys(C) when is_list(C) ->
     ?check_trace(
@@ -374,7 +408,7 @@ t_init_zone_with_global_defaults(Config) when is_list(Config) ->
     %% when put zones with global default with emqx_config:put/1
     GlobalDefaults = zone_global_defaults(),
     AllConf = maps:put(zones, Zones, GlobalDefaults),
-    %% Then put sucess
+    %% Then put success
     ?assertEqual(ok, emqx_config:put(AllConf)),
     %% Then GlobalDefaults are set
     ?assertEqual(GlobalDefaults, maps:with(maps:keys(GlobalDefaults), emqx_config:get([]))),
@@ -420,6 +454,7 @@ zone_global_defaults() ->
                 ignore_loop_deliver => false,
                 keepalive_backoff => 0.75,
                 keepalive_multiplier => 1.5,
+                keepalive_check_interval => 30000,
                 max_awaiting_rel => 100,
                 max_clientid_len => 65535,
                 max_inflight => 32,
@@ -436,15 +471,19 @@ zone_global_defaults() ->
                 peer_cert_as_username => disabled,
                 response_information => [],
                 retain_available => true,
-                retry_interval => 30000,
+                retry_interval => infinity,
+                message_expiry_interval => infinity,
                 server_keepalive => disabled,
                 session_expiry_interval => 7200000,
                 shared_subscription => true,
                 shared_subscription_strategy => round_robin,
+                shared_subscription_initial_sticky_pick => random,
                 strict_mode => false,
                 upgrade_qos => false,
                 use_username_as_clientid => false,
-                wildcard_subscription => true
+                wildcard_subscription => true,
+                client_attrs_init => [],
+                clientid_override => disabled
             },
         overload_protection =>
             #{
@@ -454,5 +493,19 @@ zone_global_defaults() ->
                 backoff_new_conn => true,
                 enable => false
             },
-        stats => #{enable => true}
+        stats => #{enable => true},
+        durable_sessions =>
+            #{
+                enable => false,
+                batch_size => 100,
+                force_persistence => false,
+                idle_poll_interval => 10_000,
+                heartbeat_interval => 5000,
+                message_retention_period => 86400000,
+                renew_streams_interval => 1000,
+                session_gc_batch_size => 100,
+                session_gc_interval => 600000,
+                subscription_count_refresh_interval => 5000,
+                disconnected_session_count_refresh_interval => 5000
+            }
     }.

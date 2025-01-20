@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mysql_SUITE).
@@ -21,7 +21,6 @@
     "DEFAULT CHARSET=utf8MB4;"
 ).
 -define(SQL_DROP_TABLE, "DROP TABLE mqtt_test").
--define(SQL_DELETE, "DELETE from mqtt_test").
 -define(SQL_SELECT, "SELECT payload FROM mqtt_test").
 
 % DB defaults
@@ -30,7 +29,9 @@
 -define(MYSQL_PASSWORD, "public").
 -define(MYSQL_POOL_SIZE, 4).
 
--define(WORKER_POOL_SIZE, 4).
+-define(WORKER_POOL_SIZE, 1).
+
+-define(ACTION_TYPE, mysql).
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -46,7 +47,16 @@ all() ->
 
 groups() ->
     TCs = emqx_common_test_helpers:all(?MODULE),
-    NonBatchCases = [t_write_timeout, t_uninitialized_prepared_statement],
+    NonBatchCases = [
+        t_write_timeout,
+        t_uninitialized_prepared_statement,
+        t_non_batch_update_is_allowed,
+        t_delete_with_undefined_field_in_sql,
+        t_undefined_field_in_sql
+    ],
+    OnlyBatchCases = [
+        t_batch_update_is_forbidden
+    ],
     BatchingGroups = [
         {group, with_batch},
         {group, without_batch}
@@ -58,7 +68,7 @@ groups() ->
         {async, BatchingGroups},
         {sync, BatchingGroups},
         {with_batch, TCs -- NonBatchCases},
-        {without_batch, TCs}
+        {without_batch, TCs -- OnlyBatchCases}
     ].
 
 init_per_group(tcp, Config) ->
@@ -95,10 +105,12 @@ init_per_group(_Group, Config) ->
     Config.
 
 end_per_group(Group, Config) when Group =:= with_batch; Group =:= without_batch ->
+    Apps = ?config(apps, Config),
     connect_and_drop_table(Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
@@ -112,8 +124,8 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(_Testcase, Config) ->
+    connect_and_drop_table(Config),
     connect_and_create_table(Config),
-    connect_and_clear_table(Config),
     delete_bridge(Config),
     snabbkaffe:start_trace(),
     Config.
@@ -122,9 +134,7 @@ end_per_testcase(_Testcase, Config) ->
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-    connect_and_clear_table(Config),
     ok = snabbkaffe:stop(),
-    delete_bridge(Config),
     emqx_common_test_helpers:call_janitor(),
     ok.
 
@@ -142,25 +152,43 @@ common_init(Config0) ->
             ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
             ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            % Ensure enterprise bridge module is loaded
-            ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_bridge, emqx_rule_engine]),
-            _ = emqx_bridge_enterprise:module_info(),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_connector,
+                    emqx_bridge,
+                    emqx_bridge_mysql,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
             % Connect to mysql directly and create the table
             connect_and_create_table(Config0),
             {Name, MysqlConfig} = mysql_config(BridgeType, Config0),
             Config =
                 [
+                    {apps, Apps},
                     {mysql_config, MysqlConfig},
                     {mysql_bridge_type, BridgeType},
                     {mysql_name, Name},
+                    {bridge_type, BridgeType},
+                    {bridge_name, Name},
+                    {bridge_config, MysqlConfig},
                     {proxy_host, ProxyHost},
                     {proxy_port, ProxyPort}
                     | Config0
                 ],
             Config;
         false ->
-            {skip, no_mysql}
+            case os:getenv("IS_CI") of
+                "yes" ->
+                    throw(no_mysql);
+                _ ->
+                    {skip, no_mysql}
+            end
     end.
 
 mysql_config(BridgeType, Config) ->
@@ -185,6 +213,15 @@ mysql_config(BridgeType, Config) ->
             "    batch_size = ~b\n"
             "    query_mode = ~s\n"
             "    worker_pool_size = ~b\n"
+            "    health_check_interval = 15s\n"
+            "    start_timeout = 5s\n"
+            "    inflight_window = 100\n"
+            "    max_buffer_bytes = 256MB\n"
+            "    buffer_mode = memory_only\n"
+            "    batch_time = 100ms\n"
+            "    metrics_flush_interval = 5s\n"
+            "    buffer_seg_bytes = 10MB\n"
+            "    start_after_created = true\n"
             "  }\n"
             "  ssl = {\n"
             "    enable = ~w\n"
@@ -245,13 +282,12 @@ send_message(Config, Payload) ->
 query_resource(Config, Request) ->
     Name = ?config(mysql_name, Config),
     BridgeType = ?config(mysql_bridge_type, Config),
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
-    emqx_resource:query(ResourceID, Request, #{timeout => 500}).
+    emqx_bridge_v2:query(BridgeType, Name, Request, #{timeout => 500}).
 
 sync_query_resource(Config, Request) ->
     Name = ?config(mysql_name, Config),
     BridgeType = ?config(mysql_bridge_type, Config),
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
+    ResourceID = emqx_bridge_v2:id(BridgeType, Name),
     emqx_resource_buffer_worker:simple_sync_query(ResourceID, Request).
 
 query_resource_async(Config, Request) ->
@@ -259,8 +295,7 @@ query_resource_async(Config, Request) ->
     BridgeType = ?config(mysql_bridge_type, Config),
     Ref = alias([reply]),
     AsyncReplyFun = fun(Result) -> Ref ! {result, Ref, Result} end,
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
-    Return = emqx_resource:query(ResourceID, Request, #{
+    Return = emqx_bridge_v2:query(BridgeType, Name, Request, #{
         timeout => 500, async_reply_fun => {AsyncReplyFun, []}
     }),
     {Return, Ref}.
@@ -277,7 +312,9 @@ unprepare(Config, Key) ->
     Name = ?config(mysql_name, Config),
     BridgeType = ?config(mysql_bridge_type, Config),
     ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
-    {ok, _, #{state := #{pool_name := PoolName}}} = emqx_resource:get_instance(ResourceID),
+    {ok, _, #{state := #{connector_state := #{pool_name := PoolName}}}} = emqx_resource:get_instance(
+        ResourceID
+    ),
     [
         begin
             {ok, Conn} = ecpool_worker:client(Worker),
@@ -323,9 +360,6 @@ connect_and_create_table(Config) ->
 connect_and_drop_table(Config) ->
     query_direct_mysql(Config, ?SQL_DROP_TABLE).
 
-connect_and_clear_table(Config) ->
-    query_direct_mysql(Config, ?SQL_DELETE).
-
 connect_and_get_payload(Config) ->
     query_direct_mysql(Config, ?SQL_SELECT).
 
@@ -345,6 +379,17 @@ create_rule_and_action_http(Config) ->
             Res = #{<<"id">> := RuleId} = emqx_utils_json:decode(Res0, [return_maps]),
             on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
             {ok, Res};
+        Error ->
+            Error
+    end.
+
+request_api_status(BridgeId) ->
+    Path = emqx_mgmt_api_test_util:api_path(["bridges", BridgeId]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    case emqx_mgmt_api_test_util:request_api(get, Path, "", AuthHeader) of
+        {ok, Res0} ->
+            #{<<"status">> := Status} = _Res = emqx_utils_json:decode(Res0, [return_maps]),
+            {ok, binary_to_existing_atom(Status)};
         Error ->
             Error
     end.
@@ -369,6 +414,33 @@ t_setup_via_config_and_publish(Config) ->
             ),
             ?assertMatch(
                 {ok, [<<"payload">>], [[Val]]},
+                connect_and_get_payload(Config)
+            ),
+            ok
+        end,
+        fun(Trace0) ->
+            Trace = ?of_kind(mysql_connector_query_return, Trace0),
+            ?assertMatch([#{result := ok}], Trace),
+            ok
+        end
+    ),
+    ok.
+
+t_undefined_vars_as_null(Config) ->
+    ?assertMatch(
+        {ok, _},
+        create_bridge(Config, #{<<"undefined_vars_as_null">> => true})
+    ),
+    SentData = #{payload => undefined, timestamp => 1668602148000},
+    ?check_trace(
+        begin
+            ?wait_async_action(
+                ?assertEqual(ok, send_message(Config, SentData)),
+                #{?snk_kind := mysql_connector_query_return},
+                10_000
+            ),
+            ?assertMatch(
+                {ok, [<<"payload">>], [[null]]},
                 connect_and_get_payload(Config)
             ),
             ok
@@ -489,7 +561,6 @@ t_write_failure(Config) ->
             ok
         end,
         fun(Trace0) ->
-            ct:pal("trace: ~p", [Trace0]),
             Trace = ?of_kind(buffer_worker_flush_nack, Trace0),
             ?assertMatch([#{result := {error, _}} | _], Trace),
             [#{result := {error, Error}} | _] = Trace,
@@ -525,14 +596,18 @@ t_write_timeout(Config) ->
         2 * Timeout
     ),
     emqx_common_test_helpers:with_failure(timeout, ProxyName, ProxyHost, ProxyPort, fun() ->
+        Name = ?config(mysql_name, Config),
+        BridgeType = ?config(mysql_bridge_type, Config),
+        ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
+
         case QueryMode of
             sync ->
                 ?assertMatch(
                     {error, {resource_error, #{reason := timeout}}},
-                    query_resource(Config, {send_message, SentData, [], Timeout})
+                    query_resource(Config, {ResourceID, SentData, [], Timeout})
                 );
             async ->
-                query_resource(Config, {send_message, SentData, [], Timeout}),
+                query_resource(Config, {ResourceID, SentData, [], Timeout}),
                 ok
         end,
         ok
@@ -566,7 +641,6 @@ t_simple_sql_query(Config) ->
 
 t_missing_data(Config) ->
     BatchSize = ?config(batch_size, Config),
-    IsBatch = BatchSize > 1,
     ?assertMatch(
         {ok, _},
         create_bridge(Config)
@@ -577,8 +651,8 @@ t_missing_data(Config) ->
     ),
     send_message(Config, #{}),
     {ok, [Event]} = snabbkaffe:receive_events(SRef),
-    case IsBatch of
-        true ->
+    case BatchSize of
+        N when N > 1 ->
             ?assertMatch(
                 #{
                     result :=
@@ -588,7 +662,7 @@ t_missing_data(Config) ->
                 },
                 Event
             );
-        false ->
+        1 ->
             ?assertMatch(
                 #{
                     result :=
@@ -710,7 +784,10 @@ t_uninitialized_prepared_statement(Config) ->
     ),
     Val = integer_to_binary(erlang:unique_integer()),
     SentData = #{payload => Val, timestamp => 1668602148000},
-    unprepare(Config, send_message),
+    Name = ?config(mysql_name, Config),
+    BridgeType = ?config(mysql_bridge_type, Config),
+    ResourceID = emqx_bridge_v2:id(BridgeType, Name),
+    unprepare(Config, ResourceID),
     ?check_trace(
         begin
             {Res, {ok, _}} =
@@ -728,7 +805,7 @@ t_uninitialized_prepared_statement(Config) ->
                     #{?snk_kind := mysql_connector_prepare_query_failed, error := not_prepared},
                     #{
                         ?snk_kind := mysql_connector_on_query_prepared_sql,
-                        type_or_key := send_message
+                        type_or_key := ResourceID
                     },
                     Trace
                 )
@@ -743,33 +820,43 @@ t_uninitialized_prepared_statement(Config) ->
     ok.
 
 t_missing_table(Config) ->
+    QueryMode = ?config(query_mode, Config),
     Name = ?config(mysql_name, Config),
     BridgeType = ?config(mysql_bridge_type, Config),
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
 
     ?check_trace(
         begin
             connect_and_drop_table(Config),
             ?assertMatch({ok, _}, create_bridge(Config)),
+            BridgeID = emqx_bridge_resource:bridge_id(BridgeType, Name),
             ?retry(
                 _Sleep = 1_000,
                 _Attempts = 20,
                 ?assertMatch(
                     {ok, Status} when Status == connecting orelse Status == disconnected,
-                    emqx_resource_manager:health_check(ResourceID)
+                    request_api_status(BridgeID)
                 )
             ),
             Val = integer_to_binary(erlang:unique_integer()),
             SentData = #{payload => Val, timestamp => 1668602148000},
-            Timeout = 1000,
+            ResourceID = emqx_bridge_v2:id(BridgeType, Name),
+            Request = {ResourceID, SentData},
+            Result =
+                case QueryMode of
+                    sync ->
+                        query_resource(Config, Request);
+                    async ->
+                        {Res, _Ref} = query_resource_async(Config, Request),
+                        Res
+                end,
             ?assertMatch(
                 {error, {resource_error, #{reason := unhealthy_target}}},
-                query_resource(Config, {send_message, SentData, [], Timeout})
+                Result
             ),
             ok
         end,
         fun(Trace) ->
-            ?assertMatch([_, _, _], ?of_kind(mysql_undefined_table, Trace)),
+            ?assertMatch([_ | _], ?of_kind(mysql_undefined_table, Trace)),
             ok
         end
     ).
@@ -777,25 +864,115 @@ t_missing_table(Config) ->
 t_table_removed(Config) ->
     Name = ?config(mysql_name, Config),
     BridgeType = ?config(mysql_bridge_type, Config),
+    connect_and_create_table(Config),
+    ?assertMatch({ok, _}, create_bridge(Config)),
     ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 20,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceID))
+    ),
+    connect_and_drop_table(Config),
+    Val = integer_to_binary(erlang:unique_integer()),
+    SentData = #{payload => Val, timestamp => 1668602148000},
+    Timeout = 1000,
+    ActionID = emqx_bridge_v2:id(BridgeType, Name),
+    ?assertMatch(
+        {error,
+            {unrecoverable_error, {1146, <<"42S02">>, <<"Table 'mqtt.mqtt_test' doesn't exist">>}}},
+        sync_query_resource(Config, {ActionID, SentData, [], Timeout})
+    ),
+    ok.
+
+init_nested_payload_template(SQL, Config) ->
+    Name = ?config(mysql_name, Config),
+    BridgeType = ?config(mysql_bridge_type, Config),
+    Value = integer_to_binary(erlang:unique_integer()),
+    {ok, _} = create_bridge(Config, #{<<"sql">> => SQL}),
+    {ok, #{<<"from">> := [Topic]}} = create_rule_and_action_http(Config),
+    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 20,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceID))
+    ),
+    %% send message via rule action
+    Payload = emqx_utils_json:encode(#{value => Value}),
+    Message = emqx_message:make(Topic, Payload),
+    {Value, Message}.
+
+t_nested_payload_template_1(Config) ->
+    SQL = <<
+        "INSERT INTO mqtt_test(payload, arrived) "
+        "VALUES (${payload.value}, FROM_UNIXTIME(${timestamp}/1000))"
+    >>,
+    {Value, Message} = init_nested_payload_template(SQL, Config),
+    {_, {ok, _}} =
+        ?wait_async_action(
+            emqx:publish(Message),
+            #{?snk_kind := mysql_connector_query_return},
+            10_000
+        ),
+    SelectResult = connect_and_get_payload(Config),
+    ?assertEqual({ok, [<<"payload">>], [[Value]]}, SelectResult),
+    ok.
+
+t_nested_payload_template_2(Config) ->
+    SQL = <<
+        "INSERT INTO mqtt_test(payload, arrived) "
+        "VALUES (${payload.value}, FROM_UNIXTIME(${timestamp}/1000)) "
+        "ON DUPLICATE KEY UPDATE arrived=NOW()"
+    >>,
+    MsgCnt = 20,
+    {Value, Message} = init_nested_payload_template(SQL, Config),
+    {_, {ok, _}} =
+        ?wait_async_action(
+            [emqx:publish(Message) || _ <- lists:seq(1, MsgCnt)],
+            #{?snk_kind := mysql_connector_query_return},
+            10_000
+        ),
+    timer:sleep(1000),
+    {ok, [<<"payload">>], Results} = connect_and_get_payload(Config),
+    ct:pal("-----value: ~p, results: ~p", [Value, Results]),
+    ?assert(length(Results) >= MsgCnt),
+    ?assert(lists:all(fun([V]) -> V == Value end, Results)),
+    ok.
+
+t_batch_update_is_forbidden(Config) ->
     ?check_trace(
         begin
-            connect_and_create_table(Config),
-            ?assertMatch({ok, _}, create_bridge(Config)),
-            ?retry(
-                _Sleep = 1_000,
-                _Attempts = 20,
-                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceID))
+            Overrides = #{
+                <<"sql">> =>
+                    <<
+                        "UPDATE mqtt_test "
+                        "SET arrived = FROM_UNIXTIME(${timestamp}/1000) "
+                        "WHERE payload = ${payload.value}"
+                    >>
+            },
+            ProbeRes = emqx_bridge_testlib:probe_bridge_api(Config, Overrides),
+            ?assertMatch({error, {{_, 400, _}, _, _Body}}, ProbeRes),
+            {error, {{_, 400, _}, _, ProbeBodyRaw}} = ProbeRes,
+            ?assertEqual(
+                match,
+                re:run(
+                    ProbeBodyRaw,
+                    <<"UPDATE statements are not supported for batch operations">>,
+                    [global, {capture, none}]
+                )
             ),
-            connect_and_drop_table(Config),
-            Val = integer_to_binary(erlang:unique_integer()),
-            SentData = #{payload => Val, timestamp => 1668602148000},
-            Timeout = 1000,
+            CreateRes = emqx_bridge_testlib:create_bridge_api(Config, Overrides),
             ?assertMatch(
-                {error,
-                    {unrecoverable_error,
-                        {1146, <<"42S02">>, <<"Table 'mqtt.mqtt_test' doesn't exist">>}}},
-                sync_query_resource(Config, {send_message, SentData, [], Timeout})
+                {ok, {{_, 201, _}, _, #{<<"status">> := <<"disconnected">>}}},
+                CreateRes
+            ),
+            {ok, {{_, 201, _}, _, #{<<"status_reason">> := Reason}}} = CreateRes,
+            ?assertEqual(
+                match,
+                re:run(
+                    Reason,
+                    <<"UPDATE statements are not supported for batch operations">>,
+                    [global, {capture, none}]
+                )
             ),
             ok
         end,
@@ -803,30 +980,30 @@ t_table_removed(Config) ->
     ),
     ok.
 
-t_nested_payload_template(Config) ->
-    Name = ?config(mysql_name, Config),
-    BridgeType = ?config(mysql_bridge_type, Config),
-    ResourceID = emqx_bridge_resource:resource_id(BridgeType, Name),
-    Value = integer_to_binary(erlang:unique_integer()),
+t_non_batch_update_is_allowed(Config) ->
     ?check_trace(
         begin
-            connect_and_create_table(Config),
-            {ok, _} = create_bridge(
-                Config,
-                #{
-                    <<"sql">> =>
-                        "INSERT INTO mqtt_test(payload, arrived) "
-                        "VALUES (${payload.value}, FROM_UNIXTIME(${timestamp}/1000))"
-                }
+            BridgeName = ?config(bridge_name, Config),
+            Overrides = #{
+                <<"resource_opts">> => #{<<"metrics_flush_interval">> => <<"500ms">>},
+                <<"sql">> =>
+                    <<
+                        "UPDATE mqtt_test "
+                        "SET arrived = FROM_UNIXTIME(${timestamp}/1000) "
+                        "WHERE payload = ${payload.value}"
+                    >>
+            },
+            ProbeRes = emqx_bridge_testlib:probe_bridge_api(Config, Overrides),
+            ?assertMatch({ok, {{_, 204, _}, _, _Body}}, ProbeRes),
+            ?assertMatch(
+                {ok, {{_, 201, _}, _, #{<<"status">> := <<"connected">>}}},
+                emqx_bridge_testlib:create_bridge_api(Config, Overrides)
             ),
-            {ok, #{<<"from">> := [Topic]}} = create_rule_and_action_http(Config),
-            ?retry(
-                _Sleep = 1_000,
-                _Attempts = 20,
-                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceID))
-            ),
-            %% send message via rule action
-            Payload = emqx_utils_json:encode(#{value => Value}),
+            {ok, #{
+                <<"id">> := RuleId,
+                <<"from">> := [Topic]
+            }} = create_rule_and_action_http(Config),
+            Payload = emqx_utils_json:encode(#{value => <<"aaaa">>}),
             Message = emqx_message:make(Topic, Payload),
             {_, {ok, _}} =
                 ?wait_async_action(
@@ -834,9 +1011,69 @@ t_nested_payload_template(Config) ->
                     #{?snk_kind := mysql_connector_query_return},
                     10_000
                 ),
+            ActionId = emqx_bridge_v2:id(?ACTION_TYPE, BridgeName),
+            ?assertEqual(1, emqx_resource_metrics:matched_get(ActionId)),
+            ?retry(
+                _Sleep0 = 200,
+                _Attempts0 = 10,
+                ?assertEqual(1, emqx_resource_metrics:success_get(ActionId))
+            ),
+
+            ?assertEqual(1, emqx_metrics_worker:get(rule_metrics, RuleId, 'actions.success')),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_undefined_field_in_sql(Config) ->
+    ?check_trace(
+        begin
+            Overrides = #{
+                <<"sql">> =>
+                    <<
+                        "INSERT INTO mqtt_test(wrong_column, arrived) "
+                        "VALUES (${payload}, FROM_UNIXTIME(${timestamp}/1000))"
+                    >>
+            },
+            ProbeRes = emqx_bridge_testlib:probe_bridge_api(Config, Overrides),
+            ?assertMatch({error, {{_, 400, _}, _, _BodyRaw}}, ProbeRes),
+            {error, {{_, 400, _}, _, BodyRaw}} = ProbeRes,
             ?assertEqual(
-                {ok, [<<"payload">>], [[Value]]},
-                connect_and_get_payload(Config)
+                match,
+                re:run(
+                    BodyRaw,
+                    <<"Unknown column 'wrong_column' in 'field list'">>,
+                    [{capture, none}]
+                ),
+                #{body => BodyRaw}
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_delete_with_undefined_field_in_sql(Config) ->
+    ?check_trace(
+        begin
+            Name = ?config(bridge_name, Config),
+            Type = ?config(bridge_type, Config),
+            Overrides = #{
+                <<"sql">> =>
+                    <<
+                        "INSERT INTO mqtt_test(wrong_column, arrived) "
+                        "VALUES (${payload}, FROM_UNIXTIME(${timestamp}/1000))"
+                    >>
+            },
+            ?assertMatch(
+                {ok, {{_, 201, _}, _, #{<<"status">> := Status}}} when
+                    Status =:= <<"connecting">> orelse Status =:= <<"disconnected">>,
+                emqx_bridge_testlib:create_bridge_api(Config, Overrides)
+            ),
+            ?assertMatch(
+                {ok, {{_, 204, _}, _, _}},
+                emqx_bridge_testlib:delete_bridge_http_api_v1(#{type => Type, name => Name})
             ),
             ok
         end,

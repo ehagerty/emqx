@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,21 +31,29 @@
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
-init_per_suite(Conf) ->
-    emqx_config:erase(gateway),
+init_per_suite(Config) ->
     emqx_gateway_test_utils:load_all_gateway_apps(),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_common_test_helpers:start_apps([emqx_authn, emqx_gateway]),
-    Conf.
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, ?CONF_DEFAULT},
+            emqx_resource,
+            emqx_gateway_lwm2m,
+            emqx_gateway,
+            emqx_auth,
+            emqx_auth_redis,
+            emqx_auth_mnesia
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Conf) ->
-    emqx_common_test_helpers:stop_apps([emqx_gateway, emqx_authn]),
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
     emqx_config:delete_override_conf_files(),
     ok.
 
 init_per_testcase(t_get_basic_usage_info_2, Config) ->
     DataDir = ?config(data_dir, Config),
-    application:stop(emqx_gateway),
     ok = setup_fake_usage_data(DataDir),
     Config;
 init_per_testcase(_TestCase, Config) ->
@@ -53,11 +61,8 @@ init_per_testcase(_TestCase, Config) ->
 
 end_per_testcase(t_get_basic_usage_info_2, _Config) ->
     emqx_gateway_cm:unregister_channel(lwm2m, <<"client_id">>),
-    emqx_config:put([gateway], #{}),
-    emqx_common_test_helpers:stop_apps([emqx_gateway]),
-    emqx_config:erase(gateway),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_common_test_helpers:start_apps([emqx_gateway]),
+    ok = emqx_gateway:unload(lwm2m),
+    {ok, _} = emqx_conf:update([gateway], #{}, #{override_to => cluster}),
     ok;
 end_per_testcase(_TestCase, _Config) ->
     ok.
@@ -67,13 +72,10 @@ end_per_testcase(_TestCase, _Config) ->
 %%--------------------------------------------------------------------
 
 t_registered_gateway(_) ->
-    [
-        {coap, #{cbkmod := emqx_gateway_coap}},
-        {exproto, #{cbkmod := emqx_gateway_exproto}},
-        {lwm2m, #{cbkmod := emqx_gateway_lwm2m}},
-        {mqttsn, #{cbkmod := emqx_gateway_mqttsn}},
-        {stomp, #{cbkmod := emqx_gateway_stomp}}
-    ] = emqx_gateway:registered_gateway().
+    ?assertMatch(
+        [{coap, #{cbkmod := emqx_gateway_coap}} | _],
+        lists:sort(emqx_gateway:registered_gateway())
+    ).
 
 t_load_unload_list_lookup(_) ->
     {ok, _} = emqx_gateway:load(?GWNAME, #{idle_timeout => 1000}),
@@ -146,33 +148,37 @@ t_get_basic_usage_info_empty(_Config) ->
 
 t_get_basic_usage_info_1(_Config) ->
     {ok, _} = emqx_gateway:load(?GWNAME, #{idle_timeout => 1000}),
-    ?assertEqual(
-        #{
-            mqttsn =>
-                #{
-                    authn => <<"undefined">>,
-                    listeners => [],
-                    num_clients => 0
-                }
-        },
-        emqx_gateway:get_basic_usage_info()
-    ).
+    try
+        ?assertEqual(
+            #{
+                mqttsn =>
+                    #{
+                        authn => <<"undefined">>,
+                        listeners => [],
+                        num_clients => 0
+                    }
+            },
+            emqx_gateway:get_basic_usage_info()
+        )
+    after
+        ok = emqx_gateway:unload(?GWNAME)
+    end.
 
 t_get_basic_usage_info_2(_Config) ->
-    ?assertEqual(
+    ?assertMatch(
         #{
-            lwm2m =>
+            lwm2m :=
                 #{
-                    authn => <<"password_based:redis">>,
-                    listeners =>
+                    authn := <<"password_based:redis">>,
+                    listeners :=
                         [
                             #{
-                                authn =>
+                                authn :=
                                     <<"password_based:built_in_database">>,
-                                type => udp
+                                type := udp
                             }
                         ],
-                    num_clients => 1
+                    num_clients := 1
                 }
         },
         emqx_gateway:get_basic_usage_info()
@@ -199,7 +205,7 @@ setup_fake_usage_data(Lwm2mDataDir) ->
     Lwm2mConf = read_lwm2m_conf(Lwm2mDataDir),
     ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, Lwm2mConf),
     emqx_config:put([gateway, lwm2m, xml_dir], XmlDir),
-    {ok, _} = application:ensure_all_started(emqx_gateway),
+    {ok, _} = emqx_gateway:load(lwm2m, emqx_config:get([gateway, lwm2m])),
     %% to simulate a connection
     FakeConnInfo = #{conn_mod => fake_conn_mod},
     FakeChanPid = self(),

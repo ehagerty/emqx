@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -105,10 +105,10 @@ t_helper(_) ->
             end
         end,
     [
-        {"emqx_broker", MkTestFun(emqx_broker, stats_fun)},
-        {"emqx_sm", MkTestFun(emqx_sm, stats_fun)},
+        {"emqx_broker_helper", MkTestFun(emqx_broker_helper, stats_fun)},
         {"emqx_router_helper", MkTestFun(emqx_router_helper, stats_fun)},
-        {"emqx_cm", MkTestFun(emqx_cm, stats_fun)}
+        {"emqx_cm", MkTestFun(emqx_cm, stats_fun)},
+        {"emqx_retainer", MkTestFun(emqx_retainer, stats_fun)}
     ].
 
 with_proc(F) ->

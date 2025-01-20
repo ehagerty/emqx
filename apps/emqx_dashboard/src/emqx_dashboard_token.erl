@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,18 +18,16 @@
 
 -include("emqx_dashboard.hrl").
 
+-export([create_tables/0]).
+
 -export([
     sign/2,
-    verify/1,
+    verify/2,
     lookup/1,
     owner/1,
     destroy/1,
     destroy_by_username/1
 ]).
-
--boot_mnesia({mnesia, [boot]}).
-
--export([mnesia/1]).
 
 -ifdef(TEST).
 -export([lookup_by_username/1, clean_expired_jwt/1]).
@@ -55,14 +53,17 @@
 
 %%--------------------------------------------------------------------
 %% jwt function
--spec sign(Username :: binary(), Password :: binary()) ->
-    {ok, Token :: binary()} | {error, Reason :: term()}.
-sign(Username, Password) ->
-    do_sign(Username, Password).
+-spec sign(User :: dashboard_user(), Password :: binary()) ->
+    {ok, dashboard_user_role(), Token :: binary()} | {error, Reason :: term()}.
+sign(User, Password) ->
+    do_sign(User, Password).
 
--spec verify(Token :: binary()) -> Result :: ok | {error, token_timeout | not_found}.
-verify(Token) ->
-    do_verify(Token).
+-spec verify(_, Token :: binary()) ->
+    Result ::
+        {ok, binary()}
+        | {error, token_timeout | not_found | unauthorized_role}.
+verify(Req, Token) ->
+    do_verify(Req, Token).
 
 -spec destroy(KeyOrKeys :: list() | binary() | #?ADMIN_JWT{}) -> ok.
 destroy([]) ->
@@ -84,7 +85,7 @@ salt() ->
     <<X:16/big-unsigned-integer>> = crypto:strong_rand_bytes(2),
     iolist_to_binary(io_lib:format("~4.16.0b", [X])).
 
-mnesia(boot) ->
+create_tables() ->
     ok = mria:create_table(?TAB, [
         {type, set},
         {rlog_shard, ?DASHBOARD_SHARD},
@@ -97,11 +98,12 @@ mnesia(boot) ->
                 {write_concurrency, true}
             ]}
         ]}
-    ]).
+    ]),
+    [?TAB].
 
 %%--------------------------------------------------------------------
 %% jwt apply
-do_sign(Username, Password) ->
+do_sign(#?ADMIN{username = Username} = User, Password) ->
     ExpTime = jwt_expiration_time(),
     Salt = salt(),
     JWK = jwk(Username, Password, Salt),
@@ -114,22 +116,21 @@ do_sign(Username, Password) ->
     },
     Signed = jose_jwt:sign(JWK, JWS, JWT),
     {_, Token} = jose_jws:compact(Signed),
-    JWTRec = format(Token, Username, ExpTime),
-    _ = mria:transaction(?DASHBOARD_SHARD, fun mnesia:write/1, [JWTRec]),
-    {ok, Token}.
+    Role = emqx_dashboard_admin:role(User),
+    JWTRec = format(Token, Username, Role, ExpTime),
+    _ = mria:sync_transaction(?DASHBOARD_SHARD, fun mnesia:write/1, [JWTRec]),
+    {ok, Role, Token}.
 
-do_verify(Token) ->
+-spec do_verify(_, Token :: binary()) ->
+    Result ::
+        {ok, binary()}
+        | {error, token_timeout | not_found | unauthorized_role}.
+do_verify(Req, Token) ->
     case lookup(Token) of
-        {ok, JWT = #?ADMIN_JWT{exptime = ExpTime}} ->
+        {ok, JWT = #?ADMIN_JWT{exptime = ExpTime, extra = _Extra, username = _Username}} ->
             case ExpTime > erlang:system_time(millisecond) of
                 true ->
-                    NewJWT = JWT#?ADMIN_JWT{exptime = jwt_expiration_time()},
-                    {atomic, Res} = mria:transaction(
-                        ?DASHBOARD_SHARD,
-                        fun mnesia:write/1,
-                        [NewJWT]
-                    ),
-                    Res;
+                    check_rbac(Req, JWT);
                 _ ->
                     {error, token_timeout}
             end;
@@ -139,7 +140,7 @@ do_verify(Token) ->
 
 do_destroy(Token) ->
     Fun = fun mnesia:delete/1,
-    {atomic, ok} = mria:transaction(?DASHBOARD_SHARD, Fun, [{?TAB, Token}]),
+    {atomic, ok} = mria:sync_transaction(?DASHBOARD_SHARD, Fun, [{?TAB, Token}]),
     ok.
 
 do_destroy_by_username(Username) ->
@@ -170,6 +171,9 @@ owner(Token) ->
         {atomic, []} -> {error, not_found}
     end.
 
+jwk(?SSO_USERNAME(Backend, Name), Password, Salt) ->
+    BackendBin = erlang:atom_to_binary(Backend),
+    jwk(<<BackendBin/binary, "-", Name/binary>>, Password, Salt);
 jwk(Username, Password, Salt) ->
     Key = crypto:hash(md5, <<Salt/binary, Username/binary, Password/binary>>),
     #{
@@ -183,11 +187,17 @@ jwt_expiration_time() ->
 token_ttl() ->
     emqx_conf:get([dashboard, token_expired_time], ?EXPTIME).
 
-format(Token, Username, ExpTime) ->
+format(Token, ?SSO_USERNAME(Backend, Name), Role, ExpTime) ->
+    format(Token, Backend, Name, Role, ExpTime);
+format(Token, Username, Role, ExpTime) ->
+    format(Token, ?BACKEND_LOCAL, Username, Role, ExpTime).
+
+format(Token, Backend, Username, Role, ExpTime) ->
     #?ADMIN_JWT{
         token = Token,
         username = Username,
-        exptime = ExpTime
+        exptime = ExpTime,
+        extra = #{role => Role, backend => Backend}
     }.
 
 %%--------------------------------------------------------------------
@@ -234,3 +244,30 @@ clean_expired_jwt(Now) ->
         fun() -> mnesia:select(?TAB, Spec) end
     ),
     ok = destroy(JWTList).
+
+-if(?EMQX_RELEASE_EDITION == ee).
+check_rbac(Req, JWT) ->
+    #?ADMIN_JWT{exptime = _ExpTime, extra = Extra, username = Username} = JWT,
+    case emqx_dashboard_rbac:check_rbac(Req, Username, Extra) of
+        true ->
+            save_new_jwt(JWT);
+        _ ->
+            {error, unauthorized_role}
+    end.
+
+-else.
+
+check_rbac(_Req, JWT) ->
+    save_new_jwt(JWT).
+
+-endif.
+
+save_new_jwt(OldJWT) ->
+    #?ADMIN_JWT{exptime = _ExpTime, extra = _Extra, username = Username} = OldJWT,
+    NewJWT = OldJWT#?ADMIN_JWT{exptime = jwt_expiration_time()},
+    {atomic, Res} = mria:sync_transaction(
+        ?DASHBOARD_SHARD,
+        fun mnesia:write/1,
+        [NewJWT]
+    ),
+    {Res, Username}.

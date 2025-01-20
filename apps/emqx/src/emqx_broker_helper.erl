@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@
 
 -behaviour(gen_server).
 
+-include("emqx_router.hrl").
+-include("emqx_shared_sub.hrl").
 -include("logger.hrl").
 -include("types.hrl").
 
@@ -33,6 +35,9 @@
     reclaim_seq/1
 ]).
 
+%% Stats fun
+-export([stats_fun/0]).
+
 %% gen_server callbacks
 -export([
     init/1,
@@ -42,6 +47,9 @@
     terminate/2,
     code_change/3
 ]).
+
+%% Internal APIs
+-export([clean_down/1]).
 
 -ifdef(TEST).
 -compile(export_all).
@@ -54,7 +62,7 @@
 -define(SUBSEQ, emqx_subseq).
 -define(SHARD, 1024).
 
--define(BATCH_SIZE, 100000).
+-define(BATCH_SIZE, 1000).
 
 -spec start_link() -> startlink_ret().
 start_link() ->
@@ -64,18 +72,19 @@ start_link() ->
 register_sub(SubPid, SubId) when is_pid(SubPid) ->
     case ets:lookup(?SUBMON, SubPid) of
         [] ->
-            gen_server:cast(?HELPER, {register_sub, SubPid, SubId});
+            _ = erlang:send(?HELPER, {register_sub, SubPid, SubId}),
+            ok;
         [{_, SubId}] ->
             ok;
         _Other ->
             error(subid_conflict)
     end.
 
--spec lookup_subid(pid()) -> maybe(emqx_types:subid()).
+-spec lookup_subid(pid()) -> option(emqx_types:subid()).
 lookup_subid(SubPid) when is_pid(SubPid) ->
     emqx_utils_ets:lookup_value(?SUBMON, SubPid).
 
--spec lookup_subpid(emqx_types:subid()) -> maybe(pid()).
+-spec lookup_subpid(emqx_types:subid()) -> option(pid()).
 lookup_subpid(SubId) ->
     emqx_utils_ets:lookup_value(?SUBID, SubId).
 
@@ -100,10 +109,48 @@ reclaim_seq(Topic) ->
     emqx_sequence:reclaim(?SUBSEQ, Topic).
 
 %%--------------------------------------------------------------------
+%% Stats fun
+%%--------------------------------------------------------------------
+
+stats_fun() ->
+    safe_update_stats(subscriber_val(), 'subscribers.count', 'subscribers.max'),
+    safe_update_stats(subscription_count(), 'subscriptions.count', 'subscriptions.max'),
+    safe_update_stats(
+        durable_subscription_count(),
+        'durable_subscriptions.count',
+        'durable_subscriptions.max'
+    ),
+    safe_update_stats(table_size(?SUBOPTION), 'suboptions.count', 'suboptions.max').
+
+safe_update_stats(undefined, _Stat, _MaxStat) ->
+    ok;
+safe_update_stats(Val, Stat, MaxStat) when is_integer(Val) ->
+    emqx_stats:setstat(Stat, MaxStat, Val).
+
+%% N.B.: subscriptions from durable sessions are not tied to any particular node.
+%% Therefore, do not sum them with node-local subscriptions.
+subscription_count() ->
+    table_size(?SUBSCRIPTION).
+
+durable_subscription_count() ->
+    emqx_persistent_session_bookkeeper:get_subscription_count().
+
+subscriber_val() ->
+    sum_subscriber(table_size(?SUBSCRIBER), table_size(?SHARED_SUBSCRIBER)).
+
+sum_subscriber(undefined, undefined) -> undefined;
+sum_subscriber(undefined, V2) when is_integer(V2) -> V2;
+sum_subscriber(V1, undefined) when is_integer(V1) -> V1;
+sum_subscriber(V1, V2) when is_integer(V1), is_integer(V2) -> V1 + V2.
+
+table_size(Tab) when is_atom(Tab) -> ets:info(Tab, size).
+
+%%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
 init([]) ->
+    process_flag(message_queue_data, off_heap),
     %% Helper table
     ok = emqx_utils_ets:new(?HELPER, [{read_concurrency, true}]),
     %% Shards: CPU * 32
@@ -115,30 +162,25 @@ init([]) ->
     %% SubMon: SubPid -> SubId
     ok = emqx_utils_ets:new(?SUBMON, [public, {read_concurrency, true}, {write_concurrency, true}]),
     %% Stats timer
-    ok = emqx_stats:update_interval(broker_stats, fun emqx_broker:stats_fun/0),
-    {ok, #{pmon => emqx_pmon:new()}}.
+    ok = emqx_stats:update_interval(broker_stats, fun ?MODULE:stats_fun/0),
+    {ok, #{}}.
 
 handle_call(Req, _From, State) ->
-    ?SLOG(error, #{msg => "unexpected_call", call => Req}),
+    ?SLOG(error, #{msg => "emqx_broker_helper_unexpected_call", call => Req}),
     {reply, ignored, State}.
 
-handle_cast({register_sub, SubPid, SubId}, State = #{pmon := PMon}) ->
-    true = (SubId =:= undefined) orelse ets:insert(?SUBID, {SubId, SubPid}),
-    true = ets:insert(?SUBMON, {SubPid, SubId}),
-    {noreply, State#{pmon := emqx_pmon:monitor(SubPid, PMon)}};
 handle_cast(Msg, State) ->
-    ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
+    ?SLOG(error, #{msg => "emqx_broker_helper_unexpected_cast", cast => Msg}),
     {noreply, State}.
 
-handle_info({'DOWN', _MRef, process, SubPid, _Reason}, State = #{pmon := PMon}) ->
-    SubPids = [SubPid | emqx_utils:drain_down(?BATCH_SIZE)],
-    ok = emqx_pool:async_submit(
-        fun lists:foreach/2, [fun clean_down/1, SubPids]
-    ),
-    {_, PMon1} = emqx_pmon:erase_all(SubPids, PMon),
-    {noreply, State#{pmon := PMon1}};
+handle_info({register_sub, SubPid, SubId}, State) ->
+    ok = collect_and_handle([{SubId, SubPid}], []),
+    {noreply, State};
+handle_info({'DOWN', _MRef, process, SubPid, _Reason}, State) ->
+    ok = collect_and_handle([], [SubPid]),
+    {noreply, State};
 handle_info(Info, State) ->
-    ?SLOG(error, #{msg => "unexpected_info", info => Info}),
+    ?SLOG(error, #{msg => "emqx_broker_helper_unexpected_info", info => Info}),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -151,6 +193,45 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+
+collect_and_handle(Reg0, Down0) ->
+    {Reg, Down} = collect_messages(Reg0, Down0),
+    %% handle register before handle down to avoid race condition
+    %% because down message is always the last one from a process
+    ok = handle_register(Reg),
+    ok = handle_down(Down).
+
+collect_messages(Reg, Down) ->
+    collect_messages(Reg, Down, ?BATCH_SIZE).
+
+%% Collect both register_sub and 'DOWN' messages in a loop.
+%% There is no other message sent to this process, so the
+%% 'receive' should not have to scan the mailbox.
+collect_messages(Reg, Down, 0) ->
+    {Reg, Down};
+collect_messages(Reg, Down, N) ->
+    receive
+        {register_sub, Pid, Id} ->
+            collect_messages([{Id, Pid} | Reg], Down, N - 1);
+        {'DOWN', _MRef, process, Pid, _Reason} ->
+            collect_messages(Reg, [Pid | Down], N - 1)
+    after 0 ->
+        {Reg, Down}
+    end.
+
+handle_register(Reg) ->
+    lists:foreach(fun do_handle_register/1, Reg).
+
+do_handle_register({SubId, SubPid}) ->
+    true = (SubId =:= undefined) orelse ets:insert(?SUBID, {SubId, SubPid}),
+    _ = erlang:monitor(process, SubPid),
+    true = ets:insert(?SUBMON, {SubPid, SubId}),
+    ok.
+
+handle_down(SubPids) ->
+    ok = emqx_pool:async_submit(
+        fun lists:foreach/2, [fun ?MODULE:clean_down/1, SubPids]
+    ).
 
 clean_down(SubPid) ->
     try

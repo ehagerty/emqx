@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -34,20 +34,14 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    ok = ekka:start(),
-    OldConf = emqx:get_config([zones], #{}),
-    emqx_config:put_zone_conf(default, [mqtt, exclusive_subscription], true),
-    timer:sleep(50),
-    [{old_conf, OldConf} | Config].
+    Apps = emqx_cth_suite:start(
+        [{emqx, "mqtt.exclusive_subscription = true"}],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    emqx_config:put([zones], proplists:get_value(old_conf, Config)),
-    ekka:stop(),
-    mria:stop(),
-    mria_mnesia:delete_schema(),
-    emqx_common_test_helpers:stop_apps([]).
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
 
 end_per_testcase(_TestCase, _Config) ->
     emqx_exclusive_subscription:clear().
@@ -60,6 +54,8 @@ t_exclusive_sub(_) ->
         {properties, #{'Session-Expiry-Interval' => 100}}
     ]),
     {ok, _} = emqtt:connect(C1),
+    ?CHECK_SUB(C1, 0),
+
     ?CHECK_SUB(C1, 0),
 
     {ok, C2} = emqtt:start_link([

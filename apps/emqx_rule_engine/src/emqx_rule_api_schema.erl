@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,12 +21,13 @@
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include("rule_engine.hrl").
 
 -export([check_params/2]).
 
--export([roots/0, fields/1]).
+-export([namespace/0, roots/0, fields/1]).
 
--type tag() :: rule_creation | rule_test | rule_engine.
+-type tag() :: rule_creation | rule_test | rule_engine | rule_apply_test.
 
 -spec check_params(map(), tag()) -> {ok, map()} | {error, term()}.
 check_params(Params, Tag) ->
@@ -36,15 +37,21 @@ check_params(Params, Tag) ->
         #{Tag := Checked} -> {ok, Checked}
     catch
         throw:Reason ->
-            ?SLOG(error, #{
-                msg => "check_rule_params_failed",
-                reason => Reason
-            }),
+            ?SLOG(
+                info,
+                #{
+                    msg => "check_rule_params_failed",
+                    reason => Reason
+                },
+                #{tag => ?TAG}
+            ),
             {error, Reason}
     end.
 
 %%======================================================================================
 %% Hocon Schema Definitions
+
+namespace() -> "rule_engine".
 
 roots() ->
     [
@@ -52,7 +59,8 @@ roots() ->
         {"rule_creation", sc(ref("rule_creation"), #{desc => ?DESC("root_rule_creation")})},
         {"rule_info", sc(ref("rule_info"), #{desc => ?DESC("root_rule_info")})},
         {"rule_events", sc(ref("rule_events"), #{desc => ?DESC("root_rule_events")})},
-        {"rule_test", sc(ref("rule_test"), #{desc => ?DESC("root_rule_test")})}
+        {"rule_test", sc(ref("rule_test"), #{desc => ?DESC("root_rule_test")})},
+        {"rule_apply_test", sc(ref("rule_apply_test"), #{desc => ?DESC("root_apply_rule_test")})}
     ].
 
 fields("rule_engine") ->
@@ -99,28 +107,21 @@ fields("rule_events") ->
     ];
 fields("rule_test") ->
     [
-        {"context",
-            sc(
-                hoconsc:union([
-                    ref("ctx_pub"),
-                    ref("ctx_sub"),
-                    ref("ctx_unsub"),
-                    ref("ctx_delivered"),
-                    ref("ctx_acked"),
-                    ref("ctx_dropped"),
-                    ref("ctx_connected"),
-                    ref("ctx_disconnected"),
-                    ref("ctx_connack"),
-                    ref("ctx_check_authz_complete"),
-                    ref("ctx_bridge_mqtt"),
-                    ref("ctx_delivery_dropped")
-                ]),
-                #{
-                    desc => ?DESC("test_context"),
-                    default => #{}
-                }
-            )},
+        rule_input_message_context(),
         {"sql", sc(binary(), #{desc => ?DESC("test_sql"), required => true})}
+    ];
+fields("rule_apply_test") ->
+    [
+        rule_input_message_context(),
+        {"stop_action_after_template_rendering",
+            sc(
+                typerefl:boolean(),
+                #{
+                    desc =>
+                        ?DESC("stop_action_after_template_render"),
+                    default => true
+                }
+            )}
     ];
 fields("metrics") ->
     [
@@ -164,50 +165,68 @@ fields("metrics") ->
         {"actions.failed.unknown",
             sc(non_neg_integer(), #{
                 desc => ?DESC("metrics_actions_failed_unknown")
+            })},
+        {"actions.discarded",
+            sc(non_neg_integer(), #{
+                desc => ?DESC("metrics_actions_discarded")
             })}
     ];
 fields("node_metrics") ->
     [{"node", sc(binary(), #{desc => ?DESC("node_node"), example => "emqx@127.0.0.1"})}] ++
         fields("metrics");
 fields("ctx_pub") ->
+    Event = 'message.publish',
     [
-        {"event_type", event_type_sc(message_publish)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"id", sc(binary(), #{desc => ?DESC("event_id")})}
         | msg_event_common_fields()
     ];
 fields("ctx_sub") ->
+    Event = 'session.subscribed',
     [
-        {"event_type", event_type_sc(session_subscribed)}
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)}
         | msg_event_common_fields()
     ];
 fields("ctx_unsub") ->
+    Event = 'session.unsubscribed',
     [
-        {"event_type", event_type_sc(session_unsubscribed)}
-        | proplists:delete("event_type", fields("ctx_sub"))
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)}
+        | without(["event_type", "event_topic", "event"], fields("ctx_sub"))
     ];
 fields("ctx_delivered") ->
+    Event = 'message.delivered',
     [
-        {"event_type", event_type_sc(message_delivered)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"id", sc(binary(), #{desc => ?DESC("event_id")})},
         {"from_clientid", sc(binary(), #{desc => ?DESC("event_from_clientid")})},
         {"from_username", sc(binary(), #{desc => ?DESC("event_from_username")})}
         | msg_event_common_fields()
     ];
 fields("ctx_acked") ->
+    Event = 'message.acked',
     [
-        {"event_type", event_type_sc(message_acked)}
-        | proplists:delete("event_type", fields("ctx_delivered"))
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)}
+        | without(["event_type", "event_topic", "event"], fields("ctx_delivered"))
     ];
 fields("ctx_dropped") ->
+    Event = 'message.dropped',
     [
-        {"event_type", event_type_sc(message_dropped)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"id", sc(binary(), #{desc => ?DESC("event_id")})},
         {"reason", sc(binary(), #{desc => ?DESC("event_ctx_dropped")})}
         | msg_event_common_fields()
     ];
 fields("ctx_connected") ->
+    Event = 'client.connected',
     [
-        {"event_type", event_type_sc(client_connected)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"clientid", sc(binary(), #{desc => ?DESC("event_clientid")})},
         {"username", sc(binary(), #{desc => ?DESC("event_username")})},
         {"mountpoint", sc(binary(), #{desc => ?DESC("event_mountpoint")})},
@@ -225,8 +244,10 @@ fields("ctx_connected") ->
             })}
     ];
 fields("ctx_disconnected") ->
+    Event = 'client.disconnected',
     [
-        {"event_type", event_type_sc(client_disconnected)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"clientid", sc(binary(), #{desc => ?DESC("event_clientid")})},
         {"username", sc(binary(), #{desc => ?DESC("event_username")})},
         {"reason", sc(binary(), #{desc => ?DESC("event_ctx_disconnected_reason")})},
@@ -238,8 +259,10 @@ fields("ctx_disconnected") ->
             })}
     ];
 fields("ctx_connack") ->
+    Event = 'client.connack',
     [
-        {"event_type", event_type_sc(client_connack)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"reason_code", sc(binary(), #{desc => ?DESC("event_ctx_connack_reason_code")})},
         {"clientid", sc(binary(), #{desc => ?DESC("event_clientid")})},
         {"clean_start", sc(boolean(), #{desc => ?DESC("event_clean_start"), default => true})},
@@ -256,8 +279,10 @@ fields("ctx_connack") ->
             })}
     ];
 fields("ctx_check_authz_complete") ->
+    Event = 'client.check_authz_complete',
     [
-        {"event_type", event_type_sc(client_check_authz_complete)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"clientid", sc(binary(), #{desc => ?DESC("event_clientid")})},
         {"username", sc(binary(), #{desc => ?DESC("event_username")})},
         {"peerhost", sc(binary(), #{desc => ?DESC("event_peerhost")})},
@@ -266,9 +291,24 @@ fields("ctx_check_authz_complete") ->
         {"authz_source", sc(binary(), #{desc => ?DESC("event_authz_source")})},
         {"result", sc(binary(), #{desc => ?DESC("event_result")})}
     ];
-fields("ctx_bridge_mqtt") ->
+fields("ctx_check_authn_complete") ->
+    Event = 'client.check_authn_complete',
     [
-        {"event_type", event_type_sc('$bridges/mqtt:*')},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
+        {"clientid", sc(binary(), #{desc => ?DESC("event_clientid")})},
+        {"username", sc(binary(), #{desc => ?DESC("event_username")})},
+        {"reason_code", sc(binary(), #{desc => ?DESC("event_ctx_authn_reason_code")})},
+        {"peername", sc(binary(), #{desc => ?DESC("event_peername")})},
+        {"is_anonymous", sc(boolean(), #{desc => ?DESC("event_is_anonymous"), required => false})},
+        {"is_superuser", sc(boolean(), #{desc => ?DESC("event_is_superuser"), required => false})}
+    ];
+fields("ctx_bridge_mqtt") ->
+    Event = '$bridges/mqtt:*',
+    EventBin = atom_to_binary(Event),
+    [
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(EventBin)},
         {"id", sc(binary(), #{desc => ?DESC("event_id")})},
         {"payload", sc(binary(), #{desc => ?DESC("event_payload")})},
         {"topic", sc(binary(), #{desc => ?DESC("event_topic")})},
@@ -279,14 +319,56 @@ fields("ctx_bridge_mqtt") ->
         qos()
     ];
 fields("ctx_delivery_dropped") ->
+    Event = 'delivery.dropped',
     [
-        {"event_type", event_type_sc(delivery_dropped)},
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"id", sc(binary(), #{desc => ?DESC("event_id")})},
         {"reason", sc(binary(), #{desc => ?DESC("event_ctx_dropped")})},
         {"from_clientid", sc(binary(), #{desc => ?DESC("event_from_clientid")})},
         {"from_username", sc(binary(), #{desc => ?DESC("event_from_username")})}
         | msg_event_common_fields()
+    ];
+fields("ctx_schema_validation_failed") ->
+    Event = 'schema.validation_failed',
+    [
+        {"event_type", event_type_sc(Event)},
+        {"validation", sc(binary(), #{desc => ?DESC("event_validation")})}
+        | msg_event_common_fields()
+    ];
+fields("ctx_message_transformation_failed") ->
+    Event = 'message.transformation_failed',
+    [
+        {"event_type", event_type_sc(Event)},
+        {"transformation", sc(binary(), #{desc => ?DESC("event_transformation")})}
+        | msg_event_common_fields()
     ].
+
+rule_input_message_context() ->
+    {"context",
+        sc(
+            hoconsc:union([
+                ref("ctx_pub"),
+                ref("ctx_sub"),
+                ref("ctx_unsub"),
+                ref("ctx_delivered"),
+                ref("ctx_acked"),
+                ref("ctx_dropped"),
+                ref("ctx_connected"),
+                ref("ctx_disconnected"),
+                ref("ctx_connack"),
+                ref("ctx_check_authz_complete"),
+                ref("ctx_check_authn_complete"),
+                ref("ctx_bridge_mqtt"),
+                ref("ctx_delivery_dropped"),
+                ref("ctx_schema_validation_failed"),
+                ref("ctx_message_transformation_failed")
+            ]),
+            #{
+                desc => ?DESC("test_context"),
+                default => #{}
+            }
+        )}.
 
 qos() ->
     {"qos", sc(emqx_schema:qos(), #{desc => ?DESC("event_qos")})}.
@@ -307,7 +389,21 @@ sc(Type, Meta) -> hoconsc:mk(Type, Meta).
 ref(Field) -> hoconsc:ref(?MODULE, Field).
 
 event_type_sc(Event) ->
-    sc(Event, #{desc => ?DESC("event_event_type"), required => true}).
+    EventType = event_to_event_type(Event),
+    sc(EventType, #{desc => ?DESC("event_event_type"), required => true}).
+
+-spec event_to_event_type(atom()) -> atom().
+event_to_event_type(Event) ->
+    binary_to_atom(binary:replace(atom_to_binary(Event), <<".">>, <<"_">>)).
+
+event_sc(Event) when is_binary(Event) ->
+    %% only exception is `$bridges/...'.
+    sc(binary(), #{default => Event, importance => ?IMPORTANCE_HIDDEN});
+event_sc(Event) ->
+    sc(Event, #{default => Event, importance => ?IMPORTANCE_HIDDEN}).
+
+without(FieldNames, Fields) ->
+    lists:foldl(fun proplists:delete/2, Fields, FieldNames).
 
 publish_received_at_sc() ->
     sc(integer(), #{desc => ?DESC("event_publish_received_at")}).

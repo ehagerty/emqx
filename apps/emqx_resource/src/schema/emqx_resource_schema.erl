@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 
 -export([namespace/0, roots/0, fields/1, desc/1]).
 
--export([create_opts/1]).
+-export([create_opts/1, resource_opts_meta/0, override/2]).
 
 %% range interval in ms
 -define(HEALTH_CHECK_INTERVAL_RANGE_MIN, 1).
@@ -47,6 +47,8 @@ fields("resource_opts") ->
 fields("creation_opts") ->
     create_opts([]).
 
+-spec create_opts([{atom(), hocon_schema:field_schema()}]) ->
+    [{atom(), hocon_schema:field_schema()}].
 create_opts(Overrides) ->
     override(
         [

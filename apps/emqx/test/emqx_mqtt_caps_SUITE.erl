@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,12 +26,11 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([]),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]),
-    ok.
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
 
 t_check_pub(_) ->
     OldConf = emqx:get_config([zones], #{}),
@@ -76,6 +75,8 @@ t_check_sub(_) ->
     ),
     ?assertEqual(
         {error, ?RC_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED},
-        emqx_mqtt_caps:check_sub(ClientInfo, <<"topic">>, SubOpts#{share => true})
+        emqx_mqtt_caps:check_sub(
+            ClientInfo, #share{group = <<"group">>, topic = <<"topic">>}, SubOpts
+        )
     ),
     emqx_config:put([zones], OldConf).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -45,17 +45,23 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Conf) ->
-    application:load(emqx),
-    emqx_gateway_test_utils:load_all_gateway_apps(),
-    emqx_config:delete_override_conf_files(),
-    emqx_config:erase(gateway),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_authn, emqx_gateway]),
-    Conf.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth,
+            emqx_auth_mnesia,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
+            {emqx_gateway, ?CONF_DEFAULT}
+            | emqx_gateway_test_utils:all_gateway_apps()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Conf)}
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps} | Conf].
 
 end_per_suite(Conf) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_authn, emqx_conf]),
-    Conf.
+    ok = emqx_cth_suite:stop(proplists:get_value(suite_apps, Conf)).
 
 init_per_testcase(t_gateway_fail, Config) ->
     meck:expect(
@@ -96,10 +102,8 @@ t_gateways(_) ->
     ok.
 
 t_gateway(_) ->
-    {404, GwNotFoundReq1} = request(get, "/gateways/not_a_known_atom"),
-    assert_not_found(GwNotFoundReq1),
-    {404, GwNotFoundReq2} = request(get, "/gateways/undefined"),
-    assert_not_found(GwNotFoundReq2),
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(get, "/gateways/not_a_known_atom")),
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(get, "/gateways/undefined")),
     {204, _} = request(put, "/gateways/stomp", #{}),
     {200, StompGw} = request(get, "/gateways/stomp"),
     assert_fields_exist(
@@ -110,7 +114,7 @@ t_gateway(_) ->
     {200, #{enable := true}} = request(get, "/gateways/stomp"),
     {204, _} = request(put, "/gateways/stomp", #{enable => false}),
     {200, #{enable := false}} = request(get, "/gateways/stomp"),
-    {404, _} = request(put, "/gateways/undefined", #{}),
+    ?assertMatch({400, #{code := <<"BAD_REQUEST">>}}, request(put, "/gateways/undefined", #{})),
     {400, _} = request(put, "/gateways/stomp", #{bad_key => "foo"}),
     ok.
 
@@ -129,8 +133,14 @@ t_gateway_enable(_) ->
     {200, #{enable := NotEnable}} = request(get, "/gateways/stomp"),
     {204, _} = request(put, "/gateways/stomp/enable/" ++ atom_to_list(Enable), undefined),
     {200, #{enable := Enable}} = request(get, "/gateways/stomp"),
-    {404, _} = request(put, "/gateways/undefined/enable/true", undefined),
-    {404, _} = request(put, "/gateways/not_a_known_atom/enable/true", undefined),
+    ?assertMatch(
+        {400, #{code := <<"BAD_REQUEST">>}},
+        request(put, "/gateways/undefined/enable/true", undefined)
+    ),
+    ?assertMatch(
+        {400, #{code := <<"BAD_REQUEST">>}},
+        request(put, "/gateways/not_a_known_atom/enable/true", undefined)
+    ),
     {404, _} = request(put, "/gateways/coap/enable/true", undefined),
     ok.
 
@@ -366,18 +376,30 @@ t_authn_data_mgmt(_) ->
         ["gateways", "stomp", "authentication", "import_users"]
     ),
 
-    Dir = code:lib_dir(emqx_authn, test),
-    JSONFileName = filename:join([Dir, <<"data/user-credentials.json">>]),
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
     {ok, JSONData} = file:read_file(JSONFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.json", JSONData}
-    ]),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults, [return_maps])
+    ),
 
-    CSVFileName = filename:join([Dir, <<"data/user-credentials.csv">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
     {ok, CSVData} = file:read_file(CSVFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.csv", CSVData}
-    ]),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2, [return_maps])
+    ),
 
     {204, _} = request(delete, "/gateways/stomp/authentication"),
     {204, _} = request(get, "/gateways/stomp/authentication"),
@@ -385,7 +407,7 @@ t_authn_data_mgmt(_) ->
 
 t_listeners_tcp(_) ->
     {204, _} = request(put, "/gateways/stomp", #{}),
-    {404, _} = request(get, "/gateways/stomp/listeners"),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
     LisConf = #{
         name => <<"def">>,
         type => <<"tcp">>,
@@ -414,7 +436,7 @@ t_listeners_tcp(_) ->
 
 t_listeners_max_conns(_) ->
     {204, _} = request(put, "/gateways/stomp", #{}),
-    {404, _} = request(get, "/gateways/stomp/listeners"),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
     LisConf = #{
         name => <<"def">>,
         type => <<"tcp">>,
@@ -571,18 +593,30 @@ t_listeners_authn_data_mgmt(_) ->
         ["gateways", "stomp", "listeners", "stomp:tcp:def", "authentication", "import_users"]
     ),
 
-    Dir = code:lib_dir(emqx_authn, test),
-    JSONFileName = filename:join([Dir, <<"data/user-credentials.json">>]),
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
     {ok, JSONData} = file:read_file(JSONFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.json", JSONData}
-    ]),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults, [return_maps])
+    ),
 
-    CSVFileName = filename:join([Dir, <<"data/user-credentials.csv">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
     {ok, CSVData} = file:read_file(CSVFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.csv", CSVData}
-    ]),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2, [return_maps])
+    ),
 
     ok.
 
@@ -669,6 +703,15 @@ t_authn_fuzzy_search(_) ->
 
     {204, _} = request(delete, "/gateways/stomp/authentication"),
     {204, _} = request(get, "/gateways/stomp/authentication"),
+    ok.
+
+t_cluster_status_if_gateway_sup_is_not_running(_) ->
+    application:stop(emqx_gateway),
+    ?assertEqual(
+        [#{node => node(), status => unloaded}],
+        emqx_gateway_http:cluster_gateway_status(<<"stomp">>)
+    ),
+    application:start(emqx_gateway),
     ok.
 
 %%--------------------------------------------------------------------

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,9 +31,13 @@
 
 -export([
     common_bridge_fields/0,
+    metrics_fields/0,
     status_fields/0,
-    metrics_fields/0
+    type_and_name_fields/1
 ]).
+
+%% for testing only
+-export([enterprise_api_schemas/1, enterprise_fields_bridges/0]).
 
 %%======================================================================================
 %% Hocon Schema Definitions
@@ -57,7 +61,7 @@ api_schema(Method) ->
             {<<"mqtt">>, emqx_bridge_mqtt_schema}
         ]
     ],
-    EE = enterprise_api_schemas(Method),
+    EE = ?MODULE:enterprise_api_schemas(Method),
     hoconsc:union(bridge_api_union(Broker ++ EE)).
 
 bridge_api_union(Refs) ->
@@ -89,7 +93,7 @@ bridge_api_union(Refs) ->
 enterprise_api_schemas(Method) ->
     %% We *must* do this to ensure the module is really loaded, especially when we use
     %% `call_hocon' from `nodetool' to generate initial configurations.
-    _ = emqx_bridge_enterprise:module_info(),
+    ok = emqx_utils:interactive_load(emqx_bridge_enterprise),
     case erlang:function_exported(emqx_bridge_enterprise, api_schemas, 1) of
         true -> emqx_bridge_enterprise:api_schemas(Method);
         false -> []
@@ -98,7 +102,7 @@ enterprise_api_schemas(Method) ->
 enterprise_fields_bridges() ->
     %% We *must* do this to ensure the module is really loaded, especially when we use
     %% `call_hocon' from `nodetool' to generate initial configurations.
-    _ = emqx_bridge_enterprise:module_info(),
+    ok = emqx_utils:interactive_load(emqx_bridge_enterprise),
     case erlang:function_exported(emqx_bridge_enterprise, fields, 1) of
         true -> emqx_bridge_enterprise:fields(bridges);
         false -> []
@@ -119,9 +123,14 @@ common_bridge_fields() ->
                 boolean(),
                 #{
                     desc => ?DESC("desc_enable"),
+                    importance => ?IMPORTANCE_NO_DOC,
                     default => true
                 }
-            )}
+            )},
+        {tags, emqx_schema:tags_schema()},
+        %% Create v2 connector then usr v1 /bridges_probe api to test connector
+        %% /bridges_probe should pass through v2 connector's description.
+        {description, emqx_schema:description_schema()}
     ].
 
 status_fields() ->
@@ -150,6 +159,12 @@ metrics_fields() ->
             )}
     ].
 
+type_and_name_fields(ConnectorType) ->
+    [
+        {type, mk(ConnectorType, #{required => true, desc => ?DESC("desc_type")})},
+        {name, mk(binary(), #{required => true, desc => ?DESC("desc_name")})}
+    ].
+
 %%======================================================================================
 %% For config files
 
@@ -158,7 +173,7 @@ namespace() -> "bridge".
 tags() ->
     [<<"Bridge">>].
 
-roots() -> [{bridges, ?HOCON(?R_REF(bridges), #{importance => ?IMPORTANCE_LOW})}].
+roots() -> [{bridges, ?HOCON(?R_REF(bridges), #{importance => ?IMPORTANCE_HIDDEN})}].
 
 fields(bridges) ->
     [
@@ -168,7 +183,7 @@ fields(bridges) ->
                 #{
                     desc => ?DESC("bridges_webhook"),
                     required => false,
-                    converter => fun webhook_bridge_converter/2
+                    converter => fun http_bridge_converter/2
                 }
             )},
         {mqtt,
@@ -184,7 +199,7 @@ fields(bridges) ->
                     end
                 }
             )}
-    ] ++ enterprise_fields_bridges();
+    ] ++ ?MODULE:enterprise_fields_bridges();
 fields("metrics") ->
     [
         {"dropped", mk(integer(), #{desc => ?DESC("metric_dropped")})},
@@ -243,7 +258,7 @@ status() ->
 node_name() ->
     {"node", mk(binary(), #{desc => ?DESC("desc_node_name"), example => "emqx@127.0.0.1"})}.
 
-webhook_bridge_converter(Conf0, _HoconOpts) ->
+http_bridge_converter(Conf0, _HoconOpts) ->
     emqx_bridge_compatible_config:upgrade_pre_ee(
-        Conf0, fun emqx_bridge_compatible_config:webhook_maybe_upgrade/1
+        Conf0, fun emqx_bridge_compatible_config:http_maybe_upgrade/1
     ).

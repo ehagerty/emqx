@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 -export([sorted_reboot_apps/0]).
 -export([start_autocluster/0]).
 -export([stop_port_apps/0]).
+-export([read_apps/0]).
 
 -dialyzer({no_match, [basic_reboot_apps/0]}).
 
@@ -30,11 +31,15 @@
 -export([sorted_reboot_apps/1, reboot_apps/0]).
 -endif.
 
-%% these apps are always (re)started by emqx_machine
--define(BASIC_REBOOT_APPS, [gproc, esockd, ranch, cowboy, emqx]).
+%% These apps are always (re)started by emqx_machine:
+-define(BASIC_REBOOT_APPS, [gproc, esockd, ranch, cowboy, emqx_durable_storage, emqx]).
 
-%% If any of these applications crash, the entire EMQX node shuts down
+%% If any of these applications crash, the entire EMQX node shuts down:
 -define(BASIC_PERMANENT_APPS, [mria, ekka, esockd, emqx]).
+
+%% These apps are optional, they may or may not be present in the
+%% release, depending on the build flags:
+-define(OPTIONAL_APPS, [bcrypt, observer]).
 
 post_boot() ->
     ok = ensure_apps_started(),
@@ -62,6 +67,7 @@ stop_apps() ->
     ?SLOG(notice, #{msg => "stopping_emqx_apps"}),
     _ = emqx_alarm_handler:unload(),
     ok = emqx_conf_app:unset_config_loaded(),
+    ok = emqx_plugins:ensure_stopped(),
     lists:foreach(fun stop_one_app/1, lists:reverse(sorted_reboot_apps())).
 
 %% Those port apps are terminated after the main apps
@@ -129,15 +135,11 @@ reboot_apps() ->
     BaseRebootApps ++ ConfigApps.
 
 basic_reboot_apps() ->
-    PrivDir = code:priv_dir(emqx_machine),
-    RebootListPath = filename:join([PrivDir, "reboot_lists.eterm"]),
-    {ok, [
-        #{
-            common_business_apps := CommonBusinessApps,
-            ee_business_apps := EEBusinessApps,
-            ce_business_apps := CEBusinessApps
-        }
-    ]} = file:consult(RebootListPath),
+    #{
+        common_business_apps := CommonBusinessApps,
+        ee_business_apps := EEBusinessApps,
+        ce_business_apps := CEBusinessApps
+    } = read_apps(),
     EditionSpecificApps =
         case emqx_release:edition() of
             ee -> EEBusinessApps;
@@ -147,10 +149,17 @@ basic_reboot_apps() ->
     BusinessApps = CommonBusinessApps ++ EditionSpecificApps,
     ?BASIC_REBOOT_APPS ++ (BusinessApps -- excluded_apps()).
 
+%% @doc Read business apps belonging to the current profile/edition.
+read_apps() ->
+    PrivDir = code:priv_dir(emqx_machine),
+    RebootListPath = filename:join([PrivDir, "reboot_lists.eterm"]),
+    {ok, [Apps]} = file:consult(RebootListPath),
+    Apps.
+
 excluded_apps() ->
-    OptionalApps = [bcrypt, jq, observer],
-    [system_monitor, observer_cli] ++
-        [App || App <- OptionalApps, not is_app(App)].
+    %% Optional apps _should_ be (re)started automatically, but only
+    %% when they are found in the release:
+    [App || App <- ?OPTIONAL_APPS, not is_app(App)].
 
 is_app(Name) ->
     case application:load(Name) of
@@ -160,34 +169,36 @@ is_app(Name) ->
     end.
 
 sorted_reboot_apps() ->
-    Apps0 = [{App, app_deps(App)} || App <- reboot_apps()],
-    Apps = inject_bridge_deps(Apps0),
+    RebootApps = reboot_apps(),
+    Apps0 = [{App, app_deps(App, RebootApps)} || App <- RebootApps],
+    Apps = emqx_machine_boot_runtime_deps:inject(Apps0, runtime_deps()),
     sorted_reboot_apps(Apps).
 
-app_deps(App) ->
+app_deps(App, RebootApps) ->
     case application:get_key(App, applications) of
         undefined -> undefined;
-        {ok, List} -> lists:filter(fun(A) -> lists:member(A, reboot_apps()) end, List)
+        {ok, List} -> lists:filter(fun(A) -> lists:member(A, RebootApps) end, List)
     end.
 
-%% `emqx_bridge' is special in that it needs all the bridges apps to
-%% be started before it, so that, when it loads the bridges from
-%% configuration, the bridge app and its dependencies need to be up.
-inject_bridge_deps(RebootAppDeps) ->
-    BridgeApps = [
-        App
-     || {App, _Deps} <- RebootAppDeps,
-        lists:prefix("emqx_bridge_", atom_to_list(App))
-    ],
-    lists:map(
-        fun
-            ({emqx_bridge, Deps0}) when is_list(Deps0) ->
-                {emqx_bridge, Deps0 ++ BridgeApps};
-            (App) ->
-                App
-        end,
-        RebootAppDeps
-    ).
+runtime_deps() ->
+    [
+        %% `emqx_bridge' is special in that it needs all the bridges apps to
+        %% be started before it, so that, when it loads the bridges from
+        %% configuration, the bridge app and its dependencies need to be up.
+        {emqx_bridge, fun(App) -> lists:prefix("emqx_bridge_", atom_to_list(App)) end},
+        %% `emqx_connector' also needs to start all connector dependencies for the same reason.
+        %% Since standalone apps like `emqx_mongodb' are already dependencies of `emqx_bridge_*'
+        %% apps, we may apply the same tactic for `emqx_connector' and inject individual bridges
+        %% as its dependencies.
+        {emqx_connector, fun(App) -> lists:prefix("emqx_bridge_", atom_to_list(App)) end},
+        %% emqx_fdb_ds is an EE app
+        {emqx_durable_storage, emqx_fdb_ds},
+        %% emqx_ds_builtin is an EE app
+        {emqx_ds_backends, emqx_ds_builtin_raft},
+        %% emqx_ds_fdb_backend is an EE app
+        {emqx_ds_backends, emqx_ds_fdb_backend},
+        {emqx_dashboard, emqx_license}
+    ].
 
 sorted_reboot_apps(Apps) ->
     G = digraph:new(),
@@ -196,7 +207,8 @@ sorted_reboot_apps(Apps) ->
         case digraph_utils:topsort(G) of
             Sorted when is_list(Sorted) ->
                 %% ensure emqx_conf boot up first
-                [emqx_conf | Sorted ++ (NoDepApps -- Sorted)];
+                AllApps = Sorted ++ (NoDepApps -- Sorted),
+                [emqx_conf | lists:delete(emqx_conf, AllApps)];
             false ->
                 Loops = find_loops(G),
                 error({circular_application_dependency, Loops})

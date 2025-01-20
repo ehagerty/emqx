@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@
 -define(LWM2M_OBJECT_DEF_TAB, lwm2m_object_def_tab).
 -define(LWM2M_OBJECT_NAME_TO_ID_TAB, lwm2m_object_name_to_id_tab).
 
+-type xmlElement() :: tuple().
+
 -record(state, {}).
 
 -elvis([{elvis_style, atom_naming_convention, disable}]).
@@ -59,7 +61,7 @@
 start_link(XmlDir) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [XmlDir], []).
 
--spec find_objectid(integer()) -> {error, no_xml_definition} | xmerl:xmlElement().
+-spec find_objectid(integer()) -> {error, no_xml_definition} | xmlElement().
 find_objectid(ObjectId) ->
     ObjectIdInt =
         case is_list(ObjectId) of
@@ -71,7 +73,7 @@ find_objectid(ObjectId) ->
         [{_ObjectId, Xml}] -> Xml
     end.
 
--spec find_name(string()) -> {error, no_xml_definition} | xmerl:xmlElement().
+-spec find_name(string()) -> {error, no_xml_definition} | xmlElement().
 find_name(Name) ->
     NameBinary =
         case is_list(Name) of

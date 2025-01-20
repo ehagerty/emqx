@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,9 +16,14 @@
 
 -module(emqx_config_backup).
 
+-type ok_result() :: #{
+    root_key => emqx_utils_maps:config_key(),
+    changed => [emqx_utils_maps:config_key_path()]
+}.
+
+-type error_result() :: #{root_key => emqx_utils_maps:config_key(), reason => term()}.
+
 -callback import_config(RawConf :: map()) ->
-    {ok, #{
-        root_key => emqx_utils_maps:config_key(),
-        changed => [emqx_utils_maps:config_path()]
-    }}
-    | {error, #{root_key => emqx_utils_maps:config_key(), reason => term()}}.
+    {ok, ok_result()}
+    | {error, error_result()}
+    | {results, {[ok_result()], [error_result()]}}.

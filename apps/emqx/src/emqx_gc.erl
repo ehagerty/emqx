@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@
 
 -export([
     init/1,
-    run/2,
     run/3,
     info/1,
     reset/1
@@ -62,12 +61,7 @@ init(#{count := Count, bytes := Bytes}) ->
     Oct = [{oct, {Bytes, Bytes}} || ?ENABLED(Bytes)],
     ?GCS(maps:from_list(Cnt ++ Oct)).
 
-%% @doc Try to run GC based on reduntions of count or bytes.
--spec run(#{cnt := pos_integer(), oct := pos_integer()}, gc_state()) ->
-    {boolean(), gc_state()}.
-run(#{cnt := Cnt, oct := Oct}, GcSt) ->
-    run(Cnt, Oct, GcSt).
-
+%% @doc Try to run GC based on reductions of count or bytes.
 -spec run(pos_integer(), pos_integer(), gc_state()) ->
     {boolean(), gc_state()}.
 run(Cnt, Oct, ?GCS(St)) ->
@@ -86,11 +80,11 @@ do_run([{K, N} | T], St) ->
     end.
 
 %% @doc Info of GC state.
--spec info(maybe(gc_state())) -> maybe(map()).
+-spec info(option(gc_state())) -> option(map()).
 info(?GCS(St)) -> St.
 
 %% @doc Reset counters to zero.
--spec reset(maybe(gc_state())) -> gc_state().
+-spec reset(option(gc_state())) -> gc_state().
 reset(?GCS(St)) ->
     ?GCS(do_reset(St)).
 

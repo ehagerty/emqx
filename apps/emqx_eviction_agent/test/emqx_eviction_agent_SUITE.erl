@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_SUITE).
@@ -15,7 +15,11 @@
 
 -import(
     emqx_eviction_agent_test_helpers,
-    [emqtt_connect/0, emqtt_connect/1, emqtt_connect/2]
+    [
+        emqtt_connect/0, emqtt_connect/1, emqtt_connect/2,
+        emqtt_connect_for_publish/1,
+        case_specific_node_name/1
+    ]
 ).
 
 -define(assertPrinted(Printed, Code),
@@ -29,37 +33,51 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([emqx_eviction_agent]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_eviction_agent
+        ],
+        #{
+            work_dir => emqx_cth_suite:work_dir(Config)
+        }
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_eviction_agent]).
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(Case, Config) ->
     _ = emqx_eviction_agent:disable(test_eviction),
     ok = snabbkaffe:start_trace(),
-    start_slave(Case, Config).
+    start_peer(Case, Config).
 
-start_slave(t_explicit_session_takeover, Config) ->
+start_peer(t_explicit_session_takeover, Config) ->
+    NodeNames =
+        [
+            t_explicit_session_takeover_donor,
+            t_explicit_session_takeover_recipient
+        ],
     ClusterNodes = emqx_eviction_agent_test_helpers:start_cluster(
-        [{evacuate_test1, 2883}, {evacuate_test2, 3883}],
-        [emqx_eviction_agent]
+        Config,
+        NodeNames,
+        [emqx_conf, emqx, emqx_eviction_agent]
     ),
+    ok = snabbkaffe:start_trace(),
     [{evacuate_nodes, ClusterNodes} | Config];
-start_slave(_Case, Config) ->
+start_peer(_Case, Config) ->
     Config.
 
 end_per_testcase(TestCase, Config) ->
     emqx_eviction_agent:disable(test_eviction),
     ok = snabbkaffe:stop(),
-    stop_slave(TestCase, Config).
+    stop_peer(TestCase, Config).
 
-stop_slave(t_explicit_session_takeover, Config) ->
+stop_peer(t_explicit_session_takeover, Config) ->
     emqx_eviction_agent_test_helpers:stop_cluster(
-        ?config(evacuate_nodes, Config),
-        [emqx_eviction_agent]
+        ?config(evacuate_nodes, Config)
     );
-stop_slave(_Case, _Config) ->
+stop_peer(_Case, _Config) ->
     ok.
 
 %%--------------------------------------------------------------------
@@ -77,13 +95,16 @@ t_enable_disable(_Config) ->
     {ok, C0} = emqtt_connect(),
     ok = emqtt:disconnect(C0),
 
+    %% Enable
     ok = emqx_eviction_agent:enable(test_eviction, undefined),
 
+    %% Can't enable with different kind
     ?assertMatch(
         {error, eviction_agent_busy},
         emqx_eviction_agent:enable(bar, undefined)
     ),
 
+    %% Enable with the same kind but different server ref
     ?assertMatch(
         ok,
         emqx_eviction_agent:enable(test_eviction, <<"srv">>)
@@ -99,6 +120,39 @@ t_enable_disable(_Config) ->
         emqtt_connect()
     ),
 
+    %% Enable with the same kind and server ref and explicit options
+    ?assertMatch(
+        ok,
+        emqx_eviction_agent:enable(test_eviction, <<"srv">>, #{allow_connections => false})
+    ),
+
+    ?assertMatch(
+        {enabled, #{}},
+        emqx_eviction_agent:status()
+    ),
+
+    ?assertMatch(
+        {error, {use_another_server, #{}}},
+        emqtt_connect()
+    ),
+
+    %% Enable with the same kind and server ref and permissive options
+    ?assertMatch(
+        ok,
+        emqx_eviction_agent:enable(test_eviction, <<"srv">>, #{allow_connections => true})
+    ),
+
+    ?assertMatch(
+        {enabled, #{}},
+        emqx_eviction_agent:status()
+    ),
+
+    ?assertMatch(
+        {ok, _},
+        emqtt_connect()
+    ),
+
+    %% Can't enable using different kind
     ?assertMatch(
         {error, eviction_agent_busy},
         emqx_eviction_agent:disable(bar)
@@ -173,7 +227,7 @@ t_explicit_session_takeover(Config) ->
         begin
             ok = rpc:call(Node1, emqx_eviction_agent, evict_connections, [1]),
             receive
-                {'EXIT', C0, {disconnected, ?RC_USE_ANOTHER_SERVER, _}} -> ok
+                {'EXIT', C0, {shutdown, {disconnected, ?RC_USE_ANOTHER_SERVER, _}}} -> ok
             after 1000 ->
                 ?assert(false, "Connection not evicted")
             end
@@ -202,7 +256,7 @@ t_explicit_session_takeover(Config) ->
 
     ok = rpc:call(Node1, emqx_eviction_agent, disable, [test_eviction]),
 
-    {ok, C1} = emqtt_connect([{port, Port1}]),
+    {ok, C1} = emqtt_connect_for_publish(Port1),
     emqtt:publish(C1, <<"t1">>, <<"MessageToEvictedSession1">>),
     ok = emqtt:disconnect(C1),
 
@@ -229,7 +283,7 @@ t_explicit_session_takeover(Config) ->
     ok = rpc:call(Node1, emqx_eviction_agent, disable, [test_eviction]),
 
     %% Session is on Node2, but we connect to Node1
-    {ok, C2} = emqtt_connect([{port, Port1}]),
+    {ok, C2} = emqtt_connect_for_publish(Port1),
     emqtt:publish(C2, <<"t1">>, <<"MessageToEvictedSession2">>),
     ok = emqtt:disconnect(C2),
 
@@ -251,6 +305,28 @@ t_explicit_session_takeover(Config) ->
         ]
     ),
     ok = emqtt:disconnect(C3).
+
+t_evict_lost_session(_Config) ->
+    _ = erlang:process_flag(trap_exit, true),
+    ok = restart_emqx(),
+
+    %% Make a session
+    {ok, C0} = emqtt_connect([
+        {clientid, <<"client_with_session">>},
+        {clean_start, false}
+    ]),
+    {ok, _, _} = emqtt:subscribe(C0, <<"t1">>),
+    ok = emqtt:disconnect(C0),
+    ok = emqx_eviction_agent:enable(test_eviction, undefined),
+    ?assertEqual(1, emqx_eviction_agent:session_count()),
+
+    %% Emulate lost session
+    [ChanPid] = emqx_cm:lookup_channels(<<"client_with_session">>),
+    emqx_cm_registry:unregister_channel({<<"client_with_session">>, ChanPid}),
+    %% unregister is async, wait for it
+    ct:sleep(100),
+    ok = emqx_eviction_agent:evict_sessions(1, node()),
+    ?retry(_Sleep = 10, _Retries = 20, ?assertEqual(0, emqx_eviction_agent:session_count())).
 
 t_disable_on_restart(_Config) ->
     ok = emqx_eviction_agent:enable(test_eviction, undefined),
@@ -278,19 +354,24 @@ t_session_serialization(_Config) ->
         emqx_eviction_agent:session_count()
     ),
 
+    [ChanPid0] = emqx_cm:lookup_channels(<<"client_with_session">>),
+    MRef0 = erlang:monitor(process, ChanPid0),
+
     %% Evacuate to the same node
 
-    ?assertWaitEvent(
-        emqx_eviction_agent:evict_sessions(1, node()),
-        #{?snk_kind := emqx_channel_takeover_end, clientid := <<"client_with_session">>},
-        1000
-    ),
+    _ = emqx_eviction_agent:evict_sessions(1, node()),
+
+    ?assertReceive({'DOWN', MRef0, process, ChanPid0, _}),
 
     ok = emqx_eviction_agent:disable(test_eviction),
 
-    ?assertEqual(
-        1,
-        emqx_eviction_agent:session_count()
+    ?retry(
+        200,
+        10,
+        ?assertEqual(
+            1,
+            emqx_eviction_agent:session_count()
+        )
     ),
 
     ?assertMatch(

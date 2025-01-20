@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ stop_bridge_to_node(Node, BridgeType, BridgeName) ->
     ).
 
 -spec restart_bridges_to_all_nodes([node()], key(), key()) ->
-    emqx_rpc:erpc_multicall().
+    emqx_rpc:erpc_multicall(ok).
 restart_bridges_to_all_nodes(Nodes, BridgeType, BridgeName) ->
     erpc:multicall(
         Nodes,
@@ -80,7 +80,7 @@ restart_bridges_to_all_nodes(Nodes, BridgeType, BridgeName) ->
     ).
 
 -spec stop_bridges_to_all_nodes([node()], key(), key()) ->
-    emqx_rpc:erpc_multicall().
+    emqx_rpc:erpc_multicall(ok).
 stop_bridges_to_all_nodes(Nodes, BridgeType, BridgeName) ->
     erpc:multicall(
         Nodes,
@@ -91,7 +91,7 @@ stop_bridges_to_all_nodes(Nodes, BridgeType, BridgeName) ->
     ).
 
 -spec lookup_from_all_nodes([node()], key(), key()) ->
-    emqx_rpc:erpc_multicall().
+    emqx_rpc:erpc_multicall(term()).
 lookup_from_all_nodes(Nodes, BridgeType, BridgeName) ->
     erpc:multicall(
         Nodes,

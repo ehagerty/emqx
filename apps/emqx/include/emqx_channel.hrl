@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,5 +40,10 @@
     session,
     will_msg
 ]).
+
+-define(REPLY_OUTGOING(Packets), {outgoing, Packets}).
+-define(REPLY_CONNACK(Packet), {connack, Packet}).
+-define(REPLY_EVENT(StateOrEvent), {event, StateOrEvent}).
+-define(REPLY_CLOSE(Reason), {close, Reason}).
 
 -define(EXPIRE_INTERVAL_INFINITE, 4294967295000).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,18 +20,33 @@
 
 -record(?TRACE, {
     name :: binary() | undefined | '_',
-    type :: clientid | topic | ip_address | undefined | '_',
+    type :: clientid | topic | ip_address | ruleid | undefined | '_',
     filter ::
-        emqx_types:topic() | emqx_types:clientid() | emqx_trace:ip_address() | undefined | '_',
+        emqx_types:topic()
+        | emqx_types:clientid()
+        | emqx_trace:ip_address()
+        | emqx_trace:ruleid()
+        | undefined
+        | '_',
     enable = true :: boolean() | '_',
     payload_encode = text :: hex | text | hidden | '_',
-    extra = #{} :: map() | '_',
+    extra = #{formatter => text} :: #{formatter => text | json} | '_',
     start_at :: integer() | undefined | '_',
     end_at :: integer() | undefined | '_'
 }).
 
+-record(emqx_trace_format_func_data, {
+    function :: fun((any()) -> any()),
+    data :: any()
+}).
+
 -define(SHARD, ?COMMON_SHARD).
 -define(MAX_SIZE, 30).
--define(OWN_KEYS, [level, filters, filter_default, handlers]).
+
+-define(EMQX_TRACE_STOP_ACTION(REASON),
+    {unrecoverable_error, {action_stopped_after_template_rendering, REASON}}
+).
+
+-define(EMQX_TRACE_STOP_ACTION_MATCH, ?EMQX_TRACE_STOP_ACTION(_)).
 
 -endif.

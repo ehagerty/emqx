@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 -define(MYSQL_DEFAULT_PORT, 3306).
 -define(MONGO_DEFAULT_PORT, 27017).
 -define(REDIS_DEFAULT_PORT, 6379).
--define(PGSQL_DEFAULT_PORT, 5432).
 -define(CLICKHOUSE_DEFAULT_PORT, 8123).
 
 -define(AUTO_RECONNECT_INTERVAL, 2).
@@ -38,4 +37,4 @@
     "The " ++ TYPE ++ " default port " ++ DEFAULT_PORT ++ " is used if `[:Port]` is not specified."
 ).
 
--define(CONNECTOR_RESOURCE_GROUP, <<"emqx_connector">>).
+-define(CONNECTOR_RESOURCE_GROUP, <<"connector">>).

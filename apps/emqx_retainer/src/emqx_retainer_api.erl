@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 -export([api_spec/0, paths/0, schema/1, namespace/0, fields/1]).
 
 -export([
-    lookup_retained_warp/2,
+    '/messages'/2,
     with_topic_warp/2,
     config/2
 ]).
@@ -44,7 +44,11 @@ api_spec() ->
     emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
 
 paths() ->
-    [?PREFIX, ?PREFIX ++ "/messages", ?PREFIX ++ "/message/:topic"].
+    [
+        ?PREFIX,
+        ?PREFIX ++ "/messages",
+        ?PREFIX ++ "/message/:topic"
+    ].
 
 schema(?PREFIX) ->
     #{
@@ -69,17 +73,24 @@ schema(?PREFIX) ->
     };
 schema(?PREFIX ++ "/messages") ->
     #{
-        'operationId' => lookup_retained_warp,
+        'operationId' => '/messages',
         get => #{
             tags => ?TAGS,
             description => ?DESC(list_retained_api),
-            parameters => page_params(),
+            parameters => parameters(query, false, query_match_topic) ++ page_params(),
             responses => #{
                 200 => [
                     {data, mk(array(ref(message_summary)), #{desc => ?DESC(retained_list)})},
                     {meta, mk(hoconsc:ref(emqx_dashboard_swagger, meta))}
                 ],
                 400 => error_codes(['BAD_REQUEST'], ?DESC(unsupported_backend))
+            }
+        },
+        delete => #{
+            tags => ?TAGS,
+            description => ?DESC(delete_messages),
+            responses => #{
+                204 => <<>>
             }
         }
     };
@@ -118,12 +129,15 @@ conf_schema() ->
     ref(emqx_retainer_schema, "retainer").
 
 parameters() ->
+    parameters(path, true, topic).
+
+parameters(In, Required, Desc) ->
     [
         {topic,
             mk(binary(), #{
-                in => path,
-                required => true,
-                desc => ?DESC(topic)
+                in => In,
+                required => Required,
+                desc => ?DESC(Desc)
             })}
     ].
 
@@ -142,8 +156,10 @@ fields(message) ->
         | fields(message_summary)
     ].
 
-lookup_retained_warp(Type, Params) ->
-    check_backend(Type, Params, fun lookup_retained/2).
+'/messages'(get, Params) ->
+    check_backend(get, Params, fun lookup_retained/2);
+'/messages'(delete, Params) ->
+    delete_messages(delete, Params).
 
 with_topic_warp(Type, Params) ->
     check_backend(Type, Params, fun with_topic/2).
@@ -168,15 +184,28 @@ config(put, #{body := Body}) ->
 lookup_retained(get, #{query_string := Qs}) ->
     Page = maps:get(<<"page">>, Qs, 1),
     Limit = maps:get(<<"limit">>, Qs, emqx_mgmt:default_row_limit()),
-    {ok, Msgs} = emqx_retainer_mnesia:page_read(undefined, undefined, Page, Limit),
+    Topic = maps:get(<<"topic">>, Qs, undefined),
+    {ok, HasNext, Msgs} = emqx_retainer:page_read(Topic, Page, Limit),
+    Meta =
+        case Topic of
+            undefined ->
+                #{count => emqx_retainer:retained_count()};
+            _ ->
+                #{}
+        end,
     {200, #{
         data => [format_message(Msg) || Msg <- Msgs],
-        meta => #{page => Page, limit => Limit, count => emqx_retainer_mnesia:size(?TAB_MESSAGE)}
+        meta =>
+            Meta#{
+                page => Page,
+                limit => Limit,
+                hasnext => HasNext
+            }
     }}.
 
 with_topic(get, #{bindings := Bindings}) ->
     Topic = maps:get(topic, Bindings),
-    {ok, Msgs} = emqx_retainer_mnesia:page_read(undefined, Topic, 1, 1),
+    {ok, _, Msgs} = emqx_retainer:page_read(Topic, 1, 1),
     case Msgs of
         [H | _] ->
             {200, format_detail_message(H)};
@@ -188,16 +217,20 @@ with_topic(get, #{bindings := Bindings}) ->
     end;
 with_topic(delete, #{bindings := Bindings}) ->
     Topic = maps:get(topic, Bindings),
-    case emqx_retainer_mnesia:page_read(undefined, Topic, 1, 1) of
-        {ok, []} ->
+    case emqx_retainer:page_read(Topic, 1, 1) of
+        {ok, _, []} ->
             {404, #{
                 code => <<"NOT_FOUND">>,
                 message => <<"Viewed message doesn't exist">>
             }};
-        {ok, _} ->
-            emqx_retainer_mnesia:delete_message(undefined, Topic),
+        {ok, _, _} ->
+            emqx_retainer:delete(Topic),
             {204}
     end.
+
+delete_messages(delete, _) ->
+    emqx_retainer:clean(),
+    {204}.
 
 format_message(#message{
     id = ID,
@@ -211,11 +244,8 @@ format_message(#message{
         msgid => emqx_guid:to_hexstr(ID),
         qos => Qos,
         topic => Topic,
-        publish_at => list_to_binary(
-            calendar:system_time_to_rfc3339(
-                Timestamp, [{unit, millisecond}]
-            )
-        ),
+        publish_at =>
+            emqx_utils_calendar:epoch_to_rfc3339(Timestamp),
         from_clientid => to_bin_string(From),
         from_username => maps:get(username, Headers, <<>>)
     }.
@@ -235,8 +265,8 @@ to_bin_string(Data) ->
     list_to_binary(io_lib:format("~p", [Data])).
 
 check_backend(Type, Params, Cont) ->
-    case emqx:get_config([retainer, backend, type]) of
-        built_in_database ->
+    case emqx_retainer:backend_module() of
+        emqx_retainer_mnesia ->
             Cont(Type, Params);
         _ ->
             {400, 'BAD_REQUEST', <<"This API only support built in database">>}

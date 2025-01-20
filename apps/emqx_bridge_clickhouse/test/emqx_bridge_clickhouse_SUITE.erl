@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_clickhouse_SUITE).
@@ -7,8 +7,10 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--define(APP, emqx_bridge_clickhouse).
 -define(CLICKHOUSE_HOST, "clickhouse").
+-define(CLICKHOUSE_PORT, "8123").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 
 %% See comment in
@@ -20,21 +22,30 @@
 %%------------------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    case
-        emqx_common_test_helpers:is_tcp_server_available(?CLICKHOUSE_HOST, ?CLICKHOUSE_DEFAULT_PORT)
-    of
+    Host = clickhouse_host(),
+    Port = list_to_integer(clickhouse_port()),
+    case emqx_common_test_helpers:is_tcp_server_available(Host, Port) of
         true ->
-            emqx_common_test_helpers:render_and_load_app_config(emqx_conf),
-            ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_bridge]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource, ?APP]),
-            snabbkaffe:fix_ct_logging(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_clickhouse,
+                    emqx_connector,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             %% Create the db table
             Conn = start_clickhouse_connection(),
             % erlang:monitor,sb
             {ok, _, _} = clickhouse:query(Conn, sql_create_database(), #{}),
             {ok, _, _} = clickhouse:query(Conn, sql_create_table(), []),
             clickhouse:query(Conn, sql_find_key(42), []),
-            [{clickhouse_connection, Conn} | Config];
+            [{apps, Apps}, {clickhouse_connection, Conn} | Config];
         false ->
             case os:getenv("IS_CI") of
                 "yes" ->
@@ -73,8 +84,9 @@ start_clickhouse_connection() ->
 end_per_suite(Config) ->
     ClickhouseConnection = proplists:get_value(clickhouse_connection, Config),
     clickhouse:stop(ClickhouseConnection),
-    ok = emqx_connector_test_helpers:stop_apps([?APP, emqx_resource]),
-    ok = emqx_common_test_helpers:stop_apps([emqx_bridge, emqx_conf]).
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
     reset_table(Config),
@@ -114,13 +126,18 @@ sql_drop_table() ->
 sql_create_database() ->
     "CREATE DATABASE IF NOT EXISTS mqtt".
 
+clickhouse_host() ->
+    os:getenv("CLICKHOUSE_HOST", ?CLICKHOUSE_HOST).
+clickhouse_port() ->
+    os:getenv("CLICKHOUSE_PORT", ?CLICKHOUSE_PORT).
+
 clickhouse_url() ->
-    erlang:iolist_to_binary([
-        <<"http://">>,
-        ?CLICKHOUSE_HOST,
-        ":",
-        erlang:integer_to_list(?CLICKHOUSE_DEFAULT_PORT)
-    ]).
+    Host = clickhouse_host(),
+    Port = clickhouse_port(),
+    erlang:iolist_to_binary(["http://", Host, ":", Port]).
+
+parse_insert(SQL) ->
+    emqx_bridge_clickhouse_connector:split_clickhouse_insert_sql(SQL).
 
 clickhouse_config(Config) ->
     SQL = maps:get(sql, Config, sql_insert_template_for_bridge()),
@@ -164,9 +181,12 @@ parse_and_check(ConfigString, BridgeType, Name) ->
     RetConfig.
 
 make_bridge(Config) ->
+    make_bridge(Config, #{}).
+
+make_bridge(Config, Overrides) ->
     Type = <<"clickhouse">>,
     Name = atom_to_binary(?MODULE),
-    BridgeConfig = clickhouse_config(Config),
+    BridgeConfig = maps:merge(clickhouse_config(Config), Overrides),
     {ok, _} = emqx_bridge:create(
         Type,
         Name,
@@ -177,8 +197,7 @@ make_bridge(Config) ->
 delete_bridge() ->
     Type = <<"clickhouse">>,
     Name = atom_to_binary(?MODULE),
-    {ok, _} = emqx_bridge:remove(Type, Name),
-    ok.
+    ok = emqx_bridge:remove(Type, Name).
 
 reset_table(Config) ->
     ClickhouseConnection = proplists:get_value(clickhouse_connection, Config),
@@ -229,6 +248,139 @@ t_make_delete_bridge(_Config) ->
     false = lists:any(IsRightName, BridgesAfterDelete),
     ok.
 
+t_parse_insert_sql_template(_Config) ->
+    ?assertEqual(
+        <<"(${tagvalues},${date})"/utf8>>,
+        parse_insert(
+            <<"insert into tag_VALUES(tag_values,Timestamp) values (${tagvalues},${date})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id}, 'Иван', 25)"/utf8>>,
+        parse_insert(
+            <<"INSERT INTO Values_таблица (идентификатор, имя, возраст)   VALUES \t (${id}, 'Иван', 25)  "/utf8>>
+        )
+    ),
+    %% with `;` suffix, bug-to-bug compatibility
+    ?assertEqual(
+        <<"(${id}, 'Иван', 25)"/utf8>>,
+        parse_insert(
+            <<"INSERT INTO Values_таблица (идентификатор, имя, возраст)   VALUES \t (${id}, 'Иван', 25);  "/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'李四', 35)"/utf8>>,
+        parse_insert(
+            <<"  inSErt into 表格(标识,名字,年龄)values(${id},'李四', 35) ; "/utf8>>
+        )
+    ),
+
+    %% `values` in column name
+    ?assertEqual(
+        <<"(${tagvalues},${date}  )"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags(tag_values,Timestamp) values (${tagvalues},${date}  )"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${payload}, FROM_UNIXTIME((${timestamp}/1000)))">>,
+        parse_insert(
+            <<"INSERT INTO mqtt_test(payload, arrived) VALUES (${payload}, FROM_UNIXTIME((${timestamp}/1000)))"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'Алексей',30)"/utf8>>,
+        parse_insert(
+            <<"insert into таблица (идентификатор,имя,возраст) VALUES(${id},'Алексей',30)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id}, '张三', 22)"/utf8>>,
+        parse_insert(
+            <<"INSERT into 表格 (标识, 名字, 年龄) VALUES (${id}, '张三', 22)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'李四', 35)"/utf8>>,
+        parse_insert(
+            <<"  inSErt into 表格(标识,名字,年龄)values(${id},'李四', 35)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(   ${tagvalues},   ${date} )"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags( tag_value,Timestamp)  VALUES\t\t(   ${tagvalues},   ${date} )"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${tagvalues},${date})"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags(tag_value , Timestamp )vALues(${tagvalues},${date})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${one}, ${two},${three})"/utf8>>,
+        parse_insert(
+            <<"inSErt  INTO  table75 (column1, column2, column3) values (${one}, ${two},${three})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${tag1},   ${tag2}  )">>,
+        parse_insert(
+            <<"INSERT Into some_table      values\t(${tag1},   ${tag2}  )">>
+        )
+    ),
+    ?assertEqual(
+        <<"(2, 2)">>,
+        parse_insert(
+            <<"INSERT INTO insert_select_testtable (* EXCEPT(b)) Values (2, 2)">>
+        )
+    ),
+    ?assertEqual(
+        <<"(2, 2), (3, ${five})">>,
+        parse_insert(
+            <<"INSERT INTO insert_select_testtable (* EXCEPT(b))Values(2, 2), (3, ${five})">>
+        )
+    ),
+
+    %% `format`
+    ?assertEqual(
+        <<"[(${key}, \"${data}\", ${timestamp})]">>,
+        parse_insert(
+            <<"INSERT INTO mqtt_test(key, data, arrived)",
+                " FORMAT JSONCompactEachRow [(${key}, \"${data}\", ${timestamp})]">>
+        )
+    ),
+    ?assertEqual(
+        <<"(v11, v12, v13), (v21, v22, v23)">>,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values (v11, v12, v13), (v21, v22, v23)">>
+        )
+    ),
+
+    ?assertEqual(
+        <<"👋    .."/utf8>>,
+        %% Only check if FORMAT_DATA existed after `FORMAT FORMAT_NAME`
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT AnyFORMAT  👋    .."/utf8>>
+        )
+    ),
+
+    ErrMsg = <<"The SQL template should be an SQL INSERT statement but it is something else.">>,
+    %% No `FORMAT_DATA`
+    ?assertError(
+        ErrMsg,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values">>
+        )
+    ),
+    ?assertError(
+        ErrMsg,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values  ">>
+        )
+    ).
+
 t_send_message_query(Config) ->
     BridgeID = make_bridge(#{enable_batch => false}),
     Key = 42,
@@ -237,6 +389,21 @@ t_send_message_query(Config) ->
     emqx_bridge:send_message(BridgeID, Payload),
     %% Check that the data got to the database
     check_key_in_clickhouse(Key, Config),
+    delete_bridge(),
+    ok.
+
+t_undefined_vars_as_null(Config) ->
+    BridgeID = make_bridge(#{enable_batch => false}, #{<<"undefined_vars_as_null">> => true}),
+    Key = 42,
+    Payload = #{key => Key, data => undefined, timestamp => 10000},
+    %% This will use the SQL template included in the bridge
+    emqx_bridge:send_message(BridgeID, Payload),
+    %% Check that the data got to the database
+    check_key_in_clickhouse(Key, Config),
+    ClickhouseConnection = proplists:get_value(clickhouse_connection, Config),
+    SQL = io_lib:format("SELECT data FROM mqtt.mqtt_test WHERE key = ~p", [Key]),
+    {ok, 200, ResultString} = clickhouse:query(ClickhouseConnection, SQL, []),
+    ?assertMatch(<<"null">>, iolist_to_binary(string:trim(ResultString))),
     delete_bridge(),
     ok.
 

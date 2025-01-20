@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 %% @doc The gateway connection registry
 -module(emqx_gateway_cm_registry).
 
--include("include/emqx_gateway.hrl").
+-include("emqx_gateway.hrl").
 
 -behaviour(gen_server).
 
@@ -28,7 +28,7 @@
     unregister_channel/2
 ]).
 
--export([lookup_channels/2]).
+-export([lookup_channels/2, get_connected_client_count/0]).
 
 -export([tabname/1]).
 
@@ -53,7 +53,7 @@
 -record(channel, {chid, pid}).
 
 %% @doc Start the global channel registry for the given gateway name.
--spec start_link(gateway_name()) -> gen_server:startlink_ret().
+-spec start_link(gateway_name()) -> emqx_types:startlink_ret().
 start_link(Name) ->
     gen_server:start_link(?MODULE, [Name], []).
 
@@ -94,6 +94,19 @@ lookup_channels(Name, ClientId) ->
 
 record(ClientId, ChanPid) ->
     #channel{chid = ClientId, pid = ChanPid}.
+
+get_connected_client_count() ->
+    Gatewyas = emqx_gateway_utils:find_gateway_definitions(),
+    Fun = fun(#{name := Name}, Acc) ->
+        Tab = tabname(Name),
+        case ets:info(Tab, size) of
+            undefined ->
+                Acc;
+            Size ->
+                Acc + Size
+        end
+    end,
+    lists:foldl(Fun, 0, Gatewyas).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks

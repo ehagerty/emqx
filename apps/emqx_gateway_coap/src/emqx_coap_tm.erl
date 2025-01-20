@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@
     token :: token() | undefined,
     observe :: 0 | 1 | undefined | observed,
     state :: atom(),
-    timers :: maps:map(),
+    timers :: map(),
     transport :: emqx_coap_transport:transport()
 }).
 -type state_machine() :: #state_machine{}.

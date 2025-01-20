@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@
 -define(HP_AUTHN, 970).
 -define(HP_AUTHZ, 960).
 -define(HP_SYS_MSGS, 950).
+-define(HP_SCHEMA_VALIDATION, 945).
+-define(HP_MESSAGE_TRANSFORMATION, 943).
 -define(HP_TOPIC_METRICS, 940).
 -define(HP_RETAINER, 930).
 -define(HP_AUTO_SUB, 920).

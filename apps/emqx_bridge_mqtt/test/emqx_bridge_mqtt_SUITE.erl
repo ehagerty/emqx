@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,14 +20,16 @@
 
 -import(emqx_dashboard_api_test_helpers, [request/4, uri/1]).
 
--include("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %% output functions
 -export([inspect/3]).
 
--define(BRIDGE_CONF_DEFAULT, <<"bridges: {}">>).
 -define(TYPE_MQTT, <<"mqtt">>).
 -define(BRIDGE_NAME_INGRESS, <<"ingress_mqtt_bridge">>).
 -define(BRIDGE_NAME_EGRESS, <<"egress_mqtt_bridge">>).
@@ -38,12 +40,16 @@
 -define(EGRESS_REMOTE_TOPIC, "egress_remote_topic").
 -define(EGRESS_LOCAL_TOPIC, "egress_local_topic").
 
--define(SERVER_CONF(Username), #{
+-define(SERVER_CONF, #{
+    <<"type">> => ?TYPE_MQTT,
     <<"server">> => <<"127.0.0.1:1883">>,
-    <<"username">> => Username,
-    <<"password">> => <<"">>,
     <<"proto_ver">> => <<"v4">>,
     <<"ssl">> => #{<<"enable">> => false}
+}).
+
+-define(SERVER_CONF(Username, Password), (?SERVER_CONF)#{
+    <<"username">> => Username,
+    <<"password">> => Password
 }).
 
 -define(INGRESS_CONF, #{
@@ -129,43 +135,32 @@ suite() ->
     [{timetrap, {seconds, 30}}].
 
 init_per_suite(Config) ->
-    _ = application:load(emqx_conf),
-    ok = emqx_common_test_helpers:start_apps(
+    Apps = emqx_cth_suite:start(
         [
-            emqx_rule_engine,
+            emqx_conf,
             emqx_bridge,
+            emqx_rule_engine,
             emqx_bridge_mqtt,
-            emqx_dashboard
+            {emqx_dashboard,
+                "dashboard {"
+                "\n listeners.http { bind = 18083 }"
+                "\n default_username = connector_admin"
+                "\n default_password = public"
+                "\n }"}
         ],
-        fun set_special_configs/1
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    ok = emqx_common_test_helpers:load_config(
-        emqx_rule_engine_schema,
-        <<"rule_engine {rules {}}">>
-    ),
-    ok = emqx_common_test_helpers:load_config(emqx_bridge_schema, ?BRIDGE_CONF_DEFAULT),
-    Config.
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([
-        emqx_dashboard,
-        emqx_bridge_mqtt,
-        emqx_bridge,
-        emqx_rule_engine
-    ]),
-    ok.
-
-set_special_configs(emqx_dashboard) ->
-    emqx_dashboard_api_test_helpers:set_default_config(<<"connector_admin">>);
-set_special_configs(_) ->
-    ok.
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 init_per_testcase(_, Config) ->
-    {ok, _} = emqx_cluster_rpc:start_link(node(), emqx_cluster_rpc, 1000),
     ok = snabbkaffe:start_trace(),
     Config.
 
 end_per_testcase(_, _Config) ->
+    ok = unhook_authenticate(),
     clear_resources(),
     snabbkaffe:stop(),
     ok.
@@ -179,7 +174,7 @@ clear_resources() ->
     ),
     lists:foreach(
         fun(#{type := Type, name := Name}) ->
-            {ok, _} = emqx_bridge:remove(Type, Name)
+            ok = emqx_bridge:remove(Type, Name)
         end,
         emqx_bridge:list()
     ).
@@ -187,14 +182,87 @@ clear_resources() ->
 %%------------------------------------------------------------------------------
 %% Testcases
 %%------------------------------------------------------------------------------
+
+t_conf_bridge_authn_anonymous(_) ->
+    ok = hook_authenticate(),
+    {ok, 201, _Bridge} = request(
+        post,
+        uri(["bridges"]),
+        ?SERVER_CONF#{
+            <<"name">> => <<"t_conf_bridge_anonymous">>,
+            <<"ingress">> => ?INGRESS_CONF#{<<"pool_size">> => 1}
+        }
+    ),
+    ?assertReceive(
+        {authenticate, #{username := undefined, password := undefined}}
+    ).
+
+t_conf_bridge_authn_password(_) ->
+    Username1 = <<"user1">>,
+    Password1 = <<"from-here">>,
+    ok = hook_authenticate(),
+    {ok, 201, _Bridge1} = request(
+        post,
+        uri(["bridges"]),
+        ?SERVER_CONF(Username1, Password1)#{
+            <<"name">> => <<"t_conf_bridge_authn_password">>,
+            <<"ingress">> => ?INGRESS_CONF#{<<"pool_size">> => 1}
+        }
+    ),
+    ?assertReceive(
+        {authenticate, #{username := Username1, password := Password1}}
+    ).
+
+t_conf_bridge_authn_passfile(Config) ->
+    %% test_server_ctrl:run_test_cases_loop
+    DataDir = ?config(data_dir, Config),
+    Username2 = <<"user2">>,
+    PasswordFilename = filename:join(DataDir, "password"),
+    Password2 = <<"from-there">>,
+    ok = hook_authenticate(),
+    {ok, 201, _Bridge2} = request(
+        post,
+        uri(["bridges"]),
+        ?SERVER_CONF(Username2, iolist_to_binary(["file://", PasswordFilename]))#{
+            <<"name">> => <<"t_conf_bridge_authn_passfile">>,
+            <<"ingress">> => ?INGRESS_CONF#{<<"pool_size">> => 1}
+        }
+    ),
+    ?assertReceive(
+        {authenticate, #{username := Username2, password := Password2}}
+    ),
+    {ok, 201, #{
+        <<"status">> := <<"disconnected">>,
+        <<"status_reason">> := Reason
+    }} =
+        request_json(
+            post,
+            uri(["bridges"]),
+            ?SERVER_CONF(<<>>, <<"file://im/pretty/sure/theres/no/such/file">>)#{
+                <<"name">> => <<"t_conf_bridge_authn_no_passfile">>,
+                <<"ingress">> => ?INGRESS_CONF#{<<"pool_size">> => 1}
+            }
+        ),
+    ?assertMatch({match, _}, re:run(Reason, <<"failed_to_read_secret_file">>)).
+
+hook_authenticate() ->
+    emqx_hooks:add('client.authenticate', {?MODULE, authenticate, [self()]}, ?HP_HIGHEST).
+
+unhook_authenticate() ->
+    emqx_hooks:del('client.authenticate', {?MODULE, authenticate}).
+
+authenticate(Credential, _, TestRunnerPid) ->
+    _ = TestRunnerPid ! {authenticate, Credential},
+    ignore.
+
+%%------------------------------------------------------------------------------
+
 t_mqtt_conn_bridge_ingress(_) ->
-    User1 = <<"user1">>,
     %% create an MQTT bridge, using POST
     {ok, 201, Bridge} = request(
         post,
         uri(["bridges"]),
-        ServerConf = ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ServerConf = ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_INGRESS,
             <<"ingress">> => ?INGRESS_CONF
         }
@@ -249,7 +317,6 @@ t_mqtt_conn_bridge_ingress(_) ->
     ok.
 
 t_mqtt_conn_bridge_ingress_full_context(_Config) ->
-    User1 = <<"user1">>,
     IngressConf =
         emqx_utils_maps:deep_merge(
             ?INGRESS_CONF,
@@ -258,8 +325,7 @@ t_mqtt_conn_bridge_ingress_full_context(_Config) ->
     {ok, 201, _Bridge} = request(
         post,
         uri(["bridges"]),
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_INGRESS,
             <<"ingress">> => IngressConf
         }
@@ -297,8 +363,7 @@ t_mqtt_conn_bridge_ingress_shared_subscription(_) ->
     Ns = lists:seq(1, 10),
     BridgeName = atom_to_binary(?FUNCTION_NAME),
     BridgeID = create_bridge(
-        ?SERVER_CONF(<<>>)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => BridgeName,
             <<"ingress">> => #{
                 <<"pool_size">> => PoolSize,
@@ -334,40 +399,34 @@ t_mqtt_conn_bridge_ingress_shared_subscription(_) ->
     {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeID]), []),
     ok.
 
-t_mqtt_egress_bridge_ignores_clean_start(_) ->
+t_mqtt_egress_bridge_warns_clean_start(_) ->
     BridgeName = atom_to_binary(?FUNCTION_NAME),
-    BridgeID = create_bridge(
-        ?SERVER_CONF(<<"user1">>)#{
-            <<"type">> => ?TYPE_MQTT,
-            <<"name">> => BridgeName,
-            <<"egress">> => ?EGRESS_CONF,
-            <<"clean_start">> => false
-        }
-    ),
+    Action = fun() ->
+        BridgeID = create_bridge(
+            ?SERVER_CONF#{
+                <<"name">> => BridgeName,
+                <<"egress">> => ?EGRESS_CONF,
+                <<"clean_start">> => false
+            }
+        ),
 
-    ResourceID = emqx_bridge_resource:resource_id(BridgeID),
-    {ok, _Group, #{state := #{egress_pool_name := EgressPoolName}}} =
-        emqx_resource_manager:lookup_cached(ResourceID),
-    ClientInfo = ecpool:pick_and_do(
-        EgressPoolName,
-        {emqx_bridge_mqtt_egress, info, []},
-        no_handover
-    ),
-    ?assertMatch(
-        #{clean_start := true},
-        maps:from_list(ClientInfo)
-    ),
+        %% delete the bridge
+        {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeID]), []),
 
-    %% delete the bridge
-    {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeID]), []),
-
+        ok
+    end,
+    {ok, {ok, _}} =
+        ?wait_async_action(
+            Action(),
+            #{?snk_kind := mqtt_clean_start_egress_action_warning},
+            10000
+        ),
     ok.
 
 t_mqtt_conn_bridge_ingress_downgrades_qos_2(_) ->
     BridgeName = atom_to_binary(?FUNCTION_NAME),
     BridgeID = create_bridge(
-        ?SERVER_CONF(<<"user1">>)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => BridgeName,
             <<"ingress">> => emqx_utils_maps:deep_merge(
                 ?INGRESS_CONF,
@@ -392,9 +451,8 @@ t_mqtt_conn_bridge_ingress_downgrades_qos_2(_) ->
     ok.
 
 t_mqtt_conn_bridge_ingress_no_payload_template(_) ->
-    User1 = <<"user1">>,
     BridgeIDIngress = create_bridge(
-        ?SERVER_CONF(User1)#{
+        ?SERVER_CONF#{
             <<"type">> => ?TYPE_MQTT,
             <<"name">> => ?BRIDGE_NAME_INGRESS,
             <<"ingress">> => ?INGRESS_CONF_NO_PAYLOAD_TEMPLATE
@@ -428,15 +486,12 @@ t_mqtt_conn_bridge_ingress_no_payload_template(_) ->
 
 t_mqtt_conn_bridge_egress(_) ->
     %% then we add a mqtt connector, using POST
-    User1 = <<"user1">>,
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_EGRESS,
             <<"egress">> => ?EGRESS_CONF
         }
     ),
-    ResourceID = emqx_bridge_resource:resource_id(?TYPE_MQTT, ?BRIDGE_NAME_EGRESS),
 
     %% we now test if the bridge works as expected
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
@@ -450,11 +505,6 @@ t_mqtt_conn_bridge_egress(_) ->
         emqx:publish(emqx_message:make(LocalTopic, Payload)),
         #{?snk_kind := buffer_worker_flush_ack}
     ),
-
-    %% we should receive a message on the "remote" broker, with specified topic
-    Msg = assert_mqtt_msg_received(RemoteTopic, Payload),
-    Size = byte_size(ResourceID),
-    ?assertMatch(<<ResourceID:Size/binary, _/binary>>, Msg#message.from),
 
     %% verify the metrics of the bridge
     ?retry(
@@ -473,16 +523,12 @@ t_mqtt_conn_bridge_egress(_) ->
 
 t_mqtt_conn_bridge_egress_no_payload_template(_) ->
     %% then we add a mqtt connector, using POST
-    User1 = <<"user1">>,
-
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_EGRESS,
             <<"egress">> => ?EGRESS_CONF_NO_PAYLOAD_TEMPLATE
         }
     ),
-    ResourceID = emqx_bridge_resource:resource_id(?TYPE_MQTT, ?BRIDGE_NAME_EGRESS),
 
     %% we now test if the bridge works as expected
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
@@ -499,8 +545,6 @@ t_mqtt_conn_bridge_egress_no_payload_template(_) ->
 
     %% we should receive a message on the "remote" broker, with specified topic
     Msg = assert_mqtt_msg_received(RemoteTopic),
-    %% the MapMsg is all fields outputed by Rule-Engine. it's a binary coded json here.
-    ?assertMatch(<<ResourceID:(byte_size(ResourceID))/binary, _/binary>>, Msg#message.from),
     ?assertMatch(#{<<"payload">> := Payload}, emqx_utils_json:decode(Msg#message.payload)),
 
     %% verify the metrics of the bridge
@@ -519,17 +563,53 @@ t_mqtt_conn_bridge_egress_no_payload_template(_) ->
 
     ok.
 
-t_egress_custom_clientid_prefix(_Config) ->
-    User1 = <<"user1">>,
+t_egress_short_clientid(_Config) ->
+    %% Name is short, expect the actual client ID in use is hashed from
+    %% <name><nodename-hash>:<pool_worker_id>
+    Name = <<"abc01234">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = iolist_to_binary([BaseId, $:, "1"]),
+    ?assertMatch(<<"abc01234", _/binary>>, ExpectedClientId),
+    test_egress_clientid(Name, ExpectedClientId).
+
+t_egress_long_clientid(_Config) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <name><nodename-hash>:<pool_worker_id>
+    Name = <<"abc012345678901234567890">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = emqx_bridge_mqtt_lib:bytes23(BaseId, 1),
+    test_egress_clientid(Name, ExpectedClientId).
+
+t_egress_with_short_prefix(_Config) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix>head(sha1(<name><nodename-hash>:<pool_worker_id>), 16)
+    Prefix = <<"012-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = emqx_bridge_mqtt_lib:bytes23_with_prefix(Prefix, BaseId, 1),
+    ?assertMatch(<<"012-", _/binary>>, ExpectedClientId),
+    test_egress_clientid(Name, Prefix, ExpectedClientId).
+
+t_egress_with_long_prefix(_Config) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix><name><nodename-hash>:<pool_worker_id>
+    Prefix = <<"0123456789abcdef01234-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = iolist_to_binary([Prefix, BaseId, <<":1">>]),
+    test_egress_clientid(Name, Prefix, ExpectedClientId).
+
+test_egress_clientid(Name, ExpectedClientId) ->
+    test_egress_clientid(Name, <<>>, ExpectedClientId).
+
+test_egress_clientid(Name, ClientIdPrefix, ExpectedClientId) ->
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"clientid_prefix">> => <<"my-custom-prefix">>,
-            <<"type">> => ?TYPE_MQTT,
-            <<"name">> => ?BRIDGE_NAME_EGRESS,
-            <<"egress">> => ?EGRESS_CONF
+        ?SERVER_CONF#{
+            <<"name">> => Name,
+            <<"egress">> => (?EGRESS_CONF)#{<<"pool_size">> => 1},
+            <<"clientid_prefix">> => ClientIdPrefix
         }
     ),
-    ResourceID = emqx_bridge_resource:resource_id(?TYPE_MQTT, ?BRIDGE_NAME_EGRESS),
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
     RemoteTopic = <<?EGRESS_REMOTE_TOPIC, "/", LocalTopic/binary>>,
     Payload = <<"hello">>,
@@ -538,24 +618,20 @@ t_egress_custom_clientid_prefix(_Config) ->
     emqx:publish(emqx_message:make(LocalTopic, Payload)),
 
     Msg = assert_mqtt_msg_received(RemoteTopic, Payload),
-    Size = byte_size(ResourceID),
-    ?assertMatch(<<"my-custom-prefix:", _ResouceID:Size/binary, _/binary>>, Msg#message.from),
+    ?assertEqual(ExpectedClientId, Msg#message.from),
 
     {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeIDEgress]), []),
     ok.
 
 t_mqtt_conn_bridge_ingress_and_egress(_) ->
-    User1 = <<"user1">>,
     BridgeIDIngress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_INGRESS,
             <<"ingress">> => ?INGRESS_CONF
         }
     ),
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_EGRESS,
             <<"egress">> => ?EGRESS_CONF
         }
@@ -627,8 +703,7 @@ t_mqtt_conn_bridge_ingress_and_egress(_) ->
 
 t_ingress_mqtt_bridge_with_rules(_) ->
     BridgeIDIngress = create_bridge(
-        ?SERVER_CONF(<<"user1">>)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_INGRESS,
             <<"ingress">> => ?INGRESS_CONF
         }
@@ -640,7 +715,7 @@ t_ingress_mqtt_bridge_with_rules(_) ->
         #{
             <<"name">> => <<"A_rule_get_messages_from_a_source_mqtt_bridge">>,
             <<"enable">> => true,
-            <<"actions">> => [#{<<"function">> => "emqx_bridge_mqtt_SUITE:inspect"}],
+            <<"actions">> => [#{<<"function">> => <<"emqx_bridge_mqtt_SUITE:inspect">>}],
             <<"sql">> => <<"SELECT * from \"$bridges/", BridgeIDIngress/binary, "\"">>
         }
     ),
@@ -712,8 +787,7 @@ t_ingress_mqtt_bridge_with_rules(_) ->
 
 t_egress_mqtt_bridge_with_rules(_) ->
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(<<"user1">>)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_EGRESS,
             <<"egress">> => ?EGRESS_CONF
         }
@@ -787,16 +861,47 @@ t_egress_mqtt_bridge_with_rules(_) ->
     {ok, 204, <<>>} = request(delete, uri(["rules", RuleId]), []),
     {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeIDEgress]), []).
 
+t_egress_mqtt_bridge_with_dummy_rule(_) ->
+    BridgeIDEgress = create_bridge(
+        ?SERVER_CONF#{
+            <<"name">> => ?BRIDGE_NAME_EGRESS,
+            <<"egress">> => ?EGRESS_CONF
+        }
+    ),
+
+    {ok, 201, Rule} = request(
+        post,
+        uri(["rules"]),
+        #{
+            <<"name">> => <<"A_rule_send_empty_messages_to_a_sink_mqtt_bridge">>,
+            <<"enable">> => true,
+            <<"actions">> => [BridgeIDEgress],
+            %% select something useless from what a message cannot be composed
+            <<"sql">> => <<"SELECT x from \"t/1\"">>
+        }
+    ),
+    #{<<"id">> := RuleId} = emqx_utils_json:decode(Rule),
+
+    %% PUBLISH a message to the rule.
+    Payload = <<"hi">>,
+    RuleTopic = <<"t/1">>,
+    RemoteTopic = <<?EGRESS_REMOTE_TOPIC, "/">>,
+    emqx:subscribe(RemoteTopic),
+    timer:sleep(100),
+    emqx:publish(emqx_message:make(RuleTopic, Payload)),
+    %% we should receive a message on the "remote" broker, with specified topic
+    assert_mqtt_msg_received(RemoteTopic, <<>>),
+
+    {ok, 204, <<>>} = request(delete, uri(["rules", RuleId]), []),
+    {ok, 204, <<>>} = request(delete, uri(["bridges", BridgeIDEgress]), []).
+
 t_mqtt_conn_bridge_egress_reconnect(_) ->
     %% then we add a mqtt connector, using POST
-    User1 = <<"user1">>,
     BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
+        ?SERVER_CONF#{
             <<"name">> => ?BRIDGE_NAME_EGRESS,
             <<"egress">> => ?EGRESS_CONF,
             <<"resource_opts">> => #{
-                <<"worker_pool_size">> => 2,
                 <<"query_mode">> => <<"sync">>,
                 %% using a long time so we can test recovery
                 <<"request_ttl">> => <<"15s">>,
@@ -876,9 +981,10 @@ t_mqtt_conn_bridge_egress_reconnect(_) ->
 
     %% start the listener 1883 to make the bridge reconnected
     ok = emqx_listeners:start_listener('tcp:default'),
-    timer:sleep(1500),
     %% verify the metrics of the bridge, the 2 queued messages should have been sent
-    ?assertMatch(#{<<"status">> := <<"connected">>}, request_bridge(BridgeIDEgress)),
+    ?retry(
+        500, 20, ?assertMatch(#{<<"status">> := <<"connected">>}, request_bridge(BridgeIDEgress))
+    ),
     %% matched >= 3 because of possible retries.
     ?assertMetrics(
         #{
@@ -897,57 +1003,69 @@ t_mqtt_conn_bridge_egress_reconnect(_) ->
     ok.
 
 t_mqtt_conn_bridge_egress_async_reconnect(_) ->
-    User1 = <<"user1">>,
-    BridgeIDEgress = create_bridge(
-        ?SERVER_CONF(User1)#{
-            <<"type">> => ?TYPE_MQTT,
-            <<"name">> => ?BRIDGE_NAME_EGRESS,
-            <<"egress">> => ?EGRESS_CONF,
-            <<"resource_opts">> => #{
-                <<"worker_pool_size">> => 2,
-                <<"query_mode">> => <<"async">>,
-                %% using a long time so we can test recovery
-                <<"request_ttl">> => <<"15s">>,
-                %% to make it check the healthy and reconnect quickly
-                <<"health_check_interval">> => <<"0.5s">>
-            }
-        }
-    ),
-
     Self = self(),
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
     RemoteTopic = <<?EGRESS_REMOTE_TOPIC, "/", LocalTopic/binary>>,
     emqx:subscribe(RemoteTopic),
 
-    Publisher = start_publisher(LocalTopic, 200, Self),
-    ct:sleep(1000),
+    ?check_trace(
+        begin
+            %% stop the listener 1883 to make the bridge disconnected
+            ok = emqx_listeners:stop_listener('tcp:default'),
 
-    %% stop the listener 1883 to make the bridge disconnected
-    ok = emqx_listeners:stop_listener('tcp:default'),
-    ct:sleep(1500),
-    ?assertMatch(
-        #{<<"status">> := Status} when
-            Status == <<"connecting">> orelse Status == <<"disconnected">>,
-        request_bridge(BridgeIDEgress)
+            BridgeIDEgress = create_bridge(
+                ?SERVER_CONF#{
+                    <<"name">> => ?BRIDGE_NAME_EGRESS,
+                    <<"egress">> => ?EGRESS_CONF,
+                    <<"resource_opts">> => #{
+                        <<"query_mode">> => <<"async">>,
+                        %% using a long time so we can test recovery
+                        <<"request_ttl">> => <<"15s">>,
+                        %% to make it check the healthy and reconnect quickly
+                        <<"health_check_interval">> => <<"0.5s">>
+                    }
+                }
+            ),
+
+            Publisher = start_publisher(LocalTopic, 200, Self),
+            ct:sleep(1000),
+
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    #{<<"status">> := Status} when
+                        Status == <<"connecting">> orelse Status == <<"disconnected">>,
+                    request_bridge(BridgeIDEgress)
+                )
+            ),
+
+            %% start the listener 1883 to make the bridge reconnected
+            ok = emqx_listeners:start_listener('tcp:default'),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    #{<<"status">> := <<"connected">>},
+                    request_bridge(BridgeIDEgress)
+                )
+            ),
+
+            N = stop_publisher(Publisher),
+
+            %% all those messages should eventually be delivered
+            [
+                assert_mqtt_msg_received(RemoteTopic, Payload)
+             || I <- lists:seq(1, N),
+                Payload <- [integer_to_binary(I)]
+            ],
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_ | _], ?of_kind(emqx_bridge_mqtt_connector_econnrefused_error, Trace)),
+            ok
+        end
     ),
-
-    %% start the listener 1883 to make the bridge reconnected
-    ok = emqx_listeners:start_listener('tcp:default'),
-    timer:sleep(1500),
-    ?assertMatch(
-        #{<<"status">> := <<"connected">>},
-        request_bridge(BridgeIDEgress)
-    ),
-
-    N = stop_publisher(Publisher),
-
-    %% all those messages should eventually be delivered
-    [
-        assert_mqtt_msg_received(RemoteTopic, Payload)
-     || I <- lists:seq(1, N),
-        Payload <- [integer_to_binary(I)]
-    ],
-
     ok.
 
 start_publisher(Topic, Interval, CtrlPid) ->
@@ -1006,7 +1124,8 @@ create_bridge(Config = #{<<"type">> := Type, <<"name">> := Name}) ->
             <<"type">> := Type,
             <<"name">> := Name
         },
-        emqx_utils_json:decode(Bridge)
+        emqx_utils_json:decode(Bridge),
+        #{expected_type => Type, expected_name => Name}
     ),
     emqx_bridge_resource:bridge_id(Type, Name).
 
@@ -1017,6 +1136,10 @@ request_bridge(BridgeID) ->
 request_bridge_metrics(BridgeID) ->
     {ok, 200, BridgeMetrics} = request(get, uri(["bridges", BridgeID, "metrics"]), []),
     emqx_utils_json:decode(BridgeMetrics).
+
+request_json(Method, Url, Body) ->
+    {ok, Code, Response} = request(Method, Url, Body),
+    {ok, Code, emqx_utils_json:decode(Response)}.
 
 request(Method, Url, Body) ->
     request(<<"connector_admin">>, Method, Url, Body).

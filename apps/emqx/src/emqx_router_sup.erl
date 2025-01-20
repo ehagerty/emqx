@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,6 +23,13 @@
 -export([init/1]).
 
 start_link() ->
+    %% Init and log routing table type
+    ok = mria:wait_for_tables(
+        emqx_trie:create_trie() ++
+            emqx_router:create_tables() ++
+            emqx_router_helper:create_tables()
+    ),
+    ok = emqx_router:init_schema(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
@@ -35,6 +42,13 @@ init([]) ->
         type => worker,
         modules => [emqx_router_helper]
     },
+    HelperPostStart = #{
+        id => helper_post_start,
+        start => {emqx_router_helper, post_start, []},
+        restart => transient,
+        shutdown => brutal_kill,
+        type => worker
+    },
     %% Router pool
     RouterPool = emqx_pool_sup:spec([
         router_pool,
@@ -46,4 +60,4 @@ init([]) ->
         intensity => 10,
         period => 100
     },
-    {ok, {SupFlags, [Helper, RouterPool]}}.
+    {ok, {SupFlags, [Helper, HelperPostStart, RouterPool]}}.

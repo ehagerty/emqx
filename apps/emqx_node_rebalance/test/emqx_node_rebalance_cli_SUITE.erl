@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%%--------------------------------------------------------------------
 
 -module(emqx_node_rebalance_cli_SUITE).
@@ -15,27 +15,38 @@
     [emqtt_connect_many/2, stop_many/1, case_specific_node_name/3]
 ).
 
--define(START_APPS, [emqx_eviction_agent, emqx_node_rebalance]).
+-define(START_APPS, [emqx, emqx_node_rebalance]).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps(?START_APPS),
-    Config.
+    Apps = emqx_cth_suite:start(?START_APPS, #{
+        work_dir => ?config(priv_dir, Config)
+    }),
+    [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    emqx_common_test_helpers:stop_apps(lists:reverse(?START_APPS)),
-    Config.
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(Case = t_rebalance, Config) ->
     _ = emqx_node_rebalance_evacuation:stop(),
-    ClusterNodes = emqx_eviction_agent_test_helpers:start_cluster(
+    Nodes =
+        [Node1 | _] =
         [
-            {case_specific_node_name(?MODULE, Case, '_donor'), 2883},
-            {case_specific_node_name(?MODULE, Case, '_recipient'), 3883}
+            case_specific_node_name(?MODULE, Case, '_1'),
+            case_specific_node_name(?MODULE, Case, '_2')
         ],
-        ?START_APPS
+    Spec = #{
+        role => core,
+        join_to => emqx_cth_cluster:node_name(Node1),
+        listeners => true,
+        apps => ?START_APPS
+    },
+    Cluster = [{Node, Spec} || Node <- Nodes],
+    ClusterNodes = emqx_cth_cluster:start(
+        Cluster,
+        #{work_dir => emqx_cth_suite:work_dir(Case, Config)}
     ),
     [{cluster_nodes, ClusterNodes} | Config];
 init_per_testcase(_Case, Config) ->
@@ -46,10 +57,7 @@ init_per_testcase(_Case, Config) ->
 end_per_testcase(t_rebalance, Config) ->
     _ = emqx_node_rebalance_evacuation:stop(),
     _ = emqx_node_rebalance:stop(),
-    _ = emqx_eviction_agent_test_helpers:stop_cluster(
-        ?config(cluster_nodes, Config),
-        ?START_APPS
-    );
+    _ = emqx_cth_cluster:stop(?config(cluster_nodes, Config));
 end_per_testcase(_Case, _Config) ->
     _ = emqx_node_rebalance_evacuation:stop(),
     _ = emqx_node_rebalance:stop().
@@ -156,10 +164,91 @@ t_evacuation(_Config) ->
         emqx_node_rebalance_evacuation:status()
     ).
 
+t_purge(_Config) ->
+    process_flag(trap_exit, true),
+
+    %% start with invalid args
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--purge", "--foo-bar"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--purge", "--purge-rate", "foobar"])
+    ),
+
+    %% not used by this scenario
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--purge", "--conn-evict-rate", "1"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--purge", "--sess-evict-rate", "1"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--purge", "--wait-takeover", "1"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli([
+            "start",
+            "--purge",
+            "--migrate-to",
+            atom_to_list(node())
+        ])
+    ),
+
+    Conns = emqtt_connect_many(get_mqtt_port(node(), tcp), 100),
+
+    ?assert(
+        emqx_node_rebalance_cli:cli([
+            "start",
+            "--purge",
+            "--purge-rate",
+            "10"
+        ])
+    ),
+
+    %% status
+    ok = emqx_node_rebalance_cli:cli(["status"]),
+    ok = emqx_node_rebalance_cli:cli(["node-status"]),
+    ok = emqx_node_rebalance_cli:cli(["node-status", atom_to_list(node())]),
+
+    ?assertMatch(
+        {enabled, #{}},
+        emqx_node_rebalance_purge:status()
+    ),
+
+    %% already enabled
+    ?assertNot(
+        emqx_node_rebalance_cli:cli([
+            "start",
+            "--purge",
+            "--purge-rate",
+            "10"
+        ])
+    ),
+
+    %% stop
+
+    true = emqx_node_rebalance_cli:cli(["stop"]),
+
+    %% stop when not started
+
+    false = emqx_node_rebalance_cli:cli(["stop"]),
+
+    ?assertEqual(
+        disabled,
+        emqx_node_rebalance_purge:status()
+    ),
+
+    ok = stop_many(Conns).
+
 t_rebalance(Config) ->
     process_flag(trap_exit, true),
 
-    [{DonorNode, DonorPort}, {RecipientNode, _}] = ?config(cluster_nodes, Config),
+    [DonorNode, RecipientNode] = ?config(cluster_nodes, Config),
+    DonorPort = get_mqtt_port(DonorNode, tcp),
 
     %% start with invalid args
     ?assertNot(
@@ -196,6 +285,14 @@ t_rebalance(Config) ->
 
     ?assertNot(
         emqx_node_rebalance_cli(DonorNode, ["start", "--wait-health-check", "foobar"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--evacuation", "--conn-evict-rpc-timeout", "foobar"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--evacuation", "--sess-evict-rpc-timeout", "foobar"])
     ),
 
     ?assertNot(
@@ -245,6 +342,10 @@ t_rebalance(Config) ->
             "1.1",
             "--wait-takeover",
             "10",
+            "--conn-evict-rpc-timeout",
+            "10",
+            "--sess-evict-rpc-timeout",
+            "10",
             "--nodes",
             atom_to_list(DonorNode) ++ "," ++
                 atom_to_list(RecipientNode)
@@ -289,3 +390,7 @@ emqx_node_rebalance_cli(Node, Args) ->
         Result ->
             Result
     end.
+
+get_mqtt_port(Node, Type) ->
+    {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, Type, default, bind]]),
+    Port.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_influxdb_SUITE).
 
@@ -53,12 +53,6 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
-    delete_all_bridges(),
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_connector_test_helpers:stop_apps([
-        emqx_conf, emqx_bridge, emqx_resource, emqx_rule_engine
-    ]),
-    _ = application:stop(emqx_connector),
     ok.
 
 init_per_group(InfluxDBType, Config0) when
@@ -92,10 +86,18 @@ init_per_group(InfluxDBType, Config0) when
             ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
             ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            ok = start_apps(),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            emqx_mgmt_api_test_util:init_suite(),
-            Config = [{use_tls, UseTLS} | Config0],
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx_conf,
+                    emqx_bridge_influxdb,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
+            Config = [{apps, Apps}, {use_tls, UseTLS} | Config0],
             {Name, ConfigString, InfluxDBConfig} = influxdb_config(
                 apiv1, InfluxDBHost, InfluxDBPort, Config
             ),
@@ -124,6 +126,9 @@ init_per_group(InfluxDBType, Config0) when
                 {influxdb_config, InfluxDBConfig},
                 {influxdb_config_string, ConfigString},
                 {ehttpc_pool_name, EHttpcPoolName},
+                {bridge_type, influxdb_api_v1},
+                {bridge_name, Name},
+                {bridge_config, InfluxDBConfig},
                 {influxdb_name, Name}
                 | Config
             ];
@@ -161,10 +166,18 @@ init_per_group(InfluxDBType, Config0) when
             ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
             ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            ok = start_apps(),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            emqx_mgmt_api_test_util:init_suite(),
-            Config = [{use_tls, UseTLS} | Config0],
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx_conf,
+                    emqx_bridge_influxdb,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
+            Config = [{apps, Apps}, {use_tls, UseTLS} | Config0],
             {Name, ConfigString, InfluxDBConfig} = influxdb_config(
                 apiv2, InfluxDBHost, InfluxDBPort, Config
             ),
@@ -193,6 +206,9 @@ init_per_group(InfluxDBType, Config0) when
                 {influxdb_config, InfluxDBConfig},
                 {influxdb_config_string, ConfigString},
                 {ehttpc_pool_name, EHttpcPoolName},
+                {bridge_type, influxdb_api_v2},
+                {bridge_name, Name},
+                {bridge_config, InfluxDBConfig},
                 {influxdb_name, Name}
                 | Config
             ];
@@ -216,12 +232,13 @@ end_per_group(Group, Config) when
     Group =:= apiv2_tcp;
     Group =:= apiv2_tls
 ->
+    Apps = ?config(apps, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     EHttpcPoolName = ?config(ehttpc_pool_name, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     ehttpc_sup:stop_pool(EHttpcPoolName),
-    delete_bridge(Config),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
@@ -243,14 +260,6 @@ end_per_testcase(_Testcase, Config) ->
 %%------------------------------------------------------------------------------
 %% Helper fns
 %%------------------------------------------------------------------------------
-
-start_apps() ->
-    %% some configs in emqx_conf app are mandatory
-    %% we want to make sure they are loaded before
-    %% ekka start in emqx_common_test_helpers:start_apps/1
-    emqx_common_test_helpers:render_and_load_app_config(emqx_conf),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:start_apps([emqx_resource, emqx_bridge, emqx_rule_engine]).
 
 example_write_syntax() ->
     %% N.B.: this single space character is relevant
@@ -439,6 +448,7 @@ query_by_clientid(ClientId, Config) ->
             query => Query,
             dialect => #{
                 header => true,
+                annotations => [<<"datatype">>],
                 delimiter => <<";">>
             }
         }),
@@ -450,6 +460,7 @@ query_by_clientid(ClientId, Config) ->
             _Timeout = 10_000,
             _Retry = 0
         ),
+    %ct:pal("raw body: ~p", [RawBody0]),
     RawBody1 = iolist_to_binary(string:replace(RawBody0, <<"\r\n">>, <<"\n">>, all)),
     {ok, DecodedCSV0} = erl_csv:decode(RawBody1, #{separator => <<$;>>}),
     DecodedCSV1 = [
@@ -459,21 +470,26 @@ query_by_clientid(ClientId, Config) ->
     DecodedCSV2 = csv_lines_to_maps(DecodedCSV1),
     index_by_field(DecodedCSV2).
 
-csv_lines_to_maps([Title | Rest]) ->
-    csv_lines_to_maps(Rest, Title, _Acc = []);
+csv_lines_to_maps([[<<"#datatype">> | DataType], Title | Rest]) ->
+    csv_lines_to_maps(Rest, Title, _Acc = [], DataType);
 csv_lines_to_maps([]) ->
     [].
 
-csv_lines_to_maps([[<<"_result">> | _] = Data | RestData], Title, Acc) ->
+csv_lines_to_maps([[<<"_result">> | _] = Data | RestData], Title, Acc, DataType) ->
+    %ct:pal("data: ~p, title: ~p, datatype: ~p", [Data, Title, DataType]),
     Map = maps:from_list(lists:zip(Title, Data)),
-    csv_lines_to_maps(RestData, Title, [Map | Acc]);
+    MapT = lists:zip(Title, DataType),
+    [Type] = [T || {<<"_value">>, T} <- MapT],
+    csv_lines_to_maps(RestData, Title, [Map#{'_value_type' => Type} | Acc], DataType);
 %% ignore the csv title line
 %% it's always like this:
 %% [<<"result">>,<<"table">>,<<"_start">>,<<"_stop">>,
 %% <<"_time">>,<<"_value">>,<<"_field">>,<<"_measurement">>, Measurement],
-csv_lines_to_maps([[<<"result">> | _] = _Title | RestData], Title, Acc) ->
-    csv_lines_to_maps(RestData, Title, Acc);
-csv_lines_to_maps([], _Title, Acc) ->
+csv_lines_to_maps([[<<"result">> | _] = _Title | RestData], Title, Acc, DataType) ->
+    csv_lines_to_maps(RestData, Title, Acc, DataType);
+csv_lines_to_maps([[<<"#datatype">> | DataType] | RestData], Title, Acc, _) ->
+    csv_lines_to_maps(RestData, Title, Acc, DataType);
+csv_lines_to_maps([], _Title, Acc, _DataType) ->
     lists:reverse(Acc).
 
 index_by_field(DecodedCSV) ->
@@ -488,11 +504,21 @@ assert_persisted_data(ClientId, Expected, PersistedData) ->
                     #{<<"_value">> := ExpectedValue},
                     maps:get(ClientIdIntKey, PersistedData)
                 );
+            (Key, {ExpectedValue, ExpectedType}) ->
+                ?assertMatch(
+                    #{<<"_value">> := ExpectedValue, '_value_type' := ExpectedType},
+                    maps:get(atom_to_binary(Key), PersistedData),
+                    #{
+                        key => Key,
+                        expected_value => ExpectedValue,
+                        expected_data_type => ExpectedType
+                    }
+                );
             (Key, ExpectedValue) ->
                 ?assertMatch(
                     #{<<"_value">> := ExpectedValue},
                     maps:get(atom_to_binary(Key), PersistedData),
-                    #{expected => ExpectedValue}
+                    #{key => Key, expected_value => ExpectedValue}
                 )
         end,
         Expected
@@ -531,11 +557,11 @@ t_start_ok(Config) ->
         begin
             case QueryMode of
                 async ->
-                    ?assertMatch(ok, send_message(Config, SentData)),
-                    ct:sleep(500);
+                    ?assertMatch(ok, send_message(Config, SentData));
                 sync ->
                     ?assertMatch({ok, 204, _}, send_message(Config, SentData))
             end,
+            ct:sleep(1500),
             PersistedData = query_by_clientid(ClientId, Config),
             Expected = #{
                 bool => <<"true">>,
@@ -570,6 +596,10 @@ t_start_ok(Config) ->
     ),
     ok.
 
+t_start_stop(Config) ->
+    ok = emqx_bridge_testlib:t_start_stop(Config, influxdb_client_stopped),
+    ok.
+
 t_start_already_started(Config) ->
     Type = influxdb_type_bin(?config(influxdb_type, Config)),
     Name = ?config(influxdb_name, Config),
@@ -584,8 +614,11 @@ t_start_already_started(Config) ->
     {ok, #{bridges := #{TypeAtom := #{NameAtom := InfluxDBConfigMap}}}} = emqx_hocon:check(
         emqx_bridge_schema, InfluxDBConfigString
     ),
+    ConnConfigMap = emqx_bridge_influxdb_connector:transform_bridge_v1_config_to_connector_config(
+        InfluxDBConfigMap
+    ),
     ?check_trace(
-        emqx_bridge_influxdb_connector:on_start(ResourceId, InfluxDBConfigMap),
+        emqx_bridge_influxdb_connector:on_start(ResourceId, ConnConfigMap),
         fun(Result, Trace) ->
             ?assertMatch({ok, _}, Result),
             ?assertMatch([_], ?of_kind(influxdb_connector_start_already_started, Trace)),
@@ -676,7 +709,15 @@ t_const_timestamp(Config) ->
             Config,
             #{
                 <<"write_syntax">> =>
-                    <<"mqtt,clientid=${clientid} foo=${payload.foo}i,bar=5i ", ConstBin/binary>>
+                    <<
+                        "mqtt,clientid=${clientid} "
+                        "foo=${payload.foo}i,"
+                        "foo1=${payload.foo},"
+                        "foo2=\"${payload.foo}\","
+                        "foo3=\"${payload.foo}somestr\","
+                        "bar=5i,baz0=1.1,baz1=\"a\",baz2=\"ai\",baz3=\"au\",baz4=\"1u\" ",
+                        ConstBin/binary
+                    >>
             }
         )
     ),
@@ -690,13 +731,24 @@ t_const_timestamp(Config) ->
     },
     case QueryMode of
         async ->
-            ?assertMatch(ok, send_message(Config, SentData)),
-            ct:sleep(500);
+            ?assertMatch(ok, send_message(Config, SentData));
         sync ->
             ?assertMatch({ok, 204, _}, send_message(Config, SentData))
     end,
+    ct:sleep(1500),
     PersistedData = query_by_clientid(ClientId, Config),
-    Expected = #{foo => <<"123">>},
+    Expected = #{
+        foo => {<<"123">>, <<"long">>},
+        foo1 => {<<"123">>, <<"double">>},
+        foo2 => {<<"123">>, <<"string">>},
+        foo3 => {<<"123somestr">>, <<"string">>},
+        bar => {<<"5">>, <<"long">>},
+        baz0 => {<<"1.1">>, <<"double">>},
+        baz1 => {<<"a">>, <<"string">>},
+        baz2 => {<<"ai">>, <<"string">>},
+        baz3 => {<<"au">>, <<"string">>},
+        baz4 => {<<"1u">>, <<"string">>}
+    },
     assert_persisted_data(ClientId, Expected, PersistedData),
     TimeReturned0 = maps:get(<<"_time">>, maps:get(<<"foo">>, PersistedData)),
     TimeReturned = pad_zero(TimeReturned0),
@@ -752,10 +804,7 @@ t_boolean_variants(Config) ->
                 async ->
                     ?assertMatch(ok, send_message(Config, SentData))
             end,
-            case QueryMode of
-                async -> ct:sleep(500);
-                sync -> ok
-            end,
+            ct:sleep(1500),
             PersistedData = query_by_clientid(ClientId, Config),
             Expected = #{
                 bool => atom_to_binary(Translation),
@@ -807,9 +856,10 @@ t_any_num_as_float(Config) ->
             ?assertMatch({ok, 204, _}, send_message(Config, SentData)),
             ok;
         async ->
-            ?assertMatch(ok, send_message(Config, SentData)),
-            ct:sleep(500)
+            ?assertMatch(ok, send_message(Config, SentData))
     end,
+    %% sleep is still need even in sync mode, or we would get an empty result sometimes
+    ct:sleep(1500),
     PersistedData = query_by_clientid(ClientId, Config),
     Expected = #{float_no_dp => <<"123">>, float_dp => <<"123">>},
     assert_persisted_data(ClientId, Expected, PersistedData),
@@ -817,7 +867,58 @@ t_any_num_as_float(Config) ->
     TimeReturned = pad_zero(TimeReturned0),
     ?assertEqual(TsStr, TimeReturned).
 
+t_tag_set_use_literal_value(Config) ->
+    QueryMode = ?config(query_mode, Config),
+    Const = erlang:system_time(nanosecond),
+    ConstBin = integer_to_binary(Const),
+    TsStr = iolist_to_binary(
+        calendar:system_time_to_rfc3339(Const, [{unit, nanosecond}, {offset, "Z"}])
+    ),
+    ?assertMatch(
+        {ok, _},
+        create_bridge(
+            Config,
+            #{
+                <<"write_syntax">> =>
+                    <<"mqtt,clientid=${clientid},tag_key1=100,tag_key2=123.4,tag_key3=66i,tag_key4=${payload.float_dp}",
+                        " ",
+                        "field_key1=100.1,field_key2=100i,field_key3=${payload.float_dp},bar=5i",
+                        " ", ConstBin/binary>>
+            }
+        )
+    ),
+    ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
+    Payload = #{
+        %% with decimal point
+        float_dp => 123.4
+    },
+    SentData = #{
+        <<"clientid">> => ClientId,
+        <<"topic">> => atom_to_binary(?FUNCTION_NAME),
+        <<"payload">> => Payload,
+        <<"timestamp">> => erlang:system_time(millisecond)
+    },
+    case QueryMode of
+        sync ->
+            ?assertMatch({ok, 204, _}, send_message(Config, SentData)),
+            ok;
+        async ->
+            ?assertMatch(ok, send_message(Config, SentData))
+    end,
+    %% sleep is still need even in sync mode, or we would get an empty result sometimes
+    ct:sleep(1500),
+    PersistedData = query_by_clientid(ClientId, Config),
+    Expected = #{field_key1 => <<"100.1">>, field_key2 => <<"100">>, field_key3 => <<"123.4">>},
+    assert_persisted_data(ClientId, Expected, PersistedData),
+    TimeReturned0 = maps:get(<<"_time">>, maps:get(<<"field_key1">>, PersistedData)),
+    TimeReturned = pad_zero(TimeReturned0),
+    ?assertEqual(TsStr, TimeReturned).
+
 t_bad_timestamp(Config) ->
+    test_bad_timestamp(Config, <<"bad_timestamp">>, non_integer_timestamp),
+    test_bad_timestamp(Config, <<"${timestamp}000">>, unsupported_placeholder_usage_for_timestamp).
+
+test_bad_timestamp(Config, Timestamp, ErrTag) ->
     InfluxDBType = ?config(influxdb_type, Config),
     InfluxDBName = ?config(influxdb_name, Config),
     QueryMode = ?config(query_mode, Config),
@@ -832,7 +933,7 @@ t_bad_timestamp(Config) ->
         %% N.B.: this single space characters are relevant
         <<"${topic}", " ", "payload=${payload},", "${clientid}_int_value=${payload.int_key}i,",
             "uint_value=${payload.uint_key}u,"
-            "bool=${payload.bool}", " ", "bad_timestamp">>,
+            "bool=${payload.bool}", " ", Timestamp/binary>>,
     %% append this to override the config
     InfluxDBConfigString1 =
         io_lib:format(
@@ -886,16 +987,16 @@ t_bad_timestamp(Config) ->
                         [
                             #{
                                 error := [
-                                    {error, {bad_timestamp, <<"bad_timestamp">>}}
+                                    {error, {bad_timestamp, {ErrTag, _}}}
                                 ]
                             }
                         ],
                         ?of_kind(influxdb_connector_send_query_error, Trace)
                     );
                 {sync, false} ->
-                    ?assertEqual(
+                    ?assertMatch(
                         {error, [
-                            {error, {bad_timestamp, <<"bad_timestamp">>}}
+                            {error, {bad_timestamp, {ErrTag, _}}}
                         ]},
                         Return
                     );
@@ -928,10 +1029,15 @@ t_create_disconnected(Config) ->
             ?assertMatch({ok, _}, create_bridge(Config))
         end),
         fun(Trace) ->
-            ?assertMatch(
-                [#{error := influxdb_client_not_alive, reason := econnrefused}],
-                ?of_kind(influxdb_connector_start_failed, Trace)
-            ),
+            [#{error := influxdb_client_not_alive, reason := Reason}] =
+                ?of_kind(influxdb_connector_start_failed, Trace),
+            case Reason of
+                econnrefused -> ok;
+                closed -> ok;
+                {closed, _} -> ok;
+                {shutdown, closed} -> ok;
+                _ -> ct:fail("influxdb_client_not_alive with wrong reason: ~p", [Reason])
+            end,
             ok
         end
     ),
@@ -1136,10 +1242,8 @@ t_authentication_error(Config0) ->
     ok.
 
 t_authentication_error_on_get_status(Config0) ->
-    ResourceId = resource_id(Config0),
-
     % Fake initialization to simulate credential update after bridge was created.
-    emqx_common_test_helpers:with_mock(
+    ResourceId = emqx_common_test_helpers:with_mock(
         influxdb,
         check_auth,
         fun(_) ->
@@ -1155,20 +1259,20 @@ t_authentication_error_on_get_status(Config0) ->
                 end,
             Config = lists:keyreplace(influxdb_config, 1, Config0, {influxdb_config, InfluxConfig}),
             {ok, _} = create_bridge(Config),
+            ResourceId = resource_id(Config0),
             ?retry(
                 _Sleep = 1_000,
                 _Attempts = 10,
                 ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
-            )
+            ),
+            ResourceId
         end
     ),
-
     % Now back to wrong credentials
     ?assertEqual({ok, disconnected}, emqx_resource_manager:health_check(ResourceId)),
     ok.
 
 t_authentication_error_on_send_message(Config0) ->
-    ResourceId = resource_id(Config0),
     QueryMode = proplists:get_value(query_mode, Config0, sync),
     InfluxDBType = ?config(influxdb_type, Config0),
     InfluxConfig0 = proplists:get_value(influxdb_config, Config0),
@@ -1188,6 +1292,7 @@ t_authentication_error_on_send_message(Config0) ->
         end,
         fun() ->
             {ok, _} = create_bridge(Config),
+            ResourceId = resource_id(Config),
             ?retry(
                 _Sleep = 1_000,
                 _Attempts = 10,

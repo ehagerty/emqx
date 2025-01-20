@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -41,16 +41,22 @@
 ]).
 
 -export_type([
+    share/0
+]).
+
+-export_type([
     socktype/0,
     sockstate/0,
     conninfo/0,
     clientinfo/0,
+    tns/0,
     clientid/0,
     username/0,
     password/0,
     peerhost/0,
     peername/0,
-    protocol/0
+    protocol/0,
+    client_attrs/0
 ]).
 
 -export_type([
@@ -96,12 +102,13 @@
 
 -export_type([
     banned/0,
+    banned_who/0,
     command/0
 ]).
 
 -export_type([
     caps/0,
-    attrs/0,
+    channel_attrs/0,
     infos/0,
     stats/0
 ]).
@@ -109,6 +116,8 @@
 -export_type([oom_policy/0]).
 
 -export_type([takeover_data/0]).
+
+-export_type([startlink_ret/0]).
 
 -type proto_ver() ::
     ?MQTT_PROTO_V3
@@ -136,10 +145,12 @@
 
 -type subid() :: binary() | atom().
 
--type group() :: binary() | undefined.
+-type group() :: binary().
 -type topic() :: binary().
 -type word() :: '' | '+' | '#' | binary().
 -type words() :: list(word()).
+
+-type share() :: #share{}.
 
 -type socktype() :: tcp | udp | ssl | proxy | atom().
 -type sockstate() :: idle | running | blocked | closed.
@@ -164,7 +175,7 @@
     atom() => term()
 }.
 -type clientinfo() :: #{
-    zone := maybe(zone()),
+    zone := option(zone()),
     protocol := protocol(),
     peerhost := peerhost(),
     sockport := non_neg_integer(),
@@ -172,18 +183,23 @@
     username := username(),
     is_bridge := boolean(),
     is_superuser := boolean(),
-    mountpoint := maybe(binary()),
-    ws_cookie => maybe(list()),
-    password => maybe(binary()),
+    mountpoint := option(binary()),
+    ws_cookie => option(list()),
+    password => option(binary()),
     auth_result => auth_result(),
     anonymous => boolean(),
     cn => binary(),
     dn => binary(),
+    %% Extra client attributes, commented out for bpapi spec backward compatibility.
+    %% This field is never used in RPC calls.
+    %% client_attrs => client_attrs(),
     atom() => term()
 }.
+-type client_attrs() :: #{binary() => binary()}.
+-type tns() :: binary().
 -type clientid() :: binary() | atom().
--type username() :: maybe(binary()).
--type password() :: maybe(binary()).
+-type username() :: option(binary()).
+-type password() :: option(binary()).
 -type peerhost() :: inet:ip_address().
 -type peername() ::
     {inet:ip_address(), inet:port_number()}
@@ -207,15 +223,14 @@
     rap := 0 | 1,
     nl := 0 | 1,
     qos := qos(),
-    share => binary(),
     atom() => term()
 }.
 -type reason_code() :: 0..16#FF.
 -type packet_id() :: 1..16#FFFF.
 -type alias_id() :: 0..16#FFFF.
 -type topic_aliases() :: #{
-    inbound => maybe(map()),
-    outbound => maybe(map())
+    inbound => option(map()),
+    outbound => option(map())
 }.
 -type properties() :: #{atom() => term()}.
 -type topic_filters() :: list({topic(), subopts()}).
@@ -238,19 +253,34 @@
 }.
 
 -type banned() :: #banned{}.
+-type banned_who() ::
+    {clientid, binary()}
+    | {peerhost, inet:ip_address()}
+    | {username, binary()}
+    | {clientid_re, {_RE :: tuple(), binary()}}
+    | {username_re, {_RE :: tuple(), binary()}}
+    | {peerhost_net, esockd_cidr:cidr()}.
+
 -type deliver() :: {deliver, topic(), message()}.
 -type delivery() :: #delivery{}.
 -type deliver_result() :: ok | {ok, non_neg_integer()} | {error, term()}.
--type publish_result() :: [
-    {node(), topic(), deliver_result()}
-    | {share, topic(), deliver_result()}
-].
+-type publish_result() ::
+    [
+        {node(), topic(), deliver_result()}
+        | {share, topic(), deliver_result()}
+        | {emqx_external_broker:dest(), topic(), deliver_result()}
+        | persisted
+    ]
+    %% If schema validation failure action is set to `disconnect'.
+    | disconnect
+    %% If caller specifies `hook_prohibition_as_error => true'.
+    | {blocked, message()}.
 -type route() :: #route{}.
 -type route_entry() :: {topic(), node()} | {topic, group()}.
 -type command() :: #command{}.
 
 -type caps() :: emqx_mqtt_caps:caps().
--type attrs() :: #{atom() => term()}.
+-type channel_attrs() :: #{atom() => term()}.
 -type infos() :: #{atom() => term()}.
 -type stats() :: [{atom(), term()}].
 

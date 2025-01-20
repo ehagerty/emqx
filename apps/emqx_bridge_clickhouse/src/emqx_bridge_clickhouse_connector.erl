@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_clickhouse_connector).
@@ -23,17 +23,24 @@
 -export([
     roots/0,
     fields/1,
-    values/1
+    values/1,
+    namespace/0
 ]).
 
 %% callbacks for behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channel_status/3,
+    on_get_channels/1,
     on_query/3,
     on_batch_query/3,
-    on_get_status/2
+    on_get_status/2,
+    on_format_query_result/1
 ]).
 
 %% callbacks for ecpool
@@ -43,6 +50,10 @@
 -export([
     execute_sql_in_clickhouse_server_using_connection/2
 ]).
+
+-ifdef(TEST).
+-export([split_clickhouse_insert_sql/1]).
+-endif.
 
 %%=====================================================================
 %% Types
@@ -61,6 +72,7 @@
 
 -type state() ::
     #{
+        channels => #{binary() => templates()},
         templates := templates(),
         pool_name := binary(),
         connect_timeout := pos_integer()
@@ -69,8 +81,79 @@
 -type clickhouse_config() :: map().
 
 %%=====================================================================
+%% Macros and On load
+%%=====================================================================
+
+%% Copied from emqx_utils_sql:parse_insert/1
+%% Can also handle Clickhouse's SQL extension for INSERT statments that allows the
+%% user to specify different formats:
+%%
+%% https://clickhouse.com/docs/en/sql-reference/statements/insert-into/
+%%
+-define(INSERT_RE_MP_KEY, {?MODULE, insert_re_mp}).
+-define(INSERT_RE_BIN, <<
+    %% case-insensitive
+    "(?i)^",
+    %% Leading spaces
+    "\\s*",
+    %% Group-1: insert into, table name and columns (when existed).
+    %% All space characters suffixed to <TABLE_NAME> will be kept
+    %% `INSERT INTO <TABLE_NAME> [(<COLUMN>, ..)]`
+    "(insert\\s+into\\s+[^\\s\\(\\)]+\\s*(?:(?:\\((?:[^()]++|(?2))*\\)\\s*,?\\s*)*))",
+    "\\s*",
+    %% Ignore Group
+    "(?:",
+    %% Group-2 (Optional for FORMAT clause):
+    %% literals value(s) or placeholder(s) with round brackets.
+    %% And the sub-pattern in brackets does not do any capturing
+    %% Ignore Group:
+    %%     `VALUES [([<VALUE> | <PLACEHOLDER>], ...)]`
+    %% Keep Capturing-Group:
+    %%     `([<VALUE> | <PLACEHOLDER>], ...) [, ([<VALUE> | <PLACEHOLDER>], ..)]`
+    "(?:values\\s*(\\((?:[^()]++|(?2))*\\)(?:\\s*,\\s*\\((?:[^()]++|(?2)*)\\))*)\\s*;?\\s*)",
+    %% End Group-2
+    %% or
+    "|",
+    %% Group-3:
+    %% literals value(s) or placeholder(s) as `<FORMAT_DATA>`
+    %% Ignore Group:
+    %%     `FORMAT <FORMAT_NAME> <FORMAT_DATA>`
+    %% Keep Capturing-Group `<FORMAT_DATA>` without any check
+    %%   Could be:
+    %%     `([<VALUE> | <PLACEHOLDER>], ...) [, ([<VALUE> | <PLACEHOLDER>], ...)]`
+    %%     `[([<VALUE> | <PLACEHOLDER>], ...) [, ([<VALUE> | <PLACEHOLDER>], ...)]]`
+    %%     ...
+    "(?:format\\s+[a-zA-Z]+\\s+)((?!\\s)(?=.*\\s).*)",
+    %% End Group-3
+    ")",
+    %% End Ignored Group
+    "\\s*$"
+>>).
+
+-on_load(on_load/0).
+
+on_load() ->
+    put_insert_mp(),
+    ok.
+
+put_insert_mp() ->
+    persistent_term:put(?INSERT_RE_MP_KEY, re:compile(?INSERT_RE_BIN)),
+    ok.
+
+get_insert_mp() ->
+    case persistent_term:get(?INSERT_RE_MP_KEY, undefined) of
+        undefined ->
+            ok = put_insert_mp(),
+            get_insert_mp();
+        {ok, MP} ->
+            {ok, MP}
+    end.
+
+%%=====================================================================
 %% Configuration and default values
 %%=====================================================================
+
+namespace() -> clickhouse.
 
 roots() ->
     [{config, #{type => hoconsc:ref(?MODULE, config)}}].
@@ -119,6 +202,7 @@ values(_) ->
 %% ===================================================================
 %% Callbacks defined in emqx_resource
 %% ===================================================================
+resource_type() -> clickhouse.
 
 callback_mode() -> always_sync.
 
@@ -145,17 +229,16 @@ on_start(
     Options = [
         {url, URL},
         {user, maps:get(username, Config, "default")},
-        {key, emqx_secret:wrap(maps:get(password, Config, "public"))},
+        {key, maps:get(password, Config, emqx_secret:wrap("public"))},
         {database, DB},
         {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
         {pool_size, PoolSize},
         {pool, InstanceID}
     ],
     try
-        Templates = prepare_sql_templates(Config),
         State = #{
+            channels => #{},
             pool_name => InstanceID,
-            templates => Templates,
             connect_timeout => ConnectTimeout
         },
         case emqx_resource_pool:start(InstanceID, ?MODULE, Options) of
@@ -192,10 +275,8 @@ prepare_sql_templates(#{
     sql := Template,
     batch_value_separator := Separator
 }) ->
-    InsertTemplate =
-        emqx_placeholder:preproc_tmpl(Template),
-    BulkExtendInsertTemplate =
-        prepare_sql_bulk_extend_template(Template, Separator),
+    InsertTemplate = emqx_placeholder:preproc_tmpl(Template),
+    BulkExtendInsertTemplate = prepare_sql_bulk_extend_template(Template, Separator),
     #{
         send_message_template => InsertTemplate,
         extend_send_message_template => BulkExtendInsertTemplate
@@ -212,37 +293,26 @@ prepare_sql_bulk_extend_template(Template, Separator) ->
     ExtendParamTemplate = iolist_to_binary([Separator, ValuesTemplate]),
     emqx_placeholder:preproc_tmpl(ExtendParamTemplate).
 
-%% This function is similar to emqx_utils_sql:parse_insert/1 but can
-%% also handle Clickhouse's SQL extension for INSERT statments that allows the
-%% user to specify different formats:
-%%
-%% https://clickhouse.com/docs/en/sql-reference/statements/insert-into/
-%%
 split_clickhouse_insert_sql(SQL) ->
     ErrorMsg = <<"The SQL template should be an SQL INSERT statement but it is something else.">>,
-    case
-        re:split(SQL, "(\\s+(?i:values)|(?i:format\\s+(?:[A-Za-z0-9_])+)\\s+)", [{return, binary}])
-    of
-        [Part1, _, Part3] ->
-            case string:trim(Part1, leading) of
-                <<"insert", _/binary>> ->
-                    Part3;
-                <<"INSERT", _/binary>> ->
-                    Part3;
-                _ ->
-                    erlang:error(ErrorMsg)
-            end;
+    {ok, MP} = get_insert_mp(),
+    case re:run(SQL, MP, [{capture, all_but_first, binary}]) of
+        {match, [_InsertInto, ValuesTemplate]} ->
+            ValuesTemplate;
+        %% Group2 is empty (not `VALUES` statement)
+        {match, [_InsertInto, <<>>, FormatTemplate]} ->
+            FormatTemplate;
         _ ->
             erlang:error(ErrorMsg)
     end.
 
 % This is a callback for ecpool which is triggered by the call to
 % emqx_resource_pool:start in on_start/2
-
 connect(Options) ->
     URL = iolist_to_binary(emqx_http_lib:normalize(proplists:get_value(url, Options))),
     User = proplists:get_value(user, Options),
     Database = proplists:get_value(database, Options),
+    %% TODO: teach `clickhouse` to accept 0-arity closures as passwords.
     Key = emqx_secret:unwrap(proplists:get_value(key, Options)),
     Pool = proplists:get_value(pool, Options),
     PoolSize = proplists:get_value(pool_size, Options),
@@ -282,18 +352,41 @@ on_stop(InstanceID, _State) ->
     emqx_resource_pool:stop(InstanceID).
 
 %% -------------------------------------------------------------------
+%% channel related emqx_resouce callbacks
+%% -------------------------------------------------------------------
+on_add_channel(_InstId, #{channels := Channs} = OldState, ChannId, ChannConf0) ->
+    #{parameters := ChannelConf} = ChannConf0,
+    NewChanns = Channs#{
+        ChannId => #{templates => prepare_sql_templates(ChannelConf), channel_conf => ChannelConf}
+    },
+    {ok, OldState#{channels => NewChanns}}.
+
+on_remove_channel(_InstanceId, #{channels := Channels} = State, ChannId) ->
+    NewState = State#{channels => maps:remove(ChannId, Channels)},
+    {ok, NewState}.
+
+on_get_channel_status(InstanceId, _ChannId, State) ->
+    case on_get_status(InstanceId, State) of
+        ?status_connected -> ?status_connected;
+        {?status_disconnected, _} -> ?status_disconnected
+    end.
+
+on_get_channels(InstanceId) ->
+    emqx_bridge_v2:get_channels_for_connector(InstanceId).
+
+%% -------------------------------------------------------------------
 %% on_get_status emqx_resouce callback and related functions
 %% -------------------------------------------------------------------
 
 on_get_status(
     _InstanceID,
-    #{pool_name := PoolName, connect_timeout := Timeout} = State
+    #{pool_name := PoolName, connect_timeout := Timeout}
 ) ->
     case do_get_status(PoolName, Timeout) of
         ok ->
-            {connected, State};
+            ?status_connected;
         {error, Reason} ->
-            {disconnected, State, Reason}
+            {?status_disconnected, Reason}
     end.
 
 do_get_status(PoolName, Timeout) ->
@@ -335,8 +428,8 @@ do_get_status(PoolName, Timeout) ->
 
 -spec on_query
     (resource_id(), Request, resource_state()) -> query_result() when
-        Request :: {RequestType, Data},
-        RequestType :: send_message,
+        Request :: {ChannId, Data},
+        ChannId :: binary(),
         Data :: map();
     (resource_id(), Request, resource_state()) -> query_result() when
         Request :: {RequestType, SQL},
@@ -349,7 +442,7 @@ on_query(
     #{pool_name := PoolName} = State
 ) ->
     ?SLOG(debug, #{
-        msg => "clickhouse connector received sql query",
+        msg => "clickhouse_connector_received_sql_query",
         connector => ResourceID,
         type => RequestType,
         sql => DataOrSQL,
@@ -357,14 +450,28 @@ on_query(
     }),
     %% Have we got a query or data to fit into an SQL template?
     SimplifiedRequestType = query_type(RequestType),
-    #{templates := Templates} = State,
-    SQL = get_sql(SimplifiedRequestType, Templates, DataOrSQL),
-    ClickhouseResult = execute_sql_in_clickhouse_server(PoolName, SQL),
+    ChannelState = get_channel_state(RequestType, State),
+    Templates = get_templates(RequestType, State),
+    SQL = get_sql(
+        SimplifiedRequestType, Templates, DataOrSQL, maps:get(channel_conf, ChannelState, #{})
+    ),
+    ClickhouseResult = execute_sql_in_clickhouse_server(RequestType, PoolName, SQL),
     transform_and_log_clickhouse_result(ClickhouseResult, ResourceID, SQL).
 
-get_sql(send_message, #{send_message_template := PreparedSQL}, Data) ->
-    emqx_placeholder:proc_tmpl(PreparedSQL, Data);
-get_sql(_, _, SQL) ->
+get_templates(ChannId, State) ->
+    maps:get(templates, get_channel_state(ChannId, State), #{}).
+
+get_channel_state(ChannId, State) ->
+    case maps:find(channels, State) of
+        {ok, Channels} ->
+            maps:get(ChannId, Channels, #{});
+        error ->
+            #{}
+    end.
+
+get_sql(channel_message, #{send_message_template := PreparedSQL}, Data, ChannelConf) ->
+    proc_nullable_tmpl(PreparedSQL, Data, ChannelConf);
+get_sql(_, _, SQL, _) ->
     SQL.
 
 query_type(sql) ->
@@ -372,65 +479,63 @@ query_type(sql) ->
 query_type(query) ->
     query;
 %% Data that goes to bridges use the prepared template
-query_type(send_message) ->
-    send_message.
+query_type(ChannId) when is_binary(ChannId) ->
+    channel_message.
 
 %% -------------------------------------------------------------------
 %% on_batch_query emqx_resouce callback and related functions
 %% -------------------------------------------------------------------
 
 -spec on_batch_query(resource_id(), BatchReq, resource_state()) -> query_result() when
-    BatchReq :: nonempty_list({'send_message', map()}).
+    BatchReq :: nonempty_list({binary(), map()}).
 
-on_batch_query(
-    ResourceID,
-    BatchReq,
-    #{pool_name := PoolName, templates := Templates} = _State
-) ->
-    %% Currently we only support batch requests with the send_message key
-    {Keys, ObjectsToInsert} = lists:unzip(BatchReq),
-    ensure_keys_are_of_type_send_message(Keys),
+on_batch_query(ResourceID, BatchReq, #{pool_name := PoolName} = State) ->
+    %% Currently we only support batch requests with a binary ChannId
+    {[ChannId | _] = Keys, ObjectsToInsert} = lists:unzip(BatchReq),
+    ensure_channel_messages(Keys),
+    Templates = get_templates(ChannId, State),
+    ChannelState = get_channel_state(ChannId, State),
     %% Create batch insert SQL statement
-    SQL = objects_to_sql(ObjectsToInsert, Templates),
+    SQL = objects_to_sql(ObjectsToInsert, Templates, maps:get(channel_conf, ChannelState, #{})),
     %% Do the actual query in the database
-    ResultFromClickhouse = execute_sql_in_clickhouse_server(PoolName, SQL),
+    ResultFromClickhouse = execute_sql_in_clickhouse_server(ChannId, PoolName, SQL),
     %% Transform the result to a better format
     transform_and_log_clickhouse_result(ResultFromClickhouse, ResourceID, SQL).
 
-ensure_keys_are_of_type_send_message(Keys) ->
-    case lists:all(fun is_send_message_atom/1, Keys) of
+ensure_channel_messages(Keys) ->
+    case lists:all(fun is_binary/1, Keys) of
         true ->
             ok;
         false ->
             erlang:error(
-                {unrecoverable_error,
-                    <<"Unexpected type for batch message (Expected send_message)">>}
+                {unrecoverable_error, <<"Unexpected type for batch message (Expected channel-id)">>}
             )
     end.
-
-is_send_message_atom(send_message) ->
-    true;
-is_send_message_atom(_) ->
-    false.
 
 objects_to_sql(
     [FirstObject | RemainingObjects] = _ObjectsToInsert,
     #{
         send_message_template := InsertTemplate,
         extend_send_message_template := BulkExtendInsertTemplate
-    }
+    },
+    ChannelConf
 ) ->
     %% Prepare INSERT-statement and the first row after VALUES
-    InsertStatementHead = emqx_placeholder:proc_tmpl(InsertTemplate, FirstObject),
+    InsertStatementHead = proc_nullable_tmpl(InsertTemplate, FirstObject, ChannelConf),
     FormatObjectDataFunction =
         fun(Object) ->
-            emqx_placeholder:proc_tmpl(BulkExtendInsertTemplate, Object)
+            proc_nullable_tmpl(BulkExtendInsertTemplate, Object, ChannelConf)
         end,
     InsertStatementTail = lists:map(FormatObjectDataFunction, RemainingObjects),
     CompleteStatement = erlang:iolist_to_binary([InsertStatementHead, InsertStatementTail]),
     CompleteStatement;
-objects_to_sql(_, _) ->
+objects_to_sql(_, _, _) ->
     erlang:error(<<"Templates for bulk insert missing.">>).
+
+proc_nullable_tmpl(Template, Data, #{undefined_vars_as_null := true}) ->
+    emqx_placeholder:proc_nullable_tmpl(Template, Data);
+proc_nullable_tmpl(Template, Data, _) ->
+    emqx_placeholder:proc_tmpl(Template, Data).
 
 %% -------------------------------------------------------------------
 %% Helper functions that are used by both on_query/3 and on_batch_query/3
@@ -438,7 +543,8 @@ objects_to_sql(_, _) ->
 
 %% This function is used by on_query/3 and on_batch_query/3 to send a query to
 %% the database server and receive a result
-execute_sql_in_clickhouse_server(PoolName, SQL) ->
+execute_sql_in_clickhouse_server(Id, PoolName, SQL) ->
+    emqx_trace:rendered_action_template(Id, #{rendered_sql => SQL}),
     ecpool:pick_and_do(
         PoolName,
         {?MODULE, execute_sql_in_clickhouse_server_using_connection, [SQL]},
@@ -463,7 +569,7 @@ transform_and_log_clickhouse_result({ok, ResponseCode, Data}, _, _) when
     Result;
 transform_and_log_clickhouse_result(ClickhouseErrorResult, ResourceID, SQL) ->
     ?SLOG(error, #{
-        msg => "clickhouse connector do sql query failed",
+        msg => "clickhouse_connector_do_sql_query_failed",
         connector => ResourceID,
         sql => SQL,
         reason => ClickhouseErrorResult
@@ -474,7 +580,7 @@ transform_and_log_clickhouse_result(ClickhouseErrorResult, ResourceID, SQL) ->
         %% handles all error cases that we need to handle as recoverable_error
         true ->
             ?SLOG(warning, #{
-                msg => "clickhouse connector: sql query failed (recoverable)",
+                msg => "clickhouse_connector_sql_query_failed_recoverable",
                 recoverable_error => true,
                 connector => ResourceID,
                 sql => SQL,
@@ -483,7 +589,7 @@ transform_and_log_clickhouse_result(ClickhouseErrorResult, ResourceID, SQL) ->
             to_recoverable_error(ClickhouseErrorResult);
         false ->
             ?SLOG(error, #{
-                msg => "clickhouse connector: sql query failed (unrecoverable)",
+                msg => "clickhouse_connector_sql_query_failed_unrecoverable",
                 recoverable_error => false,
                 connector => ResourceID,
                 sql => SQL,
@@ -491,6 +597,13 @@ transform_and_log_clickhouse_result(ClickhouseErrorResult, ResourceID, SQL) ->
             }),
             to_error_tuple(ClickhouseErrorResult)
     end.
+
+on_format_query_result(ok) ->
+    #{result => ok, message => <<"">>};
+on_format_query_result({ok, Message}) ->
+    #{result => ok, message => Message};
+on_format_query_result(Result) ->
+    Result.
 
 to_recoverable_error({error, Reason}) ->
     {error, {recoverable_error, Reason}};

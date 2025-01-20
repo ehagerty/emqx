@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3_uploader_SUITE).
@@ -33,10 +33,13 @@
     )
 ).
 
+-define(VHOST_BUCKET, "test1").
+
 all() ->
     [
         {group, tcp},
-        {group, tls}
+        {group, tls},
+        {group, vhost}
     ].
 
 groups() ->
@@ -49,28 +52,35 @@ groups() ->
             {group, common_cases},
             {group, tls_cases}
         ]},
-        {common_cases, [], [
-            t_happy_path_simple_put,
-            t_happy_path_multi,
-            t_abort_multi,
-            t_abort_simple_put,
-            t_signed_url_download,
-            t_signed_nonascii_url_download,
+        {vhost, [], [
+            {group, happy_cases}
+        ]},
 
+        {common_cases, [], [
+            {group, happy_cases},
             {group, noconn_errors},
             {group, timeout_errors},
             {group, http_errors}
         ]},
 
+        {happy_cases, [], [
+            t_happy_path_simple_put,
+            t_happy_path_multi,
+            t_abort_multi,
+            t_abort_simple_put,
+            t_signed_url_download,
+            t_signed_nonascii_url_download
+        ]},
+
         {tcp_cases, [
             t_config_switch,
-            t_config_switch_http_settings,
             t_too_large,
             t_no_profile
         ]},
 
         {tls_cases, [
-            t_tls_error
+            t_tls_error,
+            t_config_switch_http_settings
         ]},
 
         {noconn_errors, [{group, transport_errors}]},
@@ -97,12 +107,14 @@ end_per_suite(_Config) ->
 
 init_per_group(Group, Config) when Group =:= tcp orelse Group =:= tls ->
     [{conn_type, Group} | Config];
+init_per_group(vhost, Config) ->
+    [{conn_type, {tcp, direct}}, {access_method, vhost} | Config];
 init_per_group(noconn_errors, Config) ->
     [{failure, down} | Config];
 init_per_group(timeout_errors, Config) ->
     [{failure, timeout} | Config];
 init_per_group(http_errors, Config) ->
-    [{failure, ehttpc_500} | Config];
+    [{failure, httpc_500} | Config];
 init_per_group(_ConnType, Config) ->
     Config.
 
@@ -113,15 +125,21 @@ init_per_testcase(_TestCase, Config) ->
     ok = snabbkaffe:start_trace(),
     ConnType = ?config(conn_type, Config),
     TestAwsConfig = emqx_s3_test_helpers:aws_config(ConnType),
-
-    Bucket = emqx_s3_test_helpers:unique_bucket(),
-    ok = erlcloud_s3:create_bucket(Bucket, TestAwsConfig),
-
     ProfileBaseConfig = emqx_s3_test_helpers:base_config(ConnType),
-    ProfileConfig = ProfileBaseConfig#{bucket => Bucket},
+    AccessMethod = proplists:get_value(access_method, Config, path),
+    case AccessMethod of
+        path ->
+            Bucket = emqx_s3_test_helpers:unique_bucket();
+        vhost ->
+            Bucket = ?VHOST_BUCKET
+    end,
+    ProfileConfig = ProfileBaseConfig#{
+        bucket => Bucket,
+        access_method => AccessMethod
+    },
+    ok = emqx_s3_test_helpers:recreate_bucket(Bucket, TestAwsConfig),
     ok = emqx_s3:start_profile(profile_id(), ProfileConfig),
-
-    [{bucket, Bucket}, {test_aws_config, TestAwsConfig}, {profile_config, ProfileConfig} | Config].
+    [{bucket, Bucket}, {profile_config, ProfileConfig}, {test_aws_config, TestAwsConfig} | Config].
 
 end_per_testcase(_TestCase, _Config) ->
     ok = snabbkaffe:stop(),
@@ -133,7 +151,7 @@ end_per_testcase(_TestCase, _Config) ->
 
 t_happy_path_simple_put(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -165,7 +183,7 @@ t_happy_path_simple_put(Config) ->
 
 t_happy_path_multi(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -205,7 +223,8 @@ t_signed_url_download(_Config) ->
         emqx_s3_client:uri(Client, Key)
     end),
 
-    {ok, {_, _, Body}} = httpc:request(get, {SignedUrl, []}, [], []),
+    HttpOpts = [{ssl, [{verify, verify_none}]}, {timeout, 5000}],
+    {ok, {_, _, Body}} = httpc:request(get, {SignedUrl, []}, HttpOpts, []),
 
     ?assertEqual(
         iolist_to_binary(Data),
@@ -222,7 +241,8 @@ t_signed_nonascii_url_download(_Config) ->
         emqx_s3_client:uri(Client, Key)
     end),
 
-    {ok, {_, _, Body}} = httpc:request(get, {SignedUrl, []}, [], []),
+    HttpOpts = [{ssl, [{verify, verify_none}]}, {timeout, 5000}],
+    {ok, {_, _, Body}} = httpc:request(get, {SignedUrl, []}, HttpOpts, []),
 
     ?assertEqual(
         iolist_to_binary(Data),
@@ -231,7 +251,7 @@ t_signed_nonascii_url_download(_Config) ->
 
 t_abort_multi(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -258,7 +278,7 @@ t_abort_multi(Config) ->
 
 t_abort_simple_put(_Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -276,7 +296,7 @@ t_abort_simple_put(_Config) ->
 t_config_switch(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
     OldBucket = ?config(bucket, Config),
-    {ok, Pid0} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid0} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     [Data0, Data1] = data($a, 6 * 1024 * 1024, 2),
 
@@ -302,7 +322,7 @@ t_config_switch(Config) ->
     ),
 
     %% Now check that new uploader uses new config
-    {ok, Pid1} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid1} = emqx_s3:start_uploader(profile_id(), Key, #{}),
     ok = emqx_s3_uploader:write(Pid1, Data0),
     ok = emqx_s3_uploader:complete(Pid1),
 
@@ -316,7 +336,7 @@ t_config_switch(Config) ->
 t_config_switch_http_settings(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
     OldBucket = ?config(bucket, Config),
-    {ok, Pid0} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid0} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     [Data0, Data1] = data($a, 6 * 1024 * 1024, 2),
 
@@ -343,7 +363,7 @@ t_config_switch_http_settings(Config) ->
     ),
 
     %% Now check that new uploader uses new config
-    {ok, Pid1} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid1} = emqx_s3:start_uploader(profile_id(), Key, #{}),
     ok = emqx_s3_uploader:write(Pid1, Data0),
     ok = emqx_s3_uploader:complete(Pid1),
 
@@ -358,7 +378,7 @@ t_start_multipart_error(Config) ->
     _ = process_flag(trap_exit, true),
 
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -384,7 +404,7 @@ t_upload_part_error(Config) ->
     _ = process_flag(trap_exit, true),
 
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -412,7 +432,7 @@ t_abort_multipart_error(Config) ->
     _ = process_flag(trap_exit, true),
 
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -440,7 +460,7 @@ t_complete_multipart_error(Config) ->
     _ = process_flag(trap_exit, true),
 
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -468,7 +488,7 @@ t_put_object_error(Config) ->
     _ = process_flag(trap_exit, true),
 
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -494,7 +514,7 @@ t_put_object_error(Config) ->
 
 t_too_large(Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -531,7 +551,7 @@ t_tls_error(Config) ->
     ),
     ok = emqx_s3:update_profile(profile_id(), ProfileConfig),
     Key = emqx_s3_test_helpers:unique_key(),
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 
@@ -551,7 +571,7 @@ t_no_profile(_Config) ->
     Key = emqx_s3_test_helpers:unique_key(),
     ?assertMatch(
         {error, profile_not_found},
-        emqx_s3:start_uploader(<<"no-profile">>, #{key => Key})
+        emqx_s3:start_uploader(<<"no-profile">>, Key, #{})
     ).
 
 %%--------------------------------------------------------------------
@@ -570,7 +590,7 @@ list_objects(Config) ->
     proplists:get_value(contents, Props).
 
 upload(Key, ChunkSize, ChunkCount) ->
-    {ok, Pid} = emqx_s3:start_uploader(profile_id(), #{key => Key}),
+    {ok, Pid} = emqx_s3:start_uploader(profile_id(), Key, #{}),
 
     _ = erlang:monitor(process, Pid),
 

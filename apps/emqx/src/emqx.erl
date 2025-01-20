@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -53,12 +53,6 @@
     subscribed/2
 ]).
 
-%% Hooks API
--export([
-    run_hook/2,
-    run_fold_hook/3
-]).
-
 %% Configs APIs
 -export([
     get_config/1,
@@ -67,9 +61,12 @@
     get_raw_config/2,
     update_config/2,
     update_config/3,
+    update_config/4,
     remove_config/1,
     remove_config/2,
+    remove_config/3,
     reset_config/2,
+    reset_config/3,
     data_dir/0,
     etc_file/1,
     cert_file/1,
@@ -172,15 +169,8 @@ subscribed(SubId, Topic) when is_atom(SubId); is_binary(SubId) ->
     emqx_broker:subscribed(SubId, iolist_to_binary(Topic)).
 
 %%--------------------------------------------------------------------
-%% Hooks API
+%% Config API
 %%--------------------------------------------------------------------
--spec run_hook(emqx_hooks:hookpoint(), list(any())) -> ok | stop.
-run_hook(HookPoint, Args) ->
-    emqx_hooks:run(HookPoint, Args).
-
--spec run_fold_hook(emqx_hooks:hookpoint(), list(any()), any()) -> any().
-run_fold_hook(HookPoint, Args, Acc) ->
-    emqx_hooks:run_fold(HookPoint, Args, Acc).
 
 -spec get_config(emqx_utils_maps:config_key_path()) -> term().
 get_config(KeyPath) ->
@@ -208,7 +198,7 @@ get_raw_config(KeyPath, Default) ->
 -spec update_config(emqx_utils_maps:config_key_path(), emqx_config:update_request()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 update_config(KeyPath, UpdateReq) ->
-    update_config(KeyPath, UpdateReq, #{}).
+    update_config(KeyPath, UpdateReq, #{}, #{}).
 
 -spec update_config(
     emqx_utils_maps:config_key_path(),
@@ -216,30 +206,57 @@ update_config(KeyPath, UpdateReq) ->
     emqx_config:update_opts()
 ) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
-update_config([RootName | _] = KeyPath, UpdateReq, Opts) ->
+update_config(KeyPath, UpdateReq, Opts) ->
+    update_config(KeyPath, UpdateReq, Opts, #{}).
+
+-spec update_config(
+    emqx_utils_maps:config_key_path(),
+    emqx_config:update_request(),
+    emqx_config:update_opts(),
+    emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+update_config([RootName | _] = KeyPath, UpdateReq, Opts, ClusterRpcOpts) ->
+    Mod = emqx_config:get_schema_mod(RootName),
     emqx_config_handler:update_config(
-        emqx_config:get_schema_mod(RootName),
+        Mod,
         KeyPath,
-        {{update, UpdateReq}, Opts}
+        {{update, UpdateReq}, Opts},
+        ClusterRpcOpts
     ).
 
 -spec remove_config(emqx_utils_maps:config_key_path()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 remove_config(KeyPath) ->
-    remove_config(KeyPath, #{}).
+    remove_config(KeyPath, #{}, #{}).
 
 -spec remove_config(emqx_utils_maps:config_key_path(), emqx_config:update_opts()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
-remove_config([RootName | _] = KeyPath, Opts) ->
+remove_config([_RootName | _] = KeyPath, Opts) ->
+    remove_config(KeyPath, Opts, #{}).
+
+-spec remove_config(
+    emqx_utils_maps:config_key_path(), emqx_config:update_opts(), emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+remove_config([RootName | _] = KeyPath, Opts, ClusterRpcOpts) ->
     emqx_config_handler:update_config(
         emqx_config:get_schema_mod(RootName),
         KeyPath,
-        {remove, Opts}
+        {remove, Opts},
+        ClusterRpcOpts
     ).
 
 -spec reset_config(emqx_utils_maps:config_key_path(), emqx_config:update_opts()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 reset_config([RootName | SubKeys] = KeyPath, Opts) ->
+    reset_config([RootName | SubKeys] = KeyPath, Opts, #{}).
+
+-spec reset_config(
+    emqx_utils_maps:config_key_path(), emqx_config:update_opts(), emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+reset_config([RootName | SubKeys] = KeyPath, Opts, ClusterRpcOpts) ->
     case emqx_config:get_default_value(KeyPath) of
         {ok, Default} ->
             Mod = emqx_config:get_schema_mod(RootName),
@@ -248,7 +265,8 @@ reset_config([RootName | SubKeys] = KeyPath, Opts) ->
                     emqx_config_handler:update_config(
                         Mod,
                         KeyPath,
-                        {{update, Default}, Opts}
+                        {{update, Default}, Opts},
+                        ClusterRpcOpts
                     );
                 false ->
                     NewConf =
@@ -260,7 +278,8 @@ reset_config([RootName | SubKeys] = KeyPath, Opts) ->
                     emqx_config_handler:update_config(
                         Mod,
                         [RootName],
-                        {{update, NewConf}, Opts}
+                        {{update, NewConf}, Opts},
+                        ClusterRpcOpts
                     )
             end;
         {error, _} = Error ->

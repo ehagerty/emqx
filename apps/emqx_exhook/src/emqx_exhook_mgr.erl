@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -70,6 +70,10 @@
 %% Data backup
 -export([
     import_config/1
+]).
+
+-export_type([
+    server_name/0
 ]).
 
 %% Running servers
@@ -654,7 +658,7 @@ hooks(Name) ->
 
 maybe_write_certs(#{<<"name">> := Name} = Conf) ->
     case
-        emqx_tls_lib:ensure_ssl_files(
+        emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(
             ssl_file_path(Name), maps:get(<<"ssl">>, Conf, undefined)
         )
     of

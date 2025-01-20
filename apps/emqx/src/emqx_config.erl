@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -94,9 +94,10 @@
 
 -export([ensure_atom_conf_path/2]).
 -export([load_config_files/2]).
+-export([upgrade_raw_conf/2]).
 
 -ifdef(TEST).
--export([erase_all/0, backup_and_write/2]).
+-export([erase_all/0, backup_and_write/2, cluster_hocon_file/0, base_hocon_file/0]).
 -endif.
 
 -include("logger.hrl").
@@ -117,6 +118,7 @@
     config/0,
     app_envs/0,
     update_opts/0,
+    cluster_rpc_opts/0,
     update_cmd/0,
     update_args/0,
     update_error/0,
@@ -135,7 +137,8 @@
     %%   save the updated config to the emqx_override.conf file
     %%   defaults to `true`
     persistent => boolean(),
-    override_to => local | cluster
+    override_to => local | cluster,
+    lazy_evaluator => fun((function()) -> term())
 }.
 -type update_args() :: {update_cmd(), Opts :: update_opts()}.
 -type update_stage() :: pre_config_update | post_config_update.
@@ -145,6 +148,7 @@
     raw_config => emqx_config:raw_config(),
     post_config_update => #{module() => any()}
 }.
+-type cluster_rpc_opts() :: #{kind => ?KIND_INITIATE | ?KIND_REPLICATE}.
 
 %% raw_config() is the config that is NOT parsed and translated by hocon schema
 -type raw_config() :: #{binary() => term()} | list() | undefined.
@@ -333,13 +337,23 @@ init_load(SchemaMod, Conf) when is_list(Conf) orelse is_binary(Conf) ->
             false ->
                 overlay_v1(SchemaMod, RawConf0)
         end,
-    RawConf = fill_defaults_for_all_roots(SchemaMod, RawConf1),
+    RawConf2 = upgrade_raw_conf(SchemaMod, RawConf1),
+    RawConf3 = fill_defaults_for_all_roots(SchemaMod, RawConf2),
     %% check configs against the schema
-    {AppEnvs, CheckedConf} = check_config(SchemaMod, RawConf, #{}),
+    {AppEnvs, CheckedConf} = check_config(SchemaMod, RawConf3, #{}),
     save_to_app_env(AppEnvs),
-    ok = save_to_config_map(CheckedConf, RawConf),
+    ok = save_to_config_map(CheckedConf, RawConf3),
     maybe_init_default_zone(),
     ok.
+
+upgrade_raw_conf(SchemaMod, RawConf) ->
+    case erlang:function_exported(SchemaMod, upgrade_raw_conf, 1) of
+        true ->
+            %% TODO make it a schema module behaviour in hocon_schema
+            apply(SchemaMod, upgrade_raw_conf, [RawConf]);
+        false ->
+            RawConf
+    end.
 
 %% Merge environment variable overrides on top, then merge with overrides.
 overlay_v0(SchemaMod, RawConf) when is_map(RawConf) ->
@@ -383,8 +397,13 @@ fill_defaults_for_all_roots(SchemaMod, RawConf0) ->
 %% e.g. when testing an app, we need to load its config first
 %% then start emqx_conf application which will load the
 %% possibly empty config again (then filled with defaults).
+-ifdef(TEST).
 is_already_loaded(Name) ->
     ?MODULE:get_raw([Name], #{}) =/= #{}.
+-else.
+is_already_loaded(_) ->
+    false.
+-endif.
 
 %% if a root is not found in the raw conf, fill it with default values.
 seed_default(Schema) ->
@@ -421,12 +440,13 @@ do_parse_hocon(true, Conf, IncDirs) ->
 do_parse_hocon(false, Conf, IncDirs) ->
     Opts = #{format => map, include_dirs => IncDirs},
     case is_binary(Conf) of
-        %% only use in test
         true ->
+            %% only used in test
             hocon:binary(Conf, Opts);
         false ->
+            BaseHocon = base_hocon_file(),
             ClusterFile = cluster_hocon_file(),
-            hocon:files([ClusterFile | Conf], Opts)
+            hocon:files([BaseHocon, ClusterFile | Conf], Opts)
     end.
 
 include_dirs() ->
@@ -485,6 +505,14 @@ fill_defaults(RawConf, Opts) ->
     ).
 
 -spec fill_defaults(module(), raw_config(), hocon_tconf:opts()) -> map().
+fill_defaults(SchemaMod, RawConf = #{<<"durable_storage">> := Ds}, Opts) ->
+    %% FIXME: kludge to prevent `emqx_config' module from filling in
+    %% the default values for backends and layouts. These records are
+    %% inside unions, and adding default values there will add
+    %% incompatible fields.
+    RawConf1 = maps:remove(<<"durable_storage">>, RawConf),
+    Conf = fill_defaults(SchemaMod, RawConf1, Opts),
+    Conf#{<<"durable_storage">> => Ds};
 fill_defaults(SchemaMod, RawConf, Opts0) ->
     Opts = maps:merge(#{required => false, make_serializable => true}, Opts0),
     hocon_tconf:check_plain(
@@ -514,12 +542,12 @@ ensure_file_deleted(F) ->
 
 -spec read_override_conf(map()) -> raw_config().
 read_override_conf(#{} = Opts) ->
-    File =
+    Files =
         case has_deprecated_file() of
-            true -> deprecated_conf_file(Opts);
-            false -> cluster_hocon_file()
+            true -> [deprecated_conf_file(Opts)];
+            false -> [base_hocon_file(), cluster_hocon_file()]
         end,
-    load_hocon_file(File, map).
+    load_hocon_files(Files, map).
 
 %% @doc Return `true' if this node is upgraded from older version which used cluster-override.conf for
 %% cluster-wide config persistence.
@@ -536,6 +564,9 @@ deprecated_conf_file(Opts) when is_map(Opts) ->
     application:get_env(emqx, Key, undefined);
 deprecated_conf_file(Which) when is_atom(Which) ->
     application:get_env(emqx, Which, undefined).
+
+base_hocon_file() ->
+    emqx:etc_file("base.hocon").
 
 %% The newer version cluster-wide config persistence file.
 cluster_hocon_file() ->
@@ -599,22 +630,35 @@ save_to_config_map(Conf, RawConf) ->
     ?MODULE:put_raw(RawConf).
 
 -spec save_to_override_conf(boolean(), raw_config(), update_opts()) -> ok | {error, term()}.
-save_to_override_conf(_, undefined, _) ->
+save_to_override_conf(_HasDeprecatedFile, undefined, _) ->
     ok;
-save_to_override_conf(true, RawConf, Opts) ->
+save_to_override_conf(true = _HasDeprecatedFile, RawConf, Opts) ->
     case deprecated_conf_file(Opts) of
         undefined ->
             ok;
         FileName ->
-            backup_and_write(FileName, hocon_pp:do(RawConf, #{}))
+            backup_and_write(FileName, generate_hocon_content(RawConf, Opts))
     end;
-save_to_override_conf(false, RawConf, _Opts) ->
+save_to_override_conf(false = _HasDeprecatedFile, RawConf, Opts) ->
     case cluster_hocon_file() of
         undefined ->
             ok;
         FileName ->
-            backup_and_write(FileName, hocon_pp:do(RawConf, #{}))
+            backup_and_write(FileName, generate_hocon_content(RawConf, Opts))
     end.
+
+generate_hocon_content(RawConf, Opts) ->
+    [
+        cluster_dot_hocon_header(),
+        hocon_pp:do(RawConf, Opts)
+    ].
+
+cluster_dot_hocon_header() ->
+    [
+        "# This file is generated. Do not edit.\n",
+        "# The configs are results of online config changes from UI/API/CLI.\n",
+        "# To persist configs in this file, copy the content to etc/base.hocon.\n"
+    ].
 
 %% @private This is the same human-readable timestamp format as
 %% hocon-cli generated app.<time>.config file name.
@@ -694,6 +738,7 @@ add_handlers() ->
     ok = emqx_config_logger:add_handler(),
     ok = emqx_config_zones:add_handler(),
     emqx_sys_mon:add_handler(),
+    emqx_persistent_message:add_handler(),
     ok.
 
 remove_handlers() ->
@@ -702,22 +747,17 @@ remove_handlers() ->
     emqx_sys_mon:remove_handler(),
     ok.
 
-load_hocon_file(FileName, LoadType) ->
-    case filelib:is_regular(FileName) of
-        true ->
-            Opts = #{include_dirs => include_dirs(), format => LoadType},
-            case hocon:load(FileName, Opts) of
-                {ok, Raw0} ->
-                    Raw0;
-                {error, Reason} ->
-                    throw(#{
-                        msg => failed_to_load_conf,
-                        reason => Reason,
-                        file => FileName
-                    })
-            end;
-        false ->
-            #{}
+load_hocon_files(FileNames, LoadType) ->
+    Opts = #{include_dirs => include_dirs(), format => LoadType},
+    case hocon:files(FileNames, Opts) of
+        {ok, Raw0} ->
+            Raw0;
+        {error, Reason} ->
+            throw(#{
+                msg => failed_to_load_conf,
+                reason => Reason,
+                files => FileNames
+            })
     end.
 
 do_get_raw(Path) ->
@@ -948,7 +988,7 @@ is_zone_root(Name) ->
 
 -spec zone_roots() -> [atom()].
 zone_roots() ->
-    lists:map(fun list_to_atom/1, emqx_zone_schema:roots()).
+    emqx_zone_schema:roots().
 
 %%%
 %%% @doc During init, ensure order of puts that zone is put after the other global defaults.

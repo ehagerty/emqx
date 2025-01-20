@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("typerefl/include/types.hrl").
 
--export([api_spec/0, paths/0, schema/1, fields/1]).
+-export([api_spec/0, paths/0, schema/1, fields/1, namespace/0]).
 
 -export([alarms/2, format_alarm/2]).
 
@@ -30,6 +30,9 @@
 
 %% internal export (for query)
 -export([qs2ms/2]).
+
+namespace() ->
+    undefined.
 
 api_spec() ->
     emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).

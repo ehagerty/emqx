@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,8 +36,8 @@
 -export([
     load/0,
     unload/0,
-    get/0,
-    update/1
+    update/1,
+    get_raw/0
 ]).
 
 %% callbacks for emqx_config_handler
@@ -108,9 +108,8 @@ unload() ->
     ok = emqx_conf:remove_handler([file_transfer]),
     maybe_stop().
 
--spec get() -> emqx_config:config().
-get() ->
-    emqx_config:get([file_transfer]).
+get_raw() ->
+    emqx:get_raw_config([file_transfer], #{}).
 
 -spec update(emqx_config:config()) -> {ok, emqx_config:update_result()} | {error, term()}.
 update(Config) ->

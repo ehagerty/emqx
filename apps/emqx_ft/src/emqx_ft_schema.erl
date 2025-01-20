@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 -export([schema/1]).
 
 %% Utilities
--export([backend/1]).
+-export([backend/1, encode/2, decode/2]).
 
 %% Test-only helpers
 -export([translate/1]).
@@ -66,6 +66,7 @@ fields(file_transfer) ->
                 boolean(),
                 #{
                     desc => ?DESC("enable"),
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     required => false,
                     default => false
                 }
@@ -77,7 +78,7 @@ fields(file_transfer) ->
                     desc => ?DESC("init_timeout"),
                     required => false,
                     importance => ?IMPORTANCE_LOW,
-                    default => "10s"
+                    default => <<"10s">>
                 }
             )},
         {store_segment_timeout,
@@ -87,7 +88,7 @@ fields(file_transfer) ->
                     desc => ?DESC("store_segment_timeout"),
                     required => false,
                     importance => ?IMPORTANCE_LOW,
-                    default => "5m"
+                    default => <<"5m">>
                 }
             )},
         {assemble_timeout,
@@ -97,7 +98,7 @@ fields(file_transfer) ->
                     desc => ?DESC("assemble_timeout"),
                     required => false,
                     importance => ?IMPORTANCE_LOW,
-                    default => "5m"
+                    default => <<"5m">>
                 }
             )},
         {storage,
@@ -208,7 +209,7 @@ fields(local_storage_segments_gc) ->
                 #{
                     desc => ?DESC("storage_gc_interval"),
                     required => false,
-                    default => "1h"
+                    default => <<"1h">>
                 }
             )},
         {maximum_segments_ttl,
@@ -218,7 +219,7 @@ fields(local_storage_segments_gc) ->
                 #{
                     desc => ?DESC("storage_gc_max_segments_ttl"),
                     required => false,
-                    default => "24h"
+                    default => <<"24h">>
                 }
             )},
         {minimum_segments_ttl,
@@ -228,7 +229,7 @@ fields(local_storage_segments_gc) ->
                 #{
                     desc => ?DESC("storage_gc_min_segments_ttl"),
                     required => false,
-                    default => "5m",
+                    default => <<"5m">>,
                     % NOTE
                     % This setting does not seem to be useful to an end-user.
                     hidden => true
@@ -242,6 +243,7 @@ common_backend_fields() ->
             mk(
                 boolean(), #{
                     desc => ?DESC("backend_enable"),
+                    importance => ?IMPORTANCE_NO_DOC,
                     required => false,
                     default => true
                 }
@@ -281,6 +283,16 @@ schema(filemeta) ->
             {checksum, hoconsc:mk({atom(), binary()}, #{converter => converter(checksum)})},
             {segments_ttl, hoconsc:mk(pos_integer())},
             {user_data, hoconsc:mk(json_value())}
+        ]
+    };
+schema(command_response) ->
+    #{
+        roots => [
+            {vsn, hoconsc:mk(string(), #{default => <<"0.1">>})},
+            {topic, hoconsc:mk(string())},
+            {packet_id, hoconsc:mk(pos_integer())},
+            {reason_code, hoconsc:mk(non_neg_integer())},
+            {reason_description, hoconsc:mk(binary())}
         ]
     }.
 
@@ -344,6 +356,27 @@ backend(Config) ->
     no_return().
 emit_enabled(Type, BConf = #{enable := Enabled}) ->
     Enabled andalso throw({Type, BConf}).
+
+decode(SchemaName, Payload) when is_binary(Payload) ->
+    case emqx_utils_json:safe_decode(Payload, [return_maps]) of
+        {ok, Map} ->
+            decode(SchemaName, Map);
+        {error, Error} ->
+            {error, {invalid_filemeta_json, Error}}
+    end;
+decode(SchemaName, Map) when is_map(Map) ->
+    Schema = schema(SchemaName),
+    try
+        Meta = hocon_tconf:check_plain(Schema, Map, #{atom_key => true, required => false}),
+        {ok, Meta}
+    catch
+        throw:{_Schema, Errors} ->
+            {error, {invalid_filemeta, Errors}}
+    end.
+
+encode(SchemaName, Map = #{}) ->
+    Schema = schema(SchemaName),
+    hocon_tconf:make_serializable(Schema, emqx_utils_maps:binary_key_map(Map), #{}).
 
 %% Test-only helpers
 

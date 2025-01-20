@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@
 -include_lib("typerefl/include/types.hrl").
 
 %% config schema provides
--export([fields/1, desc/1]).
+-export([namespace/0, fields/1, desc/1]).
+
+namespace() -> "gateway".
 
 fields(stomp) ->
     [
@@ -35,7 +37,7 @@ fields(stomp_frame) ->
                 non_neg_integer(),
                 #{
                     default => 10,
-                    desc => ?DESC(stom_frame_max_headers)
+                    desc => ?DESC(stomp_frame_max_headers)
                 }
             )},
         {max_headers_length,
@@ -51,7 +53,7 @@ fields(stomp_frame) ->
                 integer(),
                 #{
                     default => 65536,
-                    desc => ?DESC(stom_frame_max_body_length)
+                    desc => ?DESC(stomp_frame_max_body_length)
                 }
             )}
     ].

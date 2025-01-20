@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -62,7 +62,10 @@ t_run_check(_) ->
                 error(version_mismatch)
             end,
         BpapiDumps = filelib:wildcard(
-            filename:join(emqx_bpapi_static_checks:dumps_dir(), "*.bpapi")
+            filename:join(
+                emqx_bpapi_static_checks:dumps_dir(),
+                "*" ++ emqx_bpapi_static_checks:dump_file_extension()
+            )
         ),
         logger:info("Backplane API dump files: ~p", [BpapiDumps]),
         ?assert(emqx_bpapi_static_checks:check_compat(BpapiDumps))

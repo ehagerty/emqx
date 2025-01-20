@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,12 +24,11 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
 
 init_per_testcase(t_cpu_check_alarm, Config) ->
     SysMon = emqx_config:get([sysmon, os], #{}),
@@ -39,28 +38,46 @@ init_per_testcase(t_cpu_check_alarm, Config) ->
         %% 200ms
         cpu_check_interval => 200
     }),
-    ok = supervisor:terminate_child(emqx_sys_sup, emqx_os_mon),
-    {ok, _} = supervisor:restart_child(emqx_sys_sup, emqx_os_mon),
+    restart_os_mon(),
     Config;
 init_per_testcase(t_sys_mem_check_alarm, Config) ->
-    case emqx_os_mon:is_sysmem_check_supported() of
+    case emqx_os_mon:is_os_check_supported() of
         true ->
             SysMon = emqx_config:get([sysmon, os], #{}),
             emqx_config:put([sysmon, os], SysMon#{
                 sysmem_high_watermark => 0.51,
                 %% 200ms
                 mem_check_interval => 200
-            }),
-            ok = supervisor:terminate_child(emqx_sys_sup, emqx_os_mon),
-            {ok, _} = supervisor:restart_child(emqx_sys_sup, emqx_os_mon),
-            Config;
+            });
         false ->
-            Config
-    end;
+            ok
+    end,
+    restart_os_mon(),
+    Config;
 init_per_testcase(_, Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
+    restart_os_mon(),
     Config.
+
+restart_os_mon() ->
+    case emqx_os_mon:is_os_check_supported() of
+        true ->
+            ok = supervisor:terminate_child(emqx_sys_sup, emqx_os_mon),
+            {ok, _} = supervisor:restart_child(emqx_sys_sup, emqx_os_mon);
+        false ->
+            _ = supervisor:terminate_child(emqx_sys_sup, emqx_os_mon),
+            _ = supervisor:delete_child(emqx_sys_sup, emqx_os_mon),
+            %% run test on mac/windows.
+            Mod = emqx_os_mon,
+            OsMon = #{
+                id => Mod,
+                start => {Mod, start_link, []},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [Mod]
+            },
+            {ok, _} = supervisor:start_child(emqx_sys_sup, OsMon)
+    end.
 
 t_api(_) ->
     ?assertEqual(0.7, emqx_os_mon:get_sysmem_high_watermark()),
@@ -81,7 +98,7 @@ t_api(_) ->
     ok.
 
 t_sys_mem_check_disable(Config) ->
-    case emqx_os_mon:is_sysmem_check_supported() of
+    case emqx_os_mon:is_os_check_supported() of
         true -> do_sys_mem_check_disable(Config);
         false -> skip
     end.
@@ -100,7 +117,7 @@ do_sys_mem_check_disable(_Config) ->
     ok.
 
 t_sys_mem_check_alarm(Config) ->
-    case emqx_os_mon:is_sysmem_check_supported() of
+    case emqx_os_mon:is_os_check_supported() of
         true -> do_sys_mem_check_alarm(Config);
         false -> skip
     end.
@@ -115,7 +132,8 @@ do_sys_mem_check_alarm(_Config) ->
         get_memory_usage,
         fun() -> Mem end,
         fun() ->
-            timer:sleep(500),
+            %% wait for `os_mon` started
+            timer:sleep(10_000),
             Alarms = emqx_alarm:get_alarms(activated),
             ?assert(
                 emqx_vm_mon_SUITE:is_existing(
@@ -167,7 +185,7 @@ t_cpu_check_alarm(_) ->
         util,
         fun() -> CpuUtil end,
         fun() ->
-            timer:sleep(500),
+            timer:sleep(1000),
             Alarms = emqx_alarm:get_alarms(activated),
             ?assert(
                 emqx_vm_mon_SUITE:is_existing(high_cpu_usage, emqx_alarm:get_alarms(activated))
@@ -193,7 +211,7 @@ t_cpu_check_alarm(_) ->
             ?assert(is_binary(Msg)),
             emqx_config:put([sysmon, os, cpu_high_watermark], 1),
             emqx_config:put([sysmon, os, cpu_low_watermark], 0.96),
-            timer:sleep(500),
+            timer:sleep(800),
             ?assertNot(
                 emqx_vm_mon_SUITE:is_existing(high_cpu_usage, emqx_alarm:get_alarms(activated))
             )

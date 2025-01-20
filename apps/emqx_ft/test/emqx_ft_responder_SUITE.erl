@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,16 +19,23 @@
 -compile(export_all).
 -compile(nowarn_export_all).
 
+-include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("emqx/include/asserts.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:start_apps([emqx_ft], emqx_ft_test_helpers:env_handler(Config)),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_ft, "file_transfer {enable = true}"}
+        ],
+        #{work_dir => ?config(priv_dir, Config)}
+    ),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_ft]),
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
     ok.
 
 init_per_testcase(_Case, Config) ->
@@ -40,10 +47,8 @@ end_per_testcase(_Case, _Config) ->
 t_start_ack(_Config) ->
     Key = <<"test">>,
     DefaultAction = fun({ack, Ref}) -> Ref end,
-    ?assertMatch(
-        {ok, _Pid},
-        emqx_ft_responder:start(Key, DefaultAction, 1000)
-    ),
+    {ok, ResponderPid} = emqx_ft_responder:start(Key, DefaultAction, 1000),
+    erlang:monitor(process, ResponderPid),
     ?assertMatch(
         {error, {already_started, _Pid}},
         emqx_ft_responder:start(Key, DefaultAction, 1000)
@@ -56,6 +61,10 @@ t_start_ack(_Config) ->
     ?assertExit(
         {noproc, _},
         emqx_ft_responder:ack(Key, Ref)
+    ),
+    ?assertReceive(
+        {'DOWN', _, process, ResponderPid, {shutdown, _}},
+        1000
     ).
 
 t_timeout(_Config) ->

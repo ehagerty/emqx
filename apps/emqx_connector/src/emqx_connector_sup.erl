@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,17 +32,5 @@ init([]) ->
         intensity => 5,
         period => 20
     },
-    ChildSpecs = [
-        child_spec(emqx_connector_jwt_sup)
-    ],
+    ChildSpecs = [],
     {ok, {SupFlags, ChildSpecs}}.
-
-child_spec(Mod) ->
-    #{
-        id => Mod,
-        start => {Mod, start_link, []},
-        restart => permanent,
-        shutdown => 3000,
-        type => supervisor,
-        modules => [Mod]
-    }.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -32,11 +32,10 @@ wrap_auth_headers_test_() ->
         end,
         fun meck:unload/1, fun(_) ->
             Config = #{
-                base_url => #{
+                request_base => #{
                     scheme => http,
                     host => "localhost",
-                    port => 18083,
-                    path => "/status"
+                    port => 18083
                 },
                 connect_timeout => 1000,
                 pool_type => random,
@@ -83,7 +82,8 @@ is_wrapped(Secret) when is_function(Secret) ->
 is_wrapped(_Other) ->
     false.
 
-untmpl([{_, V} | _]) -> V.
+untmpl(Tpl) ->
+    iolist_to_binary(emqx_template:render_strict(Tpl, #{})).
 
 is_unwrapped_headers(Headers) ->
     lists:all(fun is_unwrapped_header/1, Headers).
@@ -174,7 +174,7 @@ check_atom_key(Conf) when is_map(Conf) ->
 
 %% erlfmt-ignore
 webhook_config_hocon() ->
-"""
+"
 bridges.webhook.a {
   body = \"${.}\"
   connect_timeout = 15s
@@ -208,4 +208,4 @@ bridges.webhook.a {
   }
   url = \"http://some.host:4000/api/echo\"
 }
-""".
+".

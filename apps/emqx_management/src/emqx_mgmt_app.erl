@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,13 +28,10 @@
 -include("emqx_mgmt.hrl").
 
 start(_Type, _Args) ->
-    case emqx_mgmt_auth:init_bootstrap_file() of
-        ok ->
-            emqx_conf:add_handler([api_key], emqx_mgmt_auth),
-            emqx_mgmt_sup:start_link();
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    ok = mria:wait_for_tables(emqx_mgmt_auth:create_tables()),
+    emqx_mgmt_auth:try_init_bootstrap_file(),
+    emqx_conf:add_handler([api_key], emqx_mgmt_auth),
+    emqx_mgmt_sup:start_link().
 
 stop(_State) ->
     emqx_conf:remove_handler([api_key]),

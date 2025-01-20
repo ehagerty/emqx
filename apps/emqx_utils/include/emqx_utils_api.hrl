@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,12 +21,16 @@
 
 -define(OK(CONTENT), {200, CONTENT}).
 
+-define(CREATED(CONTENT), {201, CONTENT}).
+
 -define(NO_CONTENT, 204).
 
 -define(BAD_REQUEST(CODE, REASON), {400, ?ERROR_MSG(CODE, REASON)}).
 -define(BAD_REQUEST(REASON), ?BAD_REQUEST('BAD_REQUEST', REASON)).
 
 -define(NOT_FOUND(REASON), {404, ?ERROR_MSG('NOT_FOUND', REASON)}).
+
+-define(METHOD_NOT_ALLOWED, 405).
 
 -define(INTERNAL_ERROR(REASON), {500, ?ERROR_MSG('INTERNAL_ERROR', REASON)}).
 

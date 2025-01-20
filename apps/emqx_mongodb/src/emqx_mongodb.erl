@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 %%--------------------------------------------------------------------
 -module(emqx_mongodb).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
@@ -22,14 +23,17 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -behaviour(emqx_resource).
+-behaviour(hocon_schema).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
     on_query/3,
-    on_get_status/2
+    on_get_status/2,
+    namespace/0
 ]).
 
 %% ecpool callback
@@ -43,6 +47,8 @@
 -export([maybe_resolve_srv_and_txt_records/1]).
 
 -define(HEALTH_CHECK_TIMEOUT, 30000).
+-define(DEFAULT_MONGO_LIMIT, 1000).
+-define(DEFAULT_MONGO_BATCH_SIZE, 100).
 
 %% mongo servers don't need parse
 -define(MONGO_HOST_OPTIONS, #{
@@ -50,6 +56,9 @@
 }).
 
 %%=====================================================================
+
+namespace() -> "mongo".
+
 roots() ->
     [
         {config, #{
@@ -63,19 +72,10 @@ roots() ->
         }}
     ].
 
-fields(single) ->
+fields("connector_rs") ->
     [
         {mongo_type, #{
-            type => single,
-            default => single,
-            desc => ?DESC("single_mongo_type")
-        }},
-        {server, server()},
-        {w_mode, fun w_mode/1}
-    ] ++ mongo_fields();
-fields(rs) ->
-    [
-        {mongo_type, #{
+            required => true,
             type => rs,
             default => rs,
             desc => ?DESC("rs_mongo_type")
@@ -84,25 +84,60 @@ fields(rs) ->
         {w_mode, fun w_mode/1},
         {r_mode, fun r_mode/1},
         {replica_set_name, fun replica_set_name/1}
-    ] ++ mongo_fields();
-fields(sharded) ->
+    ];
+fields("connector_sharded") ->
     [
         {mongo_type, #{
+            required => true,
             type => sharded,
             default => sharded,
             desc => ?DESC("sharded_mongo_type")
         }},
         {servers, servers()},
         {w_mode, fun w_mode/1}
-    ] ++ mongo_fields();
+    ];
+fields("connector_single") ->
+    [
+        {mongo_type, #{
+            required => true,
+            type => single,
+            default => single,
+            desc => ?DESC("single_mongo_type")
+        }},
+        {server, server()},
+        {w_mode, fun w_mode/1}
+    ];
+fields(Type) when Type =:= rs; Type =:= single; Type =:= sharded ->
+    fields("connector_" ++ atom_to_list(Type)) ++ fields(mongodb);
+fields(mongodb) ->
+    [
+        {srv_record, fun srv_record/1},
+        {pool_size, fun emqx_connector_schema_lib:pool_size/1},
+        {username, fun emqx_connector_schema_lib:username/1},
+        {password, emqx_connector_schema_lib:password_field()},
+        {use_legacy_protocol,
+            hoconsc:mk(hoconsc:enum([auto, true, false]), #{
+                default => auto,
+                desc => ?DESC("use_legacy_protocol")
+            })},
+        {auth_source, #{
+            type => binary(),
+            required => false,
+            desc => ?DESC("auth_source")
+        }},
+        {database, fun emqx_connector_schema_lib:database/1},
+        {topology, #{type => hoconsc:ref(?MODULE, topology), required => false}}
+    ] ++
+        emqx_connector_schema_lib:ssl_fields();
 fields(topology) ->
     [
         {pool_size,
             hoconsc:mk(
                 pos_integer(),
                 #{
-                    deprecated => {since, "5.1.1"},
-                    importance => ?IMPORTANCE_HIDDEN
+                    importance => ?IMPORTANCE_HIDDEN,
+                    %% In most cases we don't need the topology pool as we use ecpool
+                    default => 1
                 }
             )},
         {max_overflow, fun max_overflow/1},
@@ -124,6 +159,12 @@ fields(topology) ->
         {min_heartbeat_frequency_ms, duration("min_heartbeat_period")}
     ].
 
+desc("connector_single") ->
+    ?DESC("desc_single");
+desc("connector_rs") ->
+    ?DESC("desc_rs");
+desc("connector_sharded") ->
+    ?DESC("desc_sharded");
 desc(single) ->
     ?DESC("desc_single");
 desc(rs) ->
@@ -135,23 +176,8 @@ desc(topology) ->
 desc(_) ->
     undefined.
 
-mongo_fields() ->
-    [
-        {srv_record, fun srv_record/1},
-        {pool_size, fun emqx_connector_schema_lib:pool_size/1},
-        {username, fun emqx_connector_schema_lib:username/1},
-        {password, fun emqx_connector_schema_lib:password/1},
-        {auth_source, #{
-            type => binary(),
-            required => false,
-            desc => ?DESC("auth_source")
-        }},
-        {database, fun emqx_connector_schema_lib:database/1},
-        {topology, #{type => hoconsc:ref(?MODULE, topology), required => false}}
-    ] ++
-        emqx_connector_schema_lib:ssl_fields().
-
 %% ===================================================================
+resource_type() -> mongodb.
 
 callback_mode() -> always_sync.
 
@@ -181,23 +207,7 @@ on_start(
             false ->
                 [{ssl, false}]
         end,
-    Topology0 = maps:get(topology, NConfig, #{}),
-    %% we fix this at 1 because we already have ecpool
-    case maps:get(pool_size, Topology0, 1) =:= 1 of
-        true ->
-            ok;
-        false ->
-            ?SLOG(
-                info,
-                #{
-                    msg => "mongodb_overriding_topology_pool_size",
-                    connector => InstId,
-                    reason => "this option is deprecated; please set `pool_size' for the connector",
-                    value => 1
-                }
-            )
-    end,
-    Topology = Topology0#{pool_size => 1},
+    Topology = maps:get(topology, NConfig, #{}),
     Opts = [
         {mongo_type, init_type(NConfig)},
         {hosts, Hosts},
@@ -226,7 +236,7 @@ on_stop(InstId, _State) ->
 
 on_query(
     InstId,
-    {send_message, Document},
+    {insert, Document},
     #{pool_name := PoolName, collection := Collection} = State
 ) ->
     Request = {insert, Collection, Document},
@@ -255,12 +265,21 @@ on_query(
         {{true, _Info}, _Document} ->
             ok
     end;
-on_query(
+on_query(InstId, {find_one, Collection, Filter}, State) ->
+    on_select_query(InstId, {find_one, Collection, Filter, #{}}, State);
+on_query(InstId, {find_one, _Collection, _Filter, _Options} = Request, State) ->
+    on_select_query(InstId, Request, State);
+on_query(InstId, {find, Collection, Filter}, State) ->
+    on_select_query(InstId, {find, Collection, Filter, #{}}, State);
+on_query(InstId, {find, _Collection, _Filter, _Options} = Request, State) ->
+    on_select_query(InstId, Request, State).
+
+on_select_query(
     InstId,
-    {Action, Collection, Filter, Projector},
+    {Action, Collection, Filter, Options},
     #{pool_name := PoolName} = State
 ) ->
-    Request = {Action, Collection, Filter, Projector},
+    Request = {Action, Collection, Filter, Options},
     ?TRACE(
         "QUERY",
         "mongodb_connector_received",
@@ -269,7 +288,7 @@ on_query(
     case
         ecpool:pick_and_do(
             PoolName,
-            {?MODULE, mongo_query, [Action, Collection, Filter, Projector]},
+            {?MODULE, mongo_query, [Action, Collection, Filter, Options]},
             no_handover
         )
     of
@@ -287,26 +306,27 @@ on_query(
                     {error, Reason}
             end;
         {ok, Cursor} when is_pid(Cursor) ->
-            {ok, mc_cursor:foldl(fun(O, Acc2) -> [O | Acc2] end, [], Cursor, 1000)};
+            Limit = maps:get(limit, Options, ?DEFAULT_MONGO_LIMIT),
+            {ok, mc_cursor:take(Cursor, Limit)};
         Result ->
             {ok, Result}
     end.
 
-on_get_status(InstId, State = #{pool_name := PoolName}) ->
+on_get_status(InstId, #{pool_name := PoolName}) ->
     case health_check(PoolName) of
         ok ->
             ?tp(debug, emqx_connector_mongo_health_check, #{
                 instance_id => InstId,
                 status => ok
             }),
-            connected;
+            ?status_connected;
         {error, Reason} ->
             ?tp(warning, emqx_connector_mongo_health_check, #{
                 instance_id => InstId,
                 reason => Reason,
                 status => failed
             }),
-            {disconnected, State, Reason}
+            {?status_disconnected, Reason}
     end.
 
 health_check(PoolName) ->
@@ -374,12 +394,16 @@ connect(Opts) ->
     WorkerOptions = proplists:get_value(worker_options, Opts, []),
     mongo_api:connect(Type, Hosts, Options, WorkerOptions).
 
-mongo_query(Conn, find, Collection, Filter, Projector) ->
-    mongo_api:find(Conn, Collection, Filter, Projector);
-mongo_query(Conn, find_one, Collection, Filter, Projector) ->
-    mongo_api:find_one(Conn, Collection, Filter, Projector);
-%% Todo xxx
-mongo_query(_Conn, _Action, _Collection, _Filter, _Projector) ->
+mongo_query(Conn, find, Collection, Filter, Options) ->
+    Projector = maps:get(projector, Options, #{}),
+    Skip = maps:get(skip, Options, 0),
+    BatchSize = maps:get(batch_size, Options, ?DEFAULT_MONGO_BATCH_SIZE),
+    mongo_api:find(Conn, Collection, Filter, Projector, Skip, BatchSize);
+mongo_query(Conn, find_one, Collection, Filter, Options) ->
+    Projector = maps:get(projector, Options, #{}),
+    Skip = maps:get(skip, Options, 0),
+    mongo_api:find_one(Conn, Collection, Filter, Projector, Skip);
+mongo_query(_Conn, _Action, _Collection, _Filter, _Options) ->
     ok.
 
 mongo_insert(Conn, Collection, Documents) ->
@@ -423,12 +447,14 @@ init_worker_options([{auth_source, V} | R], Acc) ->
     init_worker_options(R, [{auth_source, V} | Acc]);
 init_worker_options([{username, V} | R], Acc) ->
     init_worker_options(R, [{login, V} | Acc]);
-init_worker_options([{password, V} | R], Acc) ->
-    init_worker_options(R, [{password, emqx_secret:wrap(V)} | Acc]);
+init_worker_options([{password, Secret} | R], Acc) ->
+    init_worker_options(R, [{password, Secret} | Acc]);
 init_worker_options([{w_mode, V} | R], Acc) ->
     init_worker_options(R, [{w_mode, V} | Acc]);
 init_worker_options([{r_mode, V} | R], Acc) ->
     init_worker_options(R, [{r_mode, V} | Acc]);
+init_worker_options([{use_legacy_protocol, V} | R], Acc) ->
+    init_worker_options(R, [{use_legacy_protocol, V} | Acc]);
 init_worker_options([_ | R], Acc) ->
     init_worker_options(R, Acc);
 init_worker_options([], Acc) ->

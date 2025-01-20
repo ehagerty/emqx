@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -295,7 +295,7 @@ terminate(_Reason, _State) ->
 reset_topic({Topic, Data}, Speeds) ->
     CRef = maps:get(counter_ref, Data),
     ok = reset_counter(CRef),
-    ResetTime = emqx_rule_funcs:now_rfc3339(),
+    ResetTime = emqx_utils_calendar:now_to_rfc3339(),
     true = ets:insert(?TAB, {Topic, Data#{reset_time => ResetTime}}),
     Fun =
         fun(Metric, CurrentSpeeds) ->
@@ -468,7 +468,7 @@ counters_size() ->
     length(?TOPIC_METRICS).
 
 number_of_registered_topics() ->
-    proplists:get_value(size, ets:info(?TAB)).
+    ets:info(?TAB, size).
 
 calculate_speed(CurVal, #speed{
     last = Last,

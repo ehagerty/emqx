@@ -38,9 +38,16 @@ recreatePods: false
 ## Sets the minReadySeconds parameter on the stateful set. This can be used to add delay between restart / updates between the single pods.
 minReadySeconds:
 
+## Sets the priorityClassName parameter on the pods. This can be used to run the pods with increased priority.
+priorityClassName:
+
 clusterDomain: cluster.local
 
+## Custom annotations to be added to the pods
 podAnnotations: {}
+
+## Custom labels to be added to the pods
+podLabels: {}
 
 # Pod deployment policy
 # value: OrderedReady | Parallel
@@ -152,6 +159,17 @@ service:
   ## Port for dashboard and API over HTTPS
   ##
   # dashboardtls: 18084
+
+  ## Custom Ports
+  ## Expose the ports of additional custom listeners.
+  ## Example:
+  ## customPorts:
+  ##  - name: custom1
+  ##    port: 1884
+  ##    targetPort: 1884
+  ##
+  customPorts: {}
+
   ## Specify the nodePort(s) value for the LoadBalancer and NodePort service types.
   ## ref: https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport
   ##
@@ -163,6 +181,24 @@ service:
     wss:
     dashboard:
     dashboardtls:
+
+  ## NodePort for customPorts
+  ## Specify the nodePort(s) value for the custoPorts inside LoadBalancer and NodePort service types.
+  ##
+  ## To link the customPorts with the nodePort, use the customPorts name as the key.
+  ## Example:
+  ## customPorts:
+  ##  - name: custom1
+  ## ...
+  ## customNodePorts:
+  ##   custom1: 30000
+  ##
+  customNodePorts: {}
+
+  ## Specifies the load balancer implementation this Service belongs to.
+  ## Once set, it can not be changed.
+  ##
+  # loadBalancerClass:
   ## Set the LoadBalancer service type to internal only.
   ## ref: https://kubernetes.io/docs/concepts/services-networking/service/#internal-load-balancer
   ##
@@ -186,6 +222,7 @@ service:
   ## Provide any additional annotations which may be required. Evaluated as a template
   ##
   annotations: {}
+  labels: {}
 
 nodeSelector: {}
 
@@ -222,6 +259,19 @@ ingress:
     hosts:
     - mqtt.emqx.local
     tls: []
+  ws:
+    enabled: false
+    # ingressClassName: haproxy
+    annotations: {}
+      # kubernetes.io/ingress.class: haproxy
+      # kubernetes.io/tls-acme: "true"
+      # haproxy-ingress.github.io/tcp-service-port: "8883"
+      # haproxy-ingress.github.io/proxy-protocol: "v2"
+    path: /mqtt
+    pathType: ImplementationSpecific
+    hosts:
+      - mqtt.emqx.local
+    tls: []
 
 podSecurityContext:
   enabled: true
@@ -245,7 +295,7 @@ ssl:
   useExisting: false
   existingName: emqx-tls
   dnsnames: []
-  commonName: 
+  commonName:
   issuer:
     name: letsencrypt-dns
     kind: ClusterIssuer

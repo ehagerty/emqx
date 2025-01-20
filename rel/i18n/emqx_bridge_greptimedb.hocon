@@ -1,33 +1,33 @@
 emqx_bridge_greptimedb {
 
 config_enable.desc:
-"""Enable or disable this bridge."""
+"""Enable or disable this action."""
 
 config_enable.label:
-"""Enable Or Disable Bridge"""
+"""Enable Or Disable Action"""
 
 desc_config.desc:
-"""Configuration for an GreptimeDB bridge."""
+"""Configuration for an GreptimeDB action."""
 
 desc_config.label:
-"""GreptimeDB Bridge Configuration"""
+"""GreptimeDB Action Configuration"""
 
 desc_name.desc:
-"""Bridge name."""
+"""The name of the action."""
 
 desc_name.label:
-"""Bridge Name"""
+"""Action Name"""
 
 desc_type.desc:
-"""The Bridge Type."""
+"""The type of the action."""
 
 desc_type.label:
-"""Bridge Type"""
+"""Action Type"""
 
 local_topic.desc:
 """The MQTT topic filter to be forwarded to the GreptimeDB. All MQTT 'PUBLISH' messages with the topic
-matching the local_topic will be forwarded.</br>
-NOTE: if this bridge is used as the action of a rule (EMQX rule engine), and also local_topic is
+matching the local_topic will be forwarded.<br/>
+NOTE: If this Sink is used as the action of a rule (EMQX rule engine), and also local_topic is
 configured, then both the data got from the rule and the MQTT messages that match local_topic
 will be forwarded."""
 
@@ -37,8 +37,8 @@ local_topic.label:
 write_syntax.desc:
 """Conf of GreptimeDB gRPC protocol to write data points. Write syntax is a text-based format that provides the measurement, tag set, field set, and timestamp of a data point, and placeholder supported, which is the same as InfluxDB line protocol.
 See also [InfluxDB 2.3 Line Protocol](https://docs.influxdata.com/influxdb/v2.3/reference/syntax/line-protocol/) and
-[GreptimeDB 1.8 Line Protocol](https://docs.influxdata.com/influxdb/v1.8/write_protocols/line_protocol_tutorial/) </br>
-TLDR:</br>
+[GreptimeDB 1.8 Line Protocol](https://docs.influxdata.com/influxdb/v1.8/write_protocols/line_protocol_tutorial/) <br/>
+TLDR:<br/>
 ```
 <measurement>[,<tag_key>=<tag_value>[,<tag_key>=<tag_value>]] <field_key>=<field_value>[,<field_key>=<field_value>] [<timestamp>]
 ```
@@ -46,5 +46,20 @@ Please note that a placeholder for an integer value must be annotated with a suf
 
 write_syntax.label:
 """Write Syntax"""
+
+action_parameters.label:
+"""Action Parameters"""
+action_parameters.desc:
+"""Additional parameters specific to this action type"""
+
+connector.label:
+"""GreptimeDB Connector"""
+connector.desc:
+"""GreptimeDB Connector Configs"""
+
+greptimedb_action.label:
+"""GreptimeDB Action"""
+greptimedb_action.desc:
+"""Action to interact with a GreptimeDB connector"""
 
 }

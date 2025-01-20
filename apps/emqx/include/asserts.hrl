@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -30,11 +30,12 @@
     )
 ).
 
--define(drainMailbox(),
+-define(drainMailbox(), ?drainMailbox(0)).
+-define(drainMailbox(TIMEOUT),
     (fun F__Flush_() ->
         receive
             X__Msg_ -> [X__Msg_ | F__Flush_()]
-        after 0 -> []
+        after TIMEOUT -> []
         end
     end)()
 ).
@@ -44,6 +45,10 @@
 ).
 
 -define(assertReceive(PATTERN, TIMEOUT),
+    ?assertReceive(PATTERN, TIMEOUT, #{})
+).
+
+-define(assertReceive(PATTERN, TIMEOUT, EXTRA),
     (fun() ->
         receive
             X__V = PATTERN -> X__V
@@ -53,7 +58,8 @@
                     {module, ?MODULE},
                     {line, ?LINE},
                     {expression, (??PATTERN)},
-                    {mailbox, ?drainMailbox()}
+                    {mailbox, ?drainMailbox()},
+                    {extra_info, EXTRA}
                 ]}
             )
         end
@@ -78,6 +84,28 @@
                 )
         after TIMEOUT ->
             ok
+        end
+    end)()
+).
+
+-define(assertExceptionOneOf(CT1, CT2, EXPR),
+    (fun() ->
+        X__Attrs = [
+            {module, ?MODULE},
+            {line, ?LINE},
+            {expression, (??EXPR)},
+            {pattern, "[ " ++ (??CT1) ++ ", " ++ (??CT2) ++ " ]"}
+        ],
+        X__Exc =
+            try (EXPR) of
+                X__V -> erlang:error({assertException, [{unexpected_success, X__V} | X__Attrs]})
+            catch
+                X__C:X__T:X__S -> {X__C, X__T, X__S}
+            end,
+        case {element(1, X__Exc), element(2, X__Exc)} of
+            CT1 -> ok;
+            CT2 -> ok;
+            _ -> erlang:error({assertException, [{unexpected_exception, X__Exc} | X__Attrs]})
         end
     end)()
 ).

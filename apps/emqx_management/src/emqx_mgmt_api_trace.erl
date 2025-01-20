@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx_utils/include/emqx_utils_api.hrl").
 
 -export([
     api_spec/0,
@@ -51,8 +52,7 @@
 -define(MAX_SINT32, 2147483647).
 
 -define(TO_BIN(_B_), iolist_to_binary(_B_)).
--define(NOT_FOUND(N), {404, #{code => 'NOT_FOUND', message => ?TO_BIN([N, " NOT FOUND"])}}).
--define(SERVICE_UNAVAILABLE(C, M), {503, #{code => C, message => ?TO_BIN(M)}}).
+-define(NOT_FOUND_WITH_MSG(N), ?NOT_FOUND(?TO_BIN([N, " NOT FOUND"]))).
 -define(TAGS, [<<"Trace">>]).
 
 namespace() -> "trace".
@@ -222,7 +222,7 @@ fields(trace) ->
             )},
         {type,
             hoconsc:mk(
-                hoconsc:enum([clientid, topic, ip_address]),
+                hoconsc:enum([clientid, topic, ip_address, ruleid]),
                 #{
                     description => ?DESC(filter_type),
                     required => true,
@@ -257,6 +257,15 @@ fields(trace) ->
                     example => <<"127.0.0.1">>
                 }
             )},
+        {ruleid,
+            hoconsc:mk(
+                binary(),
+                #{
+                    description => ?DESC(ruleid_field),
+                    required => false,
+                    example => <<"my_rule">>
+                }
+            )},
         {status,
             hoconsc:mk(
                 hoconsc:enum([running, stopped, waiting]),
@@ -281,7 +290,7 @@ fields(trace) ->
             })},
         {start_at,
             hoconsc:mk(
-                emqx_datetime:epoch_second(),
+                emqx_utils_calendar:epoch_second(),
                 #{
                     description => ?DESC(time_format),
                     required => false,
@@ -290,7 +299,7 @@ fields(trace) ->
             )},
         {end_at,
             hoconsc:mk(
-                emqx_datetime:epoch_second(),
+                emqx_utils_calendar:epoch_second(),
                 #{
                     description => ?DESC(time_format),
                     required => false,
@@ -303,6 +312,15 @@ fields(trace) ->
                 #{
                     description => ?DESC(trace_log_size),
                     example => [#{<<"node">> => <<"emqx@127.0.0.1">>, <<"size">> => 1024}],
+                    required => false
+                }
+            )},
+        {formatter,
+            hoconsc:mk(
+                hoconsc:union([text, json]),
+                #{
+                    description => ?DESC(trace_log_formatter),
+                    example => text,
                     required => false
                 }
             )}
@@ -410,8 +428,8 @@ trace(get, _Params) ->
                         Trace0#{
                             log_size => LogSize,
                             Type => iolist_to_binary(Filter),
-                            start_at => list_to_binary(calendar:system_time_to_rfc3339(Start)),
-                            end_at => list_to_binary(calendar:system_time_to_rfc3339(End)),
+                            start_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
+                            end_at => emqx_utils_calendar:epoch_to_rfc3339(End, second),
                             status => status(Enable, Start, End, Now)
                         }
                     end,
@@ -468,21 +486,21 @@ format_trace(Trace0) ->
     Trace2#{
         log_size => LogSize,
         Type => iolist_to_binary(Filter),
-        start_at => list_to_binary(calendar:system_time_to_rfc3339(Start)),
-        end_at => list_to_binary(calendar:system_time_to_rfc3339(End)),
+        start_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
+        end_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
         status => status(Enable, Start, End, Now)
     }.
 
 delete_trace(delete, #{bindings := #{name := Name}}) ->
     case emqx_trace:delete(Name) of
         ok -> {204};
-        {error, not_found} -> ?NOT_FOUND(Name)
+        {error, not_found} -> ?NOT_FOUND_WITH_MSG(Name)
     end.
 
 update_trace(put, #{bindings := #{name := Name}}) ->
     case emqx_trace:update(Name, false) of
         ok -> {200, #{enable => false, name => Name}};
-        {error, not_found} -> ?NOT_FOUND(Name)
+        {error, not_found} -> ?NOT_FOUND_WITH_MSG(Name)
     end.
 
 %% if HTTP request headers include accept-encoding: gzip and file size > 300 bytes.
@@ -493,64 +511,87 @@ download_trace_log(get, #{bindings := #{name := Name}, query_string := Query}) -
             case parse_node(Query, undefined) of
                 {ok, Node} ->
                     TraceFiles = collect_trace_file(Node, TraceLog),
-                    %% We generate a session ID so that we name files
-                    %% with unique names. Then we won't cause
-                    %% overwrites for concurrent requests.
-                    SessionId = emqx_utils:gen_id(),
-                    ZipDir = filename:join([emqx_trace:zip_dir(), SessionId]),
-                    ok = file:make_dir(ZipDir),
-                    %% Write files to ZipDir and create an in-memory zip file
-                    Zips = group_trace_file(ZipDir, TraceLog, TraceFiles),
-                    ZipName = binary_to_list(Name) ++ ".zip",
-                    Binary =
-                        try
-                            {ok, {ZipName, Bin}} = zip:zip(ZipName, Zips, [memory, {cwd, ZipDir}]),
-                            Bin
-                        after
-                            %% emqx_trace:delete_files_after_send(ZipFileName, Zips),
-                            %% TODO use file replace file_binary.(delete file after send is not ready now).
-                            ok = file:del_dir_r(ZipDir)
-                        end,
-                    ?tp(trace_api_download_trace_log, #{
-                        files => Zips,
-                        name => Name,
-                        session_id => SessionId,
-                        zip_dir => ZipDir,
-                        zip_name => ZipName
-                    }),
-                    Headers = #{
-                        <<"content-type">> => <<"application/x-zip">>,
-                        <<"content-disposition">> => iolist_to_binary(
-                            "attachment; filename=" ++ ZipName
-                        )
-                    },
-                    {200, Headers, {file_binary, ZipName, Binary}};
+                    maybe_download_trace_log(Name, TraceLog, TraceFiles);
                 {error, not_found} ->
-                    ?NOT_FOUND(<<"Node">>)
+                    ?NOT_FOUND_WITH_MSG(<<"Node">>)
             end;
         {error, not_found} ->
-            ?NOT_FOUND(Name)
+            ?NOT_FOUND_WITH_MSG(Name)
     end.
+
+maybe_download_trace_log(Name, TraceLog, TraceFiles) ->
+    case group_trace_files(TraceLog, TraceFiles) of
+        #{nonempty := Files} ->
+            do_download_trace_log(Name, TraceLog, Files);
+        #{error := Reasons} ->
+            ?INTERNAL_ERROR(Reasons);
+        #{empty := _} ->
+            ?NOT_FOUND(<<"Trace is empty">>)
+    end.
+
+do_download_trace_log(Name, TraceLog, TraceFiles) ->
+    %% We generate a session ID so that we name files
+    %% with unique names. Then we won't cause
+    %% overwrites for concurrent requests.
+    SessionId = emqx_utils:gen_id(),
+    ZipDir = filename:join([emqx_trace:zip_dir(), SessionId]),
+    ok = file:make_dir(ZipDir),
+    %% Write files to ZipDir and create an in-memory zip file
+    Zips = group_trace_file(ZipDir, TraceLog, TraceFiles),
+    ZipName = binary_to_list(Name) ++ ".zip",
+    Binary =
+        try
+            {ok, {ZipName, Bin}} = zip:zip(ZipName, Zips, [memory, {cwd, ZipDir}]),
+            Bin
+        after
+            %% emqx_trace:delete_files_after_send(ZipFileName, Zips),
+            %% TODO use file replace file_binary.(delete file after send is not ready now).
+            ok = file:del_dir_r(ZipDir)
+        end,
+    ?tp(trace_api_download_trace_log, #{
+        files => Zips,
+        name => Name,
+        session_id => SessionId,
+        zip_dir => ZipDir,
+        zip_name => ZipName
+    }),
+    Headers = #{
+        <<"content-type">> => <<"application/x-zip">>,
+        <<"content-disposition">> => iolist_to_binary(
+            "attachment; filename=" ++ ZipName
+        )
+    },
+    {200, Headers, {file_binary, ZipName, Binary}}.
+
+group_trace_files(TraceLog, TraceFiles) ->
+    maps:groups_from_list(
+        fun
+            ({ok, _Node, <<>>}) ->
+                empty;
+            ({ok, _Node, _Bin}) ->
+                nonempty;
+            ({error, _Node, enoent}) ->
+                empty;
+            ({error, Node, Reason}) ->
+                ?SLOG(error, #{
+                    msg => "download_trace_log_error",
+                    node => Node,
+                    log => TraceLog,
+                    reason => Reason
+                }),
+                error
+        end,
+        TraceFiles
+    ).
 
 group_trace_file(ZipDir, TraceLog, TraceFiles) ->
     lists:foldl(
-        fun(Res, Acc) ->
-            case Res of
-                {ok, Node, Bin} ->
-                    FileName = Node ++ "-" ++ TraceLog,
-                    ZipName = filename:join([ZipDir, FileName]),
-                    case file:write_file(ZipName, Bin) of
-                        ok -> [FileName | Acc];
-                        _ -> Acc
-                    end;
-                {error, Node, Reason} ->
-                    ?SLOG(error, #{
-                        msg => "download_trace_log_error",
-                        node => Node,
-                        log => TraceLog,
-                        reason => Reason
-                    }),
-                    Acc
+        fun({ok, Node, Bin}, Acc) ->
+            FileName = Node ++ "-" ++ TraceLog,
+            ZipName = filename:join([ZipDir, FileName]),
+            case file:write_file(ZipName, Bin) of
+                ok -> [FileName | Acc];
+                _ -> Acc
             end
         end,
         [],
@@ -578,7 +619,7 @@ log_file_detail(get, #{bindings := #{name := Name}}) ->
             TraceFiles = collect_trace_file_detail(TraceLog),
             {200, group_trace_file_detail(TraceFiles)};
         {error, not_found} ->
-            ?NOT_FOUND(Name)
+            ?NOT_FOUND_WITH_MSG(Name)
     end.
 
 group_trace_file_detail(TraceLogDetail) ->
@@ -609,7 +650,7 @@ stream_log_file(get, #{bindings := #{name := Name}, query_string := Query}) ->
                     Meta = #{<<"position">> => Position, <<"bytes">> => Bytes},
                     {200, #{meta => Meta, items => <<"">>}};
                 {error, not_found} ->
-                    ?NOT_FOUND(Name);
+                    ?NOT_FOUND_WITH_MSG(Name);
                 {error, enomem} ->
                     ?SLOG(warning, #{
                         code => not_enough_mem,
@@ -617,12 +658,12 @@ stream_log_file(get, #{bindings := #{name := Name}, query_string := Query}) ->
                         bytes => Bytes,
                         name => Name
                     }),
-                    ?SERVICE_UNAVAILABLE('SERVICE_UNAVAILABLE', <<"Requested chunk size too big">>);
+                    ?SERVICE_UNAVAILABLE(<<"Requested chunk size too big">>);
                 {badrpc, nodedown} ->
-                    ?NOT_FOUND(<<"Node">>)
+                    ?NOT_FOUND_WITH_MSG(<<"Node">>)
             end;
         {error, not_found} ->
-            ?NOT_FOUND(<<"Node">>)
+            ?NOT_FOUND_WITH_MSG(<<"Node">>)
     end.
 
 -spec get_trace_size() -> #{{node(), file:name_all()} => non_neg_integer()}.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_api).
@@ -23,6 +23,8 @@
     roots/0
 ]).
 
+-define(TAGS, [<<"Node Eviction">>]).
+
 %% API callbacks
 -export([
     '/node_eviction/status'/2
@@ -44,7 +46,7 @@ schema("/node_eviction/status") ->
     #{
         'operationId' => '/node_eviction/status',
         get => #{
-            tags => [<<"node_eviction">>],
+            tags => ?TAGS,
             summary => <<"Get node eviction status">>,
             description => ?DESC("node_eviction_status_get"),
             responses => #{

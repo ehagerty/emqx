@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,12 +23,10 @@
 -export([
     start/0,
     init/1,
-    format_status/2,
     handle_event/2,
     handle_call/2,
     handle_info/2,
-    terminate/2,
-    code_change/3
+    terminate/2
 ]).
 
 -include_lib("emqx/include/logger.hrl").
@@ -43,7 +41,9 @@ start() ->
 init({[], _}) -> {ok, #{}}.
 
 handle_event(sigterm, State) ->
-    ?ULOG("Received terminate signal, shutting down now~n", []),
+    Msg = "received_terminate_signal",
+    ?SLOG(critical, #{msg => Msg}),
+    ?ULOG("~ts ~ts, shutting down now.~n", [emqx_utils_calendar:now_to_rfc3339(), Msg]),
     emqx_machine_terminator:graceful(),
     {ok, State};
 handle_event(Event, State) ->
@@ -60,12 +60,6 @@ handle_info(_Other, State) ->
 
 handle_call(_Request, State) ->
     {ok, ok, State}.
-
-format_status(_Opt, [_Pdict, _S]) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 terminate(_Args, _State) ->
     ok.

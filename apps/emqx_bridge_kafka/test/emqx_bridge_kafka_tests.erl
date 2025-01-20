@@ -1,10 +1,15 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_kafka_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+
+-export([atoms/0, kafka_producer_old_hocon/1]).
+
+%% ensure atoms exist
+atoms() -> [myproducer, my_consumer].
 
 %%===========================================================================
 %% Test cases
@@ -14,7 +19,6 @@ kafka_producer_test() ->
     Conf1 = parse(kafka_producer_old_hocon(_WithLocalTopic0 = false)),
     Conf2 = parse(kafka_producer_old_hocon(_WithLocalTopic1 = true)),
     Conf3 = parse(kafka_producer_new_hocon()),
-
     ?assertMatch(
         #{
             <<"bridges">> :=
@@ -139,6 +143,7 @@ kafka_consumer_test() ->
     ok.
 
 message_key_dispatch_validations_test() ->
+    Name = myproducer,
     Conf0 = kafka_producer_new_hocon(),
     Conf1 =
         Conf0 ++
@@ -155,7 +160,9 @@ message_key_dispatch_validations_test() ->
                     <<"message">> := #{<<"key">> := <<>>}
                 }
         },
-        emqx_utils_maps:deep_get([<<"bridges">>, <<"kafka">>, <<"myproducer">>], Conf)
+        emqx_utils_maps:deep_get(
+            [<<"bridges">>, <<"kafka">>, atom_to_binary(Name)], Conf
+        )
     ),
     ?assertThrow(
         {_, [
@@ -166,8 +173,6 @@ message_key_dispatch_validations_test() ->
         ]},
         check(Conf)
     ),
-    %% ensure atoms exist
-    _ = [myproducer],
     ?assertThrow(
         {_, [
             #{
@@ -182,8 +187,6 @@ message_key_dispatch_validations_test() ->
 tcp_keepalive_validation_test_() ->
     ProducerConf = parse(kafka_producer_new_hocon()),
     ConsumerConf = parse(kafka_consumer_hocon()),
-    %% ensure atoms exist
-    _ = [my_producer, my_consumer],
     test_keepalive_validation([<<"kafka">>, <<"myproducer">>], ProducerConf) ++
         test_keepalive_validation([<<"kafka_consumer">>, <<"my_consumer">>], ConsumerConf).
 
@@ -200,6 +203,37 @@ test_keepalive_validation(Name, Conf) ->
         [?_assertMatch(#{bridges := _}, check_atom_key(C)) || C <- ValidConfs] ++
         [?_assertThrow(_, check(C)) || C <- InvalidConfs] ++
         [?_assertThrow(_, check_atom_key(C)) || C <- InvalidConfs].
+
+%% assert compatibility
+bridge_schema_json_test() ->
+    JSON = iolist_to_binary(emqx_dashboard_schema_api:bridge_schema_json()),
+    Map = emqx_utils_json:decode(JSON),
+    Path = [<<"components">>, <<"schemas">>, <<"bridge_kafka.post_producer">>, <<"properties">>],
+    ?assertMatch(#{<<"kafka">> := _}, emqx_utils_maps:deep_get(Path, Map)).
+
+custom_group_id_test() ->
+    BaseConfig = kafka_consumer_source_config(),
+    BadSourceConfig = emqx_utils_maps:deep_merge(
+        BaseConfig,
+        #{<<"parameters">> => #{<<"group_id">> => <<>>}}
+    ),
+    %% Empty strings will be treated as absent by the connector.
+    ?assertMatch(
+        #{<<"parameters">> := #{<<"group_id">> := <<"">>}},
+        emqx_bridge_v2_testlib:parse_and_check(source, kafka_consumer, my_consumer, BadSourceConfig)
+    ),
+
+    CustomId = <<"custom_id">>,
+    OkSourceConfig = emqx_utils_maps:deep_merge(
+        BaseConfig,
+        #{<<"parameters">> => #{<<"group_id">> => CustomId}}
+    ),
+    ?assertMatch(
+        #{<<"parameters">> := #{<<"group_id">> := CustomId}},
+        emqx_bridge_v2_testlib:parse_and_check(source, kafka_consumer, my_consumer, OkSourceConfig)
+    ),
+
+    ok.
 
 %%===========================================================================
 %% Helper functions
@@ -221,135 +255,152 @@ check_atom_key(Conf) when is_map(Conf) ->
 %% Data section
 %%===========================================================================
 
-%% erlfmt-ignore
 kafka_producer_old_hocon(_WithLocalTopic = true) ->
     kafka_producer_old_hocon("mqtt {topic = \"mqtt/local\"}\n");
 kafka_producer_old_hocon(_WithLocalTopic = false) ->
     kafka_producer_old_hocon("mqtt {}\n");
 kafka_producer_old_hocon(MQTTConfig) when is_list(MQTTConfig) ->
-"""
-bridges.kafka {
-  myproducer {
-    authentication = \"none\"
-    bootstrap_hosts = \"toxiproxy:9292\"
-    connect_timeout = \"5s\"
-    metadata_request_timeout = \"5s\"
-    min_metadata_refresh_interval = \"3s\"
-    producer {
-      kafka {
-        buffer {
-          memory_overload_protection = false
-          mode = \"memory\"
-          per_partition_limit = \"2GB\"
-          segment_bytes = \"100MB\"
-        }
-        compression = \"no_compression\"
-        max_batch_bytes = \"896KB\"
-        max_inflight = 10
-        message {
-          key = \"${.clientid}\"
-          timestamp = \"${.timestamp}\"
-          value = \"${.}\"
-        }
-        partition_count_refresh_interval = \"60s\"
-        partition_strategy = \"random\"
-        required_acks = \"all_isr\"
-        topic = \"test-topic-two-partitions\"
-      }
-""" ++ MQTTConfig ++
-"""
-    }
-    socket_opts {
-      nodelay = true
-      recbuf = \"1024KB\"
-      sndbuf = \"1024KB\"
-    }
-    ssl {enable = false, verify = \"verify_peer\"}
-  }
-}
-""".
+    [
+        "bridges.kafka {"
+        "\n  myproducer {"
+        "\n    authentication = \"none\""
+        "\n    bootstrap_hosts = \"toxiproxy:9292\""
+        "\n    connect_timeout = \"5s\""
+        "\n    metadata_request_timeout = \"5s\""
+        "\n    min_metadata_refresh_interval = \"3s\""
+        "\n    producer {"
+        "\n      kafka {"
+        "\n        buffer {"
+        "\n          memory_overload_protection = false"
+        "\n          mode = \"memory\""
+        "\n          per_partition_limit = \"2GB\""
+        "\n          segment_bytes = \"100MB\""
+        "\n        }"
+        "\n        compression = \"no_compression\""
+        "\n        max_batch_bytes = \"896KB\""
+        "\n        max_inflight = 10"
+        "\n        message {"
+        "\n          key = \"${.clientid}\""
+        "\n          timestamp = \"${.timestamp}\""
+        "\n          value = \"${.}\""
+        "\n        }"
+        "\n        partition_count_refresh_interval = \"60s\""
+        "\n        partition_strategy = \"random\""
+        "\n        required_acks = \"all_isr\""
+        "\n        topic = \"test-topic-two-partitions\""
+        "\n      }",
+        MQTTConfig,
+        "\n    }"
+        "\n    socket_opts {"
+        "\n      nodelay = true"
+        "\n      recbuf = \"1024KB\""
+        "\n      sndbuf = \"1024KB\""
+        "\n    }"
+        "\n    ssl {enable = false, verify = \"verify_peer\"}"
+        "\n  }"
+        "\n}"
+    ].
 
 kafka_producer_new_hocon() ->
-    ""
-    "\n"
-    "bridges.kafka {\n"
-    "  myproducer {\n"
-    "    authentication = \"none\"\n"
-    "    bootstrap_hosts = \"toxiproxy:9292\"\n"
-    "    connect_timeout = \"5s\"\n"
-    "    metadata_request_timeout = \"5s\"\n"
-    "    min_metadata_refresh_interval = \"3s\"\n"
-    "    kafka {\n"
-    "      buffer {\n"
-    "        memory_overload_protection = false\n"
-    "        mode = \"memory\"\n"
-    "        per_partition_limit = \"2GB\"\n"
-    "        segment_bytes = \"100MB\"\n"
-    "      }\n"
-    "      compression = \"no_compression\"\n"
-    "      max_batch_bytes = \"896KB\"\n"
-    "      max_inflight = 10\n"
-    "      message {\n"
-    "        key = \"${.clientid}\"\n"
-    "        timestamp = \"${.timestamp}\"\n"
-    "        value = \"${.}\"\n"
-    "      }\n"
-    "      partition_count_refresh_interval = \"60s\"\n"
-    "      partition_strategy = \"random\"\n"
-    "      required_acks = \"all_isr\"\n"
-    "      topic = \"test-topic-two-partitions\"\n"
-    "    }\n"
-    "    local_topic = \"mqtt/local\"\n"
-    "    socket_opts {\n"
-    "      nodelay = true\n"
-    "      recbuf = \"1024KB\"\n"
-    "      sndbuf = \"1024KB\"\n"
-    "    }\n"
-    "    ssl {enable = false, verify = \"verify_peer\"}\n"
-    "  }\n"
-    "}\n"
-    "".
+    "bridges.kafka {"
+    "\n  myproducer {"
+    "\n    authentication = \"none\""
+    "\n    bootstrap_hosts = \"toxiproxy:9292\""
+    "\n    connect_timeout = \"5s\""
+    "\n    metadata_request_timeout = \"5s\""
+    "\n    min_metadata_refresh_interval = \"3s\""
+    "\n    kafka {"
+    "\n      buffer {"
+    "\n        memory_overload_protection = false"
+    "\n        mode = \"memory\""
+    "\n        per_partition_limit = \"2GB\""
+    "\n        segment_bytes = \"100MB\""
+    "\n      }"
+    "\n      compression = \"no_compression\""
+    "\n      max_batch_bytes = \"896KB\""
+    "\n      max_inflight = 10"
+    "\n      message {"
+    "\n        key = \"${.clientid}\""
+    "\n        timestamp = \"${.timestamp}\""
+    "\n        value = \"${.}\""
+    "\n      }"
+    "\n      partition_count_refresh_interval = \"60s\""
+    "\n      partition_strategy = \"random\""
+    "\n      required_acks = \"all_isr\""
+    "\n      topic = \"test-topic-two-partitions\""
+    "\n    }"
+    "\n    local_topic = \"mqtt/local\""
+    "\n    socket_opts {"
+    "\n      nodelay = true"
+    "\n      recbuf = \"1024KB\""
+    "\n      sndbuf = \"1024KB\""
+    "\n    }"
+    "\n    ssl {enable = false, verify = \"verify_peer\"}"
+    "\n    resource_opts {"
+    "\n      health_check_interval = 10s"
+    "\n    }"
+    "\n  }"
+    "\n}".
 
-%% erlfmt-ignore
 kafka_consumer_hocon() ->
-"""
-bridges.kafka_consumer.my_consumer {
-  enable = true
-  bootstrap_hosts = \"kafka-1.emqx.net:9292\"
-  connect_timeout = 5s
-  min_metadata_refresh_interval = 3s
-  metadata_request_timeout = 5s
-  authentication = {
-    mechanism = plain
-    username = emqxuser
-    password = password
-  }
-  kafka {
-    max_batch_bytes = 896KB
-    max_rejoin_attempts = 5
-    offset_commit_interval_seconds = 3s
-    offset_reset_policy = latest
-  }
-  topic_mapping = [
-    {
-      kafka_topic = \"kafka-topic-1\"
-      mqtt_topic = \"mqtt/topic/1\"
-      qos = 1
-      payload_template = \"${.}\"
-    },
-    {
-      kafka_topic = \"kafka-topic-2\"
-      mqtt_topic = \"mqtt/topic/2\"
-      qos = 2
-      payload_template = \"v = ${.value}\"
-    }
-  ]
-  key_encoding_mode = none
-  value_encoding_mode = none
-  ssl {
-    enable = false
-    verify = verify_none
-    server_name_indication = \"auto\"
-  }
-}
-""".
+    "bridges.kafka_consumer.my_consumer {"
+    "\n   enable = true"
+    "\n   bootstrap_hosts = \"kafka-1.emqx.net:9292\""
+    "\n   connect_timeout = 5s"
+    "\n   min_metadata_refresh_interval = 3s"
+    "\n   metadata_request_timeout = 5s"
+    "\n   authentication = {"
+    "\n     mechanism = plain"
+    "\n     username = emqxuser"
+    "\n     password = password"
+    "\n   }"
+    "\n   kafka {"
+    "\n     max_batch_bytes = 896KB"
+    "\n     max_rejoin_attempts = 5"
+    "\n     offset_commit_interval_seconds = 3s"
+    "\n     offset_reset_policy = latest"
+    "\n   }"
+    "\n   topic_mapping = ["
+    "\n     {"
+    "\n       kafka_topic = \"kafka-topic-1\""
+    "\n       mqtt_topic = \"mqtt/topic/1\""
+    "\n       qos = 1"
+    "\n       payload_template = \"${.}\""
+    "\n     },"
+    "\n     {"
+    "\n       kafka_topic = \"kafka-topic-2\""
+    "\n       mqtt_topic = \"mqtt/topic/2\""
+    "\n       qos = 2"
+    "\n       payload_template = \"v = ${.value}\""
+    "\n     }"
+    "\n   ]"
+    "\n   key_encoding_mode = none"
+    "\n   value_encoding_mode = none"
+    "\n   ssl {"
+    "\n     enable = false"
+    "\n     verify = verify_none"
+    "\n     server_name_indication = \"auto\""
+    "\n   }"
+    "\n   resource_opts {"
+    "\n     health_check_interval = 10s"
+    "\n   }"
+    "\n }".
+
+kafka_consumer_source_config() ->
+    #{
+        <<"enable">> => true,
+        <<"connector">> => <<"my_connector">>,
+        <<"parameters">> =>
+            #{
+                <<"key_encoding_mode">> => <<"none">>,
+                <<"max_batch_bytes">> => <<"896KB">>,
+                <<"max_rejoin_attempts">> => <<"5">>,
+                <<"offset_reset_policy">> => <<"latest">>,
+                <<"topic">> => <<"please override">>,
+                <<"value_encoding_mode">> => <<"none">>
+            },
+        <<"resource_opts">> => #{
+            <<"health_check_interval">> => <<"2s">>,
+            <<"resume_interval">> => <<"2s">>
+        }
+    }.

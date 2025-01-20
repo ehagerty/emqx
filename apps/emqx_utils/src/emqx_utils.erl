@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@
     proc_stats/0,
     proc_stats/1,
     rand_seed/0,
+    rand_id/1,
     now_to_secs/1,
     now_to_ms/1,
     index_of/2,
@@ -51,6 +52,8 @@
     gen_id/0,
     gen_id/1,
     explain_posix/1,
+    pforeach/2,
+    pforeach/3,
     pmap/2,
     pmap/3,
     readable_error_msg/1,
@@ -60,8 +63,15 @@
     safe_filename/1,
     diff_lists/3,
     merge_lists/3,
-    tcp_keepalive_opts/4,
-    format/1
+    flattermap/2,
+    format/1,
+    format/2,
+    format_mfal/2,
+    call_first_defined/3,
+    ntoa/1,
+    foldl_while/3,
+    is_restricted_str/1,
+    interactive_load/1
 ]).
 
 -export([
@@ -75,8 +85,15 @@
 ]).
 
 -export([clamp/3, redact/1, redact/2, is_redacted/2, is_redacted/3]).
+-export([deobfuscate/2]).
 
--type maybe(T) :: undefined | T.
+-export_type([
+    readable_error_msg/1
+]).
+
+-type readable_error_msg(_Error) :: binary().
+
+-type option(T) :: undefined | T.
 
 -dialyzer({nowarn_function, [nolink_apply/2]}).
 
@@ -115,8 +132,8 @@ merge_opts(Defaults, Options) ->
     ).
 
 %% @doc Apply a function to a maybe argument.
--spec maybe_apply(fun((maybe(A)) -> maybe(A)), maybe(A)) ->
-    maybe(A)
+-spec maybe_apply(fun((option(A)) -> option(A)), option(A)) ->
+    option(A)
 when
     A :: any().
 maybe_apply(_Fun, undefined) ->
@@ -164,6 +181,17 @@ pipeline([Fun | More], Input, State) ->
         {error, Reason, NState} -> {error, Reason, NState}
     end.
 
+-spec foldl_while(fun((X, Acc) -> {cont | halt, Acc}), Acc, [X]) -> Acc.
+foldl_while(_Fun, Acc, []) ->
+    Acc;
+foldl_while(Fun, Acc, [X | Xs]) ->
+    case Fun(X, Acc) of
+        {cont, NewAcc} ->
+            foldl_while(Fun, NewAcc, Xs);
+        {halt, NewAcc} ->
+            NewAcc
+    end.
+
 -compile({inline, [apply_fun/3]}).
 apply_fun(Fun, Input, State) ->
     case erlang:fun_info(Fun, arity) of
@@ -171,17 +199,17 @@ apply_fun(Fun, Input, State) ->
         {arity, 2} -> Fun(Input, State)
     end.
 
--spec start_timer(integer() | atom(), term()) -> maybe(reference()).
+-spec start_timer(integer() | atom(), term()) -> option(reference()).
 start_timer(Interval, Msg) ->
     start_timer(Interval, self(), Msg).
 
--spec start_timer(integer() | atom(), pid() | atom(), term()) -> maybe(reference()).
+-spec start_timer(integer() | atom(), pid() | atom(), term()) -> option(reference()).
 start_timer(Interval, Dest, Msg) when is_number(Interval) ->
     erlang:start_timer(erlang:ceil(Interval), Dest, Msg);
 start_timer(_Atom, _Dest, _Msg) ->
     undefined.
 
--spec cancel_timer(maybe(reference())) -> ok.
+-spec cancel_timer(option(reference())) -> ok.
 cancel_timer(Timer) when is_reference(Timer) ->
     case erlang:cancel_timer(Timer) of
         false ->
@@ -249,7 +277,7 @@ check_oom(Pid, #{
             ok;
         [{message_queue_len, QLen}, {total_heap_size, HeapSize}] ->
             do_check_oom([
-                {QLen, MaxQLen, message_queue_too_long},
+                {QLen, MaxQLen, mailbox_overflow},
                 {HeapSize, MaxHeapSize, proc_heap_too_large}
             ])
     end.
@@ -263,8 +291,10 @@ do_check_oom([{Val, Max, Reason} | Rest]) ->
     end.
 
 tune_heap_size(#{enable := false}) ->
-    ok;
+    ignore;
 %% If the max_heap_size is set to zero, the limit is disabled.
+tune_heap_size(#{max_heap_size := 0}) ->
+    ignore;
 tune_heap_size(#{max_heap_size := MaxHeapSize}) when MaxHeapSize > 0 ->
     MaxSize =
         case erlang:system_info(wordsize) of
@@ -412,6 +442,15 @@ explain_posix(estale) -> "Stale remote file handle";
 explain_posix(exdev) -> "Cross-domain link";
 explain_posix(NotPosix) -> NotPosix.
 
+-spec pforeach(fun((A) -> term()), list(A)) -> ok.
+pforeach(Fun, List) when is_function(Fun, 1), is_list(List) ->
+    pforeach(Fun, List, ?DEFAULT_PMAP_TIMEOUT).
+
+-spec pforeach(fun((A) -> term()), list(A), timeout()) -> ok.
+pforeach(Fun, List, Timeout) ->
+    _ = pmap(Fun, List, Timeout),
+    ok.
+
 %% @doc Like lists:map/2, only the callback function is evaluated
 %% concurrently.
 -spec pmap(fun((A) -> B), list(A)) -> list(B).
@@ -420,7 +459,9 @@ pmap(Fun, List) when is_function(Fun, 1), is_list(List) ->
 
 -spec pmap(fun((A) -> B), list(A), timeout()) -> list(B).
 pmap(Fun, List, Timeout) when
-    is_function(Fun, 1), is_list(List), is_integer(Timeout), Timeout >= 0
+    is_function(Fun, 1),
+    is_list(List),
+    (is_integer(Timeout) andalso Timeout >= 0 orelse Timeout =:= infinity)
 ->
     nolink_apply(fun() -> do_parallel_map(Fun, List) end, Timeout).
 
@@ -432,7 +473,7 @@ pmap(Fun, List, Timeout) when
 nolink_apply(Fun) -> nolink_apply(Fun, infinity).
 
 %% @doc Same as `nolink_apply/1', with a timeout.
--spec nolink_apply(function(), timer:timeout()) -> term().
+-spec nolink_apply(function(), timeout()) -> term().
 nolink_apply(Fun, Timeout) when is_function(Fun, 0) ->
     Caller = self(),
     ResRef = alias([reply]),
@@ -506,28 +547,50 @@ safe_to_existing_atom(Atom, _Encoding) when is_atom(Atom) ->
 safe_to_existing_atom(_Any, _Encoding) ->
     {error, invalid_type}.
 
--spec tcp_keepalive_opts(term(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
-    {ok, [{keepalive, true} | {raw, non_neg_integer(), non_neg_integer(), binary()}]}
-    | {error, {unsupported_os, term()}}.
-tcp_keepalive_opts({unix, linux}, Idle, Interval, Probes) ->
-    {ok, [
-        {keepalive, true},
-        {raw, 6, 4, <<Idle:32/native>>},
-        {raw, 6, 5, <<Interval:32/native>>},
-        {raw, 6, 6, <<Probes:32/native>>}
-    ]};
-tcp_keepalive_opts({unix, darwin}, Idle, Interval, Probes) ->
-    {ok, [
-        {keepalive, true},
-        {raw, 6, 16#10, <<Idle:32/native>>},
-        {raw, 6, 16#101, <<Interval:32/native>>},
-        {raw, 6, 16#102, <<Probes:32/native>>}
-    ]};
-tcp_keepalive_opts(OS, _Idle, _Interval, _Probes) ->
-    {error, {unsupported_os, OS}}.
-
 format(Term) ->
-    iolist_to_binary(io_lib:format("~0p", [Term])).
+    unicode:characters_to_binary(io_lib:format("~0tp", [Term])).
+
+format(Fmt, Args) ->
+    unicode:characters_to_binary(io_lib:format(Fmt, Args)).
+
+%% @doc Helper function for log formatters.
+-spec format_mfal(map(), map()) -> undefined | binary().
+format_mfal(Data, #{with_mfa := true}) ->
+    Line =
+        case maps:get(line, Data, undefined) of
+            undefined ->
+                <<"">>;
+            Num ->
+                ["(", integer_to_list(Num), ")"]
+        end,
+    case maps:get(mfa, Data, undefined) of
+        {M, F, A} ->
+            iolist_to_binary([
+                atom_to_binary(M, utf8),
+                $:,
+                atom_to_binary(F, utf8),
+                $/,
+                integer_to_binary(A),
+                Line
+            ]);
+        _ ->
+            undefined
+    end;
+format_mfal(_, _) ->
+    undefined.
+
+-spec call_first_defined(module(), atom(), list()) -> term() | no_return().
+call_first_defined(Module, Function, []) ->
+    error({not_exported, Module, Function});
+call_first_defined(Module, Function, [Args | Rest]) ->
+    %% ensure module is loaded
+    ok = interactive_load(Module),
+    case erlang:function_exported(Module, Function, length(Args)) of
+        true ->
+            apply(Module, Function, Args);
+        false ->
+            call_first_defined(Module, Function, Rest)
+    end.
 
 %%------------------------------------------------------------------------------
 %% Internal Functions
@@ -620,109 +683,20 @@ try_to_existing_atom(Convert, Data, Encoding) ->
         _:Reason -> {error, Reason}
     end.
 
-is_sensitive_key(aws_secret_access_key) -> true;
-is_sensitive_key("aws_secret_access_key") -> true;
-is_sensitive_key(<<"aws_secret_access_key">>) -> true;
-is_sensitive_key(password) -> true;
-is_sensitive_key("password") -> true;
-is_sensitive_key(<<"password">>) -> true;
-is_sensitive_key('proxy-authorization') -> true;
-is_sensitive_key("proxy-authorization") -> true;
-is_sensitive_key(<<"proxy-authorization">>) -> true;
-is_sensitive_key(secret) -> true;
-is_sensitive_key("secret") -> true;
-is_sensitive_key(<<"secret">>) -> true;
-is_sensitive_key(secret_key) -> true;
-is_sensitive_key("secret_key") -> true;
-is_sensitive_key(<<"secret_key">>) -> true;
-is_sensitive_key(security_token) -> true;
-is_sensitive_key("security_token") -> true;
-is_sensitive_key(<<"security_token">>) -> true;
-is_sensitive_key(token) -> true;
-is_sensitive_key("token") -> true;
-is_sensitive_key(<<"token">>) -> true;
-is_sensitive_key(jwt) -> true;
-is_sensitive_key("jwt") -> true;
-is_sensitive_key(<<"jwt">>) -> true;
-is_sensitive_key(authorization) -> true;
-is_sensitive_key("authorization") -> true;
-is_sensitive_key(<<"authorization">>) -> true;
-is_sensitive_key(Key) -> is_authorization(Key).
-
 redact(Term) ->
-    do_redact(Term, fun is_sensitive_key/1).
+    emqx_utils_redact:redact(Term).
 
 redact(Term, Checker) ->
-    do_redact(Term, fun(V) ->
-        is_sensitive_key(V) orelse Checker(V)
-    end).
+    emqx_utils_redact:redact(Term, Checker).
 
-do_redact(L, Checker) when is_list(L) ->
-    lists:map(fun(E) -> do_redact(E, Checker) end, L);
-do_redact(M, Checker) when is_map(M) ->
-    maps:map(
-        fun(K, V) ->
-            do_redact(K, V, Checker)
-        end,
-        M
-    );
-do_redact({Key, Value}, Checker) ->
-    case Checker(Key) of
-        true ->
-            {Key, redact_v(Value)};
-        false ->
-            {do_redact(Key, Checker), do_redact(Value, Checker)}
-    end;
-do_redact(T, Checker) when is_tuple(T) ->
-    Elements = erlang:tuple_to_list(T),
-    Redact = do_redact(Elements, Checker),
-    erlang:list_to_tuple(Redact);
-do_redact(Any, _Checker) ->
-    Any.
-
-do_redact(K, V, Checker) ->
-    case Checker(K) of
-        true ->
-            redact_v(V);
-        false ->
-            do_redact(V, Checker)
-    end.
-
--define(REDACT_VAL, "******").
-redact_v(V) when is_binary(V) -> <<?REDACT_VAL>>;
-%% The HOCON schema system may generate sensitive values with this format
-redact_v([{str, Bin}]) when is_binary(Bin) ->
-    [{str, <<?REDACT_VAL>>}];
-redact_v(_V) ->
-    ?REDACT_VAL.
+deobfuscate(NewConf, OldConf) ->
+    emqx_utils_redact:deobfuscate(NewConf, OldConf).
 
 is_redacted(K, V) ->
-    do_is_redacted(K, V, fun is_sensitive_key/1).
+    emqx_utils_redact:is_redacted(K, V).
 
 is_redacted(K, V, Fun) ->
-    do_is_redacted(K, V, fun(E) ->
-        is_sensitive_key(E) orelse Fun(E)
-    end).
-
-do_is_redacted(K, ?REDACT_VAL, Fun) ->
-    Fun(K);
-do_is_redacted(K, <<?REDACT_VAL>>, Fun) ->
-    Fun(K);
-do_is_redacted(_K, _V, _Fun) ->
-    false.
-
-%% This is ugly, however, the authorization is case-insensitive,
-%% the best way is to check chars one by one and quickly exit when any position is not equal,
-%% but in Erlang, this may not perform well, so here only check the first one
-is_authorization([Cap | _] = Key) when Cap == $a; Cap == $A ->
-    is_authorization2(Key);
-is_authorization(<<Cap, _/binary>> = Key) when Cap == $a; Cap == $A ->
-    is_authorization2(erlang:binary_to_list(Key));
-is_authorization(_Any) ->
-    false.
-
-is_authorization2(Str) ->
-    "authorization" == string:to_lower(Str).
+    emqx_utils_redact:is_redacted(K, V, Fun).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -735,84 +709,6 @@ ipv6_probe_test() ->
         _:_ ->
             ok
     end.
-
-redact_test_() ->
-    Case = fun(Type, KeyT) ->
-        Key =
-            case Type of
-                atom -> KeyT;
-                string -> erlang:atom_to_list(KeyT);
-                binary -> erlang:atom_to_binary(KeyT)
-            end,
-
-        ?assert(is_sensitive_key(Key)),
-
-        %% direct
-        ?assertEqual({Key, ?REDACT_VAL}, redact({Key, foo})),
-        ?assertEqual(#{Key => ?REDACT_VAL}, redact(#{Key => foo})),
-        ?assertEqual({Key, Key, Key}, redact({Key, Key, Key})),
-        ?assertEqual({[{Key, ?REDACT_VAL}], bar}, redact({[{Key, foo}], bar})),
-
-        %% 1 level nested
-        ?assertEqual([{Key, ?REDACT_VAL}], redact([{Key, foo}])),
-        ?assertEqual([#{Key => ?REDACT_VAL}], redact([#{Key => foo}])),
-
-        %% 2 level nested
-        ?assertEqual(#{opts => [{Key, ?REDACT_VAL}]}, redact(#{opts => [{Key, foo}]})),
-        ?assertEqual(#{opts => #{Key => ?REDACT_VAL}}, redact(#{opts => #{Key => foo}})),
-        ?assertEqual({opts, [{Key, ?REDACT_VAL}]}, redact({opts, [{Key, foo}]})),
-
-        %% 3 level nested
-        ?assertEqual([#{opts => [{Key, ?REDACT_VAL}]}], redact([#{opts => [{Key, foo}]}])),
-        ?assertEqual([{opts, [{Key, ?REDACT_VAL}]}], redact([{opts, [{Key, foo}]}])),
-        ?assertEqual([{opts, [#{Key => ?REDACT_VAL}]}], redact([{opts, [#{Key => foo}]}]))
-    end,
-
-    Types = [atom, string, binary],
-    Keys = [
-        authorization,
-        aws_secret_access_key,
-        password,
-        'proxy-authorization',
-        secret,
-        secret_key,
-        security_token,
-        token
-    ],
-    [{case_name(Type, Key), fun() -> Case(Type, Key) end} || Key <- Keys, Type <- Types].
-
-redact2_test_() ->
-    Case = fun(Key, Checker) ->
-        ?assertEqual({Key, ?REDACT_VAL}, redact({Key, foo}, Checker)),
-        ?assertEqual(#{Key => ?REDACT_VAL}, redact(#{Key => foo}, Checker)),
-        ?assertEqual({Key, Key, Key}, redact({Key, Key, Key}, Checker)),
-        ?assertEqual({[{Key, ?REDACT_VAL}], bar}, redact({[{Key, foo}], bar}, Checker))
-    end,
-
-    Checker = fun(E) -> E =:= passcode end,
-
-    Keys = [secret, passcode],
-    [{case_name(atom, Key), fun() -> Case(Key, Checker) end} || Key <- Keys].
-
-redact_is_authorization_test_() ->
-    Types = [string, binary],
-    Keys = ["auThorization", "Authorization", "authorizaTion"],
-
-    Case = fun(Type, Key0) ->
-        Key =
-            case Type of
-                binary ->
-                    erlang:list_to_binary(Key0);
-                _ ->
-                    Key0
-            end,
-        ?assert(is_sensitive_key(Key))
-    end,
-
-    [{case_name(Type, Key), fun() -> Case(Type, Key) end} || Key <- Keys, Type <- Types].
-
-case_name(Type, Key) ->
-    lists:concat([Type, "-", Key]).
 
 -endif.
 
@@ -866,7 +762,6 @@ safe_filename(Filename) when is_list(Filename) ->
 when
     Func :: fun((T) -> any()),
     T :: any().
-
 diff_lists(New, Old, KeyFunc) when is_list(New) andalso is_list(Old) ->
     Removed =
         lists:foldl(
@@ -945,6 +840,74 @@ search(ExpectValue, KeyFunc, [Item | List]) ->
         true -> Item;
         false -> search(ExpectValue, KeyFunc, List)
     end.
+
+%% @doc Maps over a list of terms and flattens the result, giving back a flat
+%% list of terms. It's similar to `lists:flatmap/2`, but it also works on a
+%% single term as `Fun` output (thus, the wordplay on "flatter").
+%% The purpose of this function is to adapt to `Fun`s that return either a `[]`
+%% or a term, and to avoid costs of list construction and flattening when
+%% dealing with large lists.
+-spec flattermap(Fun, [X]) -> [X] when
+    Fun :: fun((X) -> [X] | X).
+flattermap(_Fun, []) ->
+    [];
+flattermap(Fun, [X | Xs]) ->
+    flatcomb(Fun(X), flattermap(Fun, Xs)).
+
+flatcomb([], Zs) ->
+    Zs;
+flatcomb(Ys = [_ | _], []) ->
+    Ys;
+flatcomb(Ys = [_ | _], Zs = [_ | _]) ->
+    Ys ++ Zs;
+flatcomb(Y, Zs) ->
+    [Y | Zs].
+
+%% @doc Format IP address tuple or {IP, Port} tuple to string.
+ntoa({IP, Port}) ->
+    ntoa(IP) ++ ":" ++ integer_to_list(Port);
+ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
+    %% v6 piggyback v4
+    inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
+ntoa(IP) ->
+    inet_parse:ntoa(IP).
+
+%% @doc Return true if the provided string is a restricted string:
+%% Start with a letter or a digit,
+%% remaining characters can be '-' or '_' in addition to letters and digits
+is_restricted_str(String) ->
+    RE = <<"^[A-Za-z0-9]+[A-Za-z0-9-_]*$">>,
+    match =:= re:run(String, RE, [{capture, none}]).
+
+%% @doc Generate random, printable bytes as an ID.
+%% The first byte is ensured to be a-z or A-Z.
+rand_id(Len) when Len > 0 ->
+    iolist_to_binary([rand_first_char(), rand_chars(Len - 1)]).
+
+rand_first_char() ->
+    base62(rand:uniform(52) - 1).
+
+rand_chars(0) ->
+    [];
+rand_chars(N) ->
+    [rand_char() | rand_chars(N - 1)].
+
+rand_char() ->
+    base62(rand:uniform(62) - 1).
+
+base62(I) when I < 26 -> $A + I;
+base62(I) when I < 52 -> $a + I - 26;
+base62(I) -> $0 + I - 52.
+
+%% In production code, EMQX is always booted in embedded mode.
+%% so making a dynamic call to Module:module_info(module) is cheap.
+%% In interactive mode (test, and emqx config check CLI), the first attempt
+%% to make the dynamic call to Module:module_info(module) will cost,
+%% once loaded, it's cheap for subsequent calls.
+%% NOTE: For non-existing modules, this call is not as effective!
+interactive_load(Module) ->
+    _ = catch apply(Module, module_info, [module]),
+    ok.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

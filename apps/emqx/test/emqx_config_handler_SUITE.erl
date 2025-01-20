@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,15 +26,15 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
-all() -> emqx_common_test_helpers:all(?MODULE).
+all() ->
+    emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:boot_modules(all),
-    emqx_common_test_helpers:start_apps([]),
-    Config.
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([]).
+end_per_suite(Config) ->
+    emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(_Case, Config) ->
     _ = file:delete(?CLUSTER_CONF),
@@ -223,8 +223,8 @@ t_callback_crash(_Config) ->
     ok = emqx_config_handler:remove_handler(CrashPath),
     ok.
 
-t_pre_callback_error(_Config) ->
-    callback_error(
+t_pre_assert_update_result(_Config) ->
+    assert_update_result(
         [sysmon, os, mem_check_interval],
         <<"100s">>,
         {error, {pre_config_update, ?MODULE, pre_config_update_error}}
@@ -232,10 +232,85 @@ t_pre_callback_error(_Config) ->
     ok.
 
 t_post_update_error(_Config) ->
-    callback_error(
+    assert_update_result(
         [sysmon, os, sysmem_high_watermark],
         <<"60%">>,
         {error, {post_config_update, ?MODULE, post_config_update_error}}
+    ),
+    ok.
+
+t_post_update_propagate_error_wkey(_Config) ->
+    Conf0 = emqx_config:get_raw([sysmon]),
+    Conf1 = emqx_utils_maps:deep_put([<<"os">>, <<"sysmem_high_watermark">>], Conf0, <<"60%">>),
+    assert_update_result(
+        [
+            [sysmon, '?', sysmem_high_watermark],
+            [sysmon]
+        ],
+        [sysmon],
+        Conf1,
+        {error, {post_config_update, ?MODULE, post_config_update_error}}
+    ),
+    ok.
+
+t_post_update_propagate_error_key(_Config) ->
+    Conf0 = emqx_config:get_raw([sysmon]),
+    Conf1 = emqx_utils_maps:deep_put([<<"os">>, <<"sysmem_high_watermark">>], Conf0, <<"60%">>),
+    assert_update_result(
+        [
+            [sysmon, os, sysmem_high_watermark],
+            [sysmon]
+        ],
+        [sysmon],
+        Conf1,
+        {error, {post_config_update, ?MODULE, post_config_update_error}}
+    ),
+    ok.
+
+t_pre_update_propagate_error_wkey(_Config) ->
+    Conf0 = emqx_config:get_raw([sysmon]),
+    Conf1 = emqx_utils_maps:deep_put([<<"os">>, <<"mem_check_interval">>], Conf0, <<"70s">>),
+    assert_update_result(
+        [
+            [sysmon, '?', mem_check_interval],
+            [sysmon]
+        ],
+        [sysmon],
+        Conf1,
+        {error, {pre_config_update, ?MODULE, pre_config_update_error}}
+    ),
+    ok.
+
+t_pre_update_propagate_error_key(_Config) ->
+    Conf0 = emqx_config:get_raw([sysmon]),
+    Conf1 = emqx_utils_maps:deep_put([<<"os">>, <<"mem_check_interval">>], Conf0, <<"70s">>),
+    assert_update_result(
+        [
+            [sysmon, os, mem_check_interval],
+            [sysmon]
+        ],
+        [sysmon],
+        Conf1,
+        {error, {pre_config_update, ?MODULE, pre_config_update_error}}
+    ),
+    ok.
+
+t_pre_update_propagate_key_rewrite(_Config) ->
+    Conf0 = emqx_config:get_raw([sysmon]),
+    Conf1 = emqx_utils_maps:deep_put([<<"os">>, <<"cpu_check_interval">>], Conf0, <<"333s">>),
+    with_update_result(
+        [
+            [sysmon, '?', cpu_check_interval],
+            [sysmon]
+        ],
+        [sysmon],
+        Conf1,
+        fun(_, Result) ->
+            ?assertMatch(
+                {ok, #{config := #{os := #{cpu_check_interval := 444000}}}},
+                Result
+            )
+        end
     ),
     ok.
 
@@ -295,6 +370,17 @@ pre_config_update([sysmon, os, sysmem_high_watermark], UpdateReq, _RawConf) ->
 pre_config_update([sysmon, os, mem_check_interval], _UpdateReq, _RawConf) ->
     {error, pre_config_update_error}.
 
+propagated_pre_config_update(
+    [<<"sysmon">>, <<"os">>, <<"cpu_check_interval">>], <<"333s">>, _RawConf
+) ->
+    {ok, <<"444s">>};
+propagated_pre_config_update(
+    [<<"sysmon">>, <<"os">>, <<"mem_check_interval">>], _UpdateReq, _RawConf
+) ->
+    {error, pre_config_update_error};
+propagated_pre_config_update(_ConfKeyPath, _UpdateReq, _RawConf) ->
+    ok.
+
 post_config_update([sysmon], _UpdateReq, _NewConf, _OldConf, _AppEnvs) ->
     {ok, ok};
 post_config_update([sysmon, os], _UpdateReq, _NewConf, _OldConf, _AppEnvs) ->
@@ -308,6 +394,13 @@ post_config_update([sysmon, os, cpu_high_watermark], _UpdateReq, _NewConf, _OldC
 post_config_update([sysmon, os, sysmem_high_watermark], _UpdateReq, _NewConf, _OldConf, _AppEnvs) ->
     {error, post_config_update_error}.
 
+propagated_post_config_update(
+    [sysmon, os, sysmem_high_watermark], _UpdateReq, _NewConf, _OldConf, _AppEnvs
+) ->
+    {error, post_config_update_error};
+propagated_post_config_update(_ConfKeyPath, _UpdateReq, _NewConf, _OldConf, _AppEnvs) ->
+    ok.
+
 wait_for_new_pid() ->
     case erlang:whereis(emqx_config_handler) of
         undefined ->
@@ -317,20 +410,27 @@ wait_for_new_pid() ->
             Pid
     end.
 
-callback_error(FailedPath, Update, ExpectError) ->
+assert_update_result(FailedPath, Update, Expect) ->
+    assert_update_result([FailedPath], FailedPath, Update, Expect).
+
+assert_update_result(Paths, UpdatePath, Update, Expect) ->
+    with_update_result(Paths, UpdatePath, Update, fun(Old, Result) ->
+        ?assertEqual(Expect, Result),
+        New = emqx:get_raw_config(UpdatePath, undefined),
+        ?assertEqual(Old, New)
+    end).
+
+with_update_result(Paths, UpdatePath, Update, Fun) ->
+    ok = lists:foreach(
+        fun(Path) -> emqx_config_handler:add_handler(Path, ?MODULE) end,
+        Paths
+    ),
     Opts = #{rawconf_with_defaults => true},
-    ok = emqx_config_handler:add_handler(FailedPath, ?MODULE),
-    Old = emqx:get_raw_config(FailedPath, undefined),
-    Error = emqx:update_config(FailedPath, Update, Opts),
-    case ExpectError of
-        {error, {post_config_update, ?MODULE, post_config_update_error}} ->
-            ?assertMatch(
-                {error, {post_config_update, ?MODULE, {post_config_update_error, _}}}, Error
-            );
-        _ ->
-            ?assertEqual(ExpectError, Error)
-    end,
-    New = emqx:get_raw_config(FailedPath, undefined),
-    ?assertEqual(Old, New),
-    ok = emqx_config_handler:remove_handler(FailedPath),
+    Old = emqx:get_raw_config(UpdatePath, undefined),
+    Result = emqx:update_config(UpdatePath, Update, Opts),
+    _ = Fun(Old, Result),
+    ok = lists:foreach(
+        fun(Path) -> emqx_config_handler:remove_handler(Path) end,
+        Paths
+    ),
     ok.

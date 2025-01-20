@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,12 +36,11 @@ groups() ->
 
 init_per_suite(Config) ->
     Storage = emqx_ft_test_helpers:local_storage(Config),
-    WorkDir = ?config(priv_dir, Config),
     Apps = emqx_cth_suite:start(
         [
             {emqx_ft, #{config => emqx_ft_test_helpers:config(Storage)}}
         ],
-        #{work_dir => WorkDir}
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
     [{suite_apps, Apps} | Config].
 
@@ -82,8 +81,8 @@ end_per_group(_Group, _Config) ->
 
 t_multinode_exports(Config) ->
     [Node1, Node2 | _] = ?config(cluster, Config),
-    ok = emqx_ft_test_helpers:upload_file(<<"c/1">>, <<"f:1">>, "fn1", <<"data">>, Node1),
-    ok = emqx_ft_test_helpers:upload_file(<<"c/2">>, <<"f:2">>, "fn2", <<"data">>, Node2),
+    ok = emqx_ft_test_helpers:upload_file(sync, <<"c/1">>, <<"f:1">>, "fn1", <<"data">>, Node1),
+    ok = emqx_ft_test_helpers:upload_file(sync, <<"c/2">>, <<"f:2">>, "fn2", <<"data">>, Node2),
     ?assertMatch(
         [
             #{transfer := {<<"c/1">>, <<"f:1">>}, name := "fn1"},

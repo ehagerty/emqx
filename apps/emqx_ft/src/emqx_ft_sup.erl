@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -52,14 +52,14 @@ init([]) ->
         modules => [emqx_ft_storage_fs_reader_sup]
     },
 
-    Responder = #{
+    ResponderSup = #{
         id => emqx_ft_responder_sup,
         start => {emqx_ft_responder_sup, start_link, []},
         restart => permanent,
         shutdown => infinity,
-        type => worker,
+        type => supervisor,
         modules => [emqx_ft_responder_sup]
     },
 
-    ChildSpecs = [Responder, AssemblerSup, FileReaderSup],
+    ChildSpecs = [ResponderSup, AssemblerSup, FileReaderSup],
     {ok, {SupFlags, ChildSpecs}}.

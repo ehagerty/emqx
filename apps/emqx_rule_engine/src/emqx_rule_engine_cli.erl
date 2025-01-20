@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 -export([cmd/1]).
 
 %%================================================================================
-%% API funcions
+%% API functions
 %%================================================================================
 
 load() ->
@@ -74,8 +74,8 @@ pretty_print_rule(ID) ->
               "Updated at:\n  ~ts\n"
               "Actions:\n  ~s\n"
              ,[Id, Name, left_pad(Descr), Enable, left_pad(SQL),
-               calendar:system_time_to_rfc3339(CreatedAt, [{unit, millisecond}]),
-               calendar:system_time_to_rfc3339(UpdatedAt, [{unit, millisecond}]),
+               emqx_utils_calendar:epoch_to_rfc3339(CreatedAt, millisecond),
+               emqx_utils_calendar:epoch_to_rfc3339(UpdatedAt, millisecond),
                [left_pad(format_action(A)) || A <- Actions]
               ]
              );
@@ -95,6 +95,18 @@ format_action(BridgeChannelId) when is_binary(BridgeChannelId) ->
     io_lib:format("- Name:  ~s\n"
                   "  Type:  data-bridge\n"
                  ,[BridgeChannelId]
+                 );
+format_action({bridge, ActionType, ActionName, _Id}) ->
+    io_lib:format("- Name:         ~p\n"
+                  "  Action Type:  ~p\n"
+                  "  Type:         data-bridge\n"
+                 ,[ActionName, ActionType]
+                 );
+format_action({bridge_v2, ActionType, ActionName}) ->
+    io_lib:format("- Name:         ~p\n"
+                  "  Action Type:  ~p\n"
+                  "  Type:         data-bridge\n"
+                 ,[ActionName, ActionType]
                  ).
 
 left_pad(Str) ->

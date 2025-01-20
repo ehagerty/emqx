@@ -1,5 +1,5 @@
 %--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/asserts.hrl").
 
 -record(coap_content, {content_format, payload = <<>>}).
 
@@ -66,6 +67,7 @@ groups() ->
     [
         {test_grp_0_register, [RepeatOpt], [
             case01_register,
+            case01_auth_expire,
             case01_register_additional_opts,
             %% TODO now we can't handle partial decode packet
             %% case01_register_incorrect_opts,
@@ -132,19 +134,25 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% load application first for minirest api searching
-    application:load(emqx_gateway),
-    application:load(emqx_gateway_lwm2m),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_authn]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_gateway_lwm2m,
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    timer:sleep(300),
-    {ok, _} = emqx_conf:remove([<<"gateway">>, <<"lwm2m">>], #{}),
-    emqx_mgmt_api_test_util:end_suite([emqx_conf, emqx_authn]),
-    Config.
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok.
 
 init_per_testcase(TestCase, Config) ->
+    snabbkaffe:start_trace(),
     GatewayConfig =
         case TestCase of
             case09_auto_observe ->
@@ -152,9 +160,8 @@ init_per_testcase(TestCase, Config) ->
             _ ->
                 default_config()
         end,
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, GatewayConfig),
+    ok = emqx_conf_cli:load_config(GatewayConfig, #{mode => replace}),
 
-    {ok, _} = application:ensure_all_started(emqx_gateway),
     {ok, ClientUdpSock} = gen_udp:open(0, [binary, {active, false}]),
 
     {ok, C} = emqtt:start_link([
@@ -171,7 +178,8 @@ end_per_testcase(_AllTestCase, Config) ->
     timer:sleep(300),
     gen_udp:close(?config(sock, Config)),
     emqtt:disconnect(?config(emqx_c, Config)),
-    ok = application:stop(emqx_gateway).
+    snabbkaffe:stop(),
+    ok.
 
 default_config() ->
     default_config(#{}).
@@ -231,6 +239,8 @@ case01_register(Config) ->
     MsgId = 12,
     SubTopic = list_to_binary("lwm2m/" ++ Epn ++ "/dn/#"),
 
+    emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
     test_send_coap_request(
         UdpSock,
         post,
@@ -243,7 +253,13 @@ case01_register(Config) ->
         MsgId
     ),
 
-    %% checkpoint 1 - response
+    %% checkpoint 1 - called client.connect hook
+    ?assertMatch(
+        ['client.connect' | _],
+        emqx_gateway_test_utils:collect_emqx_hooks_calls()
+    ),
+
+    %% checkpoint 2 - response
     #coap_message{type = Type, method = Method, id = RspId, options = Opts} =
         test_recv_coap_response(UdpSock),
     ack = Type,
@@ -252,7 +268,7 @@ case01_register(Config) ->
     Location = maps:get(location_path, Opts),
     ?assertNotEqual(undefined, Location),
 
-    %% checkpoint 2 - verify subscribed topics
+    %% checkpoint 3 - verify subscribed topics
     timer:sleep(100),
     ?LOGT("all topics: ~p", [test_mqtt_broker:get_subscrbied_topics()]),
     true = lists:member(SubTopic, test_mqtt_broker:get_subscrbied_topics()),
@@ -279,6 +295,43 @@ case01_register(Config) ->
     MsgId3 = RspId3,
     timer:sleep(50),
     false = lists:member(SubTopic, test_mqtt_broker:get_subscrbied_topics()).
+
+case01_auth_expire(Config) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {ok, #{is_superuser => false, expire_at => erlang:system_time(millisecond) + 500}}
+        end
+    ),
+
+    %%----------------------------------------
+    %% REGISTER command
+    %%----------------------------------------
+    UdpSock = ?config(sock, Config),
+    Epn = "urn:oma:lwm2m:oma:3",
+    MsgId = 12,
+
+    ?assertWaitEvent(
+        test_send_coap_request(
+            UdpSock,
+            post,
+            sprintf("coap://127.0.0.1:~b/rd?ep=~ts&lt=345&lwm2m=1", [?PORT, Epn]),
+            #coap_content{
+                content_format = <<"text/plain">>,
+                payload = <<"</1>, </2>, </3>, </4>, </5>">>
+            },
+            [],
+            MsgId
+        ),
+        #{
+            ?snk_kind := conn_process_terminated,
+            clientid := <<"urn:oma:lwm2m:oma:3">>,
+            reason := {shutdown, expired}
+        },
+        5000
+    ).
 
 case01_register_additional_opts(Config) ->
     %%----------------------------------------
@@ -2448,6 +2501,8 @@ case100_clients_api(Config) ->
         request(get, "/gateways/lwm2m/clients/" ++ binary_to_list(ClientId)),
     %% assert
     Client1 = Client2 = Client3 = Client4,
+    %% assert keepalive
+    ?assertEqual(345, maps:get(keepalive, Client4)),
     %% kickout
     {204, _} =
         request(delete, "/gateways/lwm2m/clients/" ++ binary_to_list(ClientId)),

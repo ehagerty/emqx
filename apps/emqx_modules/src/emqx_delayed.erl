@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,12 +25,8 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("emqx/include/emqx_hooks.hrl").
 
-%% Mnesia bootstrap
--export([mnesia/1]).
-
--boot_mnesia({mnesia, [boot]}).
-
 -export([
+    create_tables/0,
     start_link/0,
     on_message_publish/1
 ]).
@@ -45,19 +41,29 @@
     code_change/3
 ]).
 
-%% gen_server callbacks
+%% API
 -export([
     load/0,
     unload/0,
     load_or_unload/1,
     get_conf/1,
     update_config/1,
+    delayed_count/0,
     list/1,
     get_delayed_message/1,
     get_delayed_message/2,
     delete_delayed_message/1,
     delete_delayed_message/2,
+    delete_delayed_messages_by_topic_name/1,
+    clear_all/0,
+    %% rpc target
+    clear_all_local/0,
     cluster_list/1
+]).
+
+%% exports for internal rpc
+-export([
+    do_delete_delayed_messages_by_topic_name/1
 ]).
 
 %% exports for query
@@ -82,15 +88,22 @@
 -export_type([with_id_return/0, with_id_return/1]).
 
 -type state() :: #{
-    publish_timer := maybe(timer:tref()),
+    publish_timer := option(reference()),
     publish_at := non_neg_integer(),
-    stats_timer := maybe(reference()),
-    stats_fun := maybe(fun((pos_integer()) -> ok))
+    stats_timer := option(reference()),
+    stats_fun := option(fun((pos_integer()) -> ok))
 }.
 
 %% sync ms with record change
 -define(QUERY_MS(Id), [{{delayed_message, {'_', Id}, '_', '_'}, [], ['$_']}]).
 -define(DELETE_MS(Id), [{{delayed_message, {'$1', Id}, '_', '_'}, [], ['$1']}]).
+-define(DELETE_BY_TOPIC_MS(Topic), [
+    {
+        {delayed_message, '$1', '_', {message, '_', '_', '_', '_', '_', Topic, '_', '_', '_'}},
+        [],
+        ['$1']
+    }
+]).
 
 -define(TAB, ?MODULE).
 -define(SERVER, ?MODULE).
@@ -101,14 +114,16 @@
 %%------------------------------------------------------------------------------
 %% Mnesia bootstrap
 %%------------------------------------------------------------------------------
-mnesia(boot) ->
+
+create_tables() ->
     ok = mria:create_table(?TAB, [
         {type, ordered_set},
         {storage, disc_copies},
         {local_content, true},
         {record_name, delayed_message},
         {attributes, record_info(fields, delayed_message)}
-    ]).
+    ]),
+    [?TAB].
 
 %%------------------------------------------------------------------------------
 %% Hooks
@@ -167,6 +182,9 @@ unload() ->
 load_or_unload(Bool) ->
     gen_server:call(?SERVER, {do_load_or_unload, Bool}).
 
+-spec delayed_count() -> non_neg_integer().
+delayed_count() -> mnesia:table_info(?TAB, size).
+
 list(Params) ->
     emqx_mgmt_api:paginate(?TAB, Params, ?FORMAT_FUN).
 
@@ -208,8 +226,8 @@ format_delayed(
     },
     WithPayload
 ) ->
-    PublishTime = to_rfc3339(PublishTimeStamp div 1000),
-    ExpectTime = to_rfc3339(ExpectTimeStamp div 1000),
+    PublishTime = emqx_utils_calendar:epoch_to_rfc3339(PublishTimeStamp),
+    ExpectTime = emqx_utils_calendar:epoch_to_rfc3339(ExpectTimeStamp),
     RemainingTime = ExpectTimeStamp - ?NOW,
     Result = #{
         msgid => emqx_guid:to_hexstr(Id),
@@ -230,9 +248,6 @@ format_delayed(
             Result
     end.
 
-to_rfc3339(Timestamp) ->
-    list_to_binary(calendar:system_time_to_rfc3339(Timestamp, [{unit, second}])).
-
 -spec get_delayed_message(binary()) -> with_id_return(map()).
 get_delayed_message(Id) ->
     case ets:select(?TAB, ?QUERY_MS(Id)) of
@@ -246,7 +261,7 @@ get_delayed_message(Id) ->
 get_delayed_message(Node, Id) when Node =:= node() ->
     get_delayed_message(Id);
 get_delayed_message(Node, Id) ->
-    emqx_delayed_proto_v1:get_delayed_message(Node, Id).
+    emqx_delayed_proto_v2:get_delayed_message(Node, Id).
 
 -spec delete_delayed_message(binary()) -> with_id_return().
 delete_delayed_message(Id) ->
@@ -261,7 +276,59 @@ delete_delayed_message(Id) ->
 delete_delayed_message(Node, Id) when Node =:= node() ->
     delete_delayed_message(Id);
 delete_delayed_message(Node, Id) ->
-    emqx_delayed_proto_v1:delete_delayed_message(Node, Id).
+    emqx_delayed_proto_v2:delete_delayed_message(Node, Id).
+
+-spec delete_delayed_messages_by_topic_name(binary()) -> with_id_return().
+delete_delayed_messages_by_topic_name(TopicName) when is_binary(TopicName) ->
+    Nodes = emqx:running_nodes(),
+    Result = emqx_delayed_proto_v3:delete_delayed_messages_by_topic_name(Nodes, TopicName),
+    case
+        lists:any(
+            fun
+                ({ok, ok}) -> true;
+                (_) -> false
+            end,
+            Result
+        )
+    of
+        true ->
+            ok;
+        false ->
+            Errors = lists:filter(
+                fun
+                    ({ok, {error, not_found}}) -> false;
+                    (_) -> true
+                end,
+                Result
+            ),
+            case Errors of
+                [] ->
+                    {error, not_found};
+                [Exception | _] ->
+                    {error, Exception}
+            end
+    end.
+
+-spec do_delete_delayed_messages_by_topic_name(binary()) -> with_id_return().
+do_delete_delayed_messages_by_topic_name(TopicName) when is_binary(TopicName) ->
+    case ets:select(?TAB, ?DELETE_BY_TOPIC_MS(TopicName)) of
+        [] ->
+            {error, not_found};
+        Rows ->
+            lists:foreach(fun(Key) -> mria:dirty_delete(?TAB, Key) end, Rows)
+    end.
+
+-spec clear_all() -> ok.
+clear_all() ->
+    Nodes = emqx:running_nodes(),
+    _ = emqx_delayed_proto_v2:clear_all(Nodes),
+    ok.
+
+%% rpc target
+-spec clear_all_local() -> ok.
+clear_all_local() ->
+    _ = mria:clear_table(?TAB),
+    ok.
 
 update_config(Config) ->
     emqx_conf:update([delayed], Config, #{rawconf_with_defaults => true, override_to => cluster}).
@@ -394,25 +461,22 @@ do_publish(Key = {Ts, _Id}, Now, Acc) when Ts =< Now ->
         [] ->
             ok;
         [#delayed_message{msg = Msg}] ->
-            case emqx_banned:look_up({clientid, Msg#message.from}) of
-                [] ->
+            case emqx_banned:check_clientid(Msg#message.from) of
+                false ->
                     emqx_pool:async_submit(fun emqx:publish/1, [Msg]);
-                _ ->
+                true ->
                     ?tp(
                         notice,
                         ignore_delayed_message_publish,
                         #{
                             reason => "client is banned",
-                            clienid => Msg#message.from
+                            clientid => Msg#message.from
                         }
                     ),
                     ok
             end
     end,
     do_publish(mnesia:dirty_next(?TAB, Key), Now, [Key | Acc]).
-
--spec delayed_count() -> non_neg_integer().
-delayed_count() -> mnesia:table_info(?TAB, size).
 
 do_load_or_unload(true, State) ->
     emqx_hooks:put('message.publish', {?MODULE, on_message_publish, []}, ?HP_DELAY_PUB),

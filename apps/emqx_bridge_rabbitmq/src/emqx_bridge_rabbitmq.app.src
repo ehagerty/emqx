@@ -1,7 +1,8 @@
 {application, emqx_bridge_rabbitmq, [
     {description, "EMQX Enterprise RabbitMQ Bridge"},
-    {vsn, "0.1.4"},
+    {vsn, "0.2.5"},
     {registered, []},
+    {mod, {emqx_bridge_rabbitmq_app, []}},
     {applications, [
         kernel,
         stdlib,
@@ -9,7 +10,11 @@
         rabbit_common,
         amqp_client
     ]},
-    {env, []},
+
+    {env, [
+        {emqx_action_info_modules, [emqx_bridge_rabbitmq_action_info]},
+        {emqx_connector_info_modules, [emqx_bridge_rabbitmq_connector_info]}
+    ]},
     {modules, []},
     {links, []}
 ]}.

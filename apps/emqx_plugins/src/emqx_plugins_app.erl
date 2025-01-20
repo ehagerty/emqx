@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 -behaviour(application).
 
 -include("emqx_plugins.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
 
 -export([
     start/2,
@@ -27,9 +28,11 @@
 
 start(_Type, _Args) ->
     %% load all pre-configured
-    ok = emqx_plugins:ensure_started(),
     {ok, Sup} = emqx_plugins_sup:start_link(),
+    ok = emqx_plugins:ensure_installed(),
+    ok = emqx_plugins:ensure_started(),
     ok = emqx_config_handler:add_handler([?CONF_ROOT], emqx_plugins),
+    ?tp("emqx_plugins_app_started", #{}),
     {ok, Sup}.
 
 stop(_State) ->

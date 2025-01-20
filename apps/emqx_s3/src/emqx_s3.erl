@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3).
@@ -10,7 +10,7 @@
     start_profile/2,
     stop_profile/1,
     update_profile/2,
-    start_uploader/2,
+    start_uploader/3,
     with_client/2
 ]).
 
@@ -22,6 +22,7 @@
 -export_type([
     profile_id/0,
     profile_config/0,
+    transport_options/0,
     acl/0
 ]).
 
@@ -38,16 +39,15 @@
 -type transport_options() :: #{
     headers => map(),
     connect_timeout => pos_integer(),
-    enable_pipelining => pos_integer(),
     max_retries => pos_integer(),
     pool_size => pos_integer(),
-    pool_type => atom(),
     ipv6_probe => boolean(),
     ssl => map()
 }.
 
 -type profile_config() :: #{
     bucket := string(),
+    access_method => path | vhost,
     access_key_id => string(),
     secret_access_key => emqx_secret:t(string()),
     host := string(),
@@ -81,18 +81,18 @@ stop_profile(ProfileId) when ?IS_PROFILE_ID(ProfileId) ->
 update_profile(ProfileId, ProfileConfig) when ?IS_PROFILE_ID(ProfileId) ->
     emqx_s3_profile_conf:update_config(ProfileId, ProfileConfig).
 
--spec start_uploader(profile_id(), emqx_s3_uploader:opts()) ->
-    supervisor:start_ret() | {error, profile_not_found}.
-start_uploader(ProfileId, Opts) when ?IS_PROFILE_ID(ProfileId) ->
-    emqx_s3_profile_uploader_sup:start_uploader(ProfileId, Opts).
+-spec start_uploader(profile_id(), emqx_s3_client:key(), emqx_s3_client:upload_options()) ->
+    emqx_types:startlink_ret() | {error, profile_not_found}.
+start_uploader(ProfileId, Key, Props) when ?IS_PROFILE_ID(ProfileId) ->
+    emqx_s3_profile_uploader_sup:start_uploader(ProfileId, Key, Props).
 
 -spec with_client(profile_id(), fun((emqx_s3_client:client()) -> Result)) ->
     {error, profile_not_found} | Result.
 with_client(ProfileId, Fun) when is_function(Fun, 1) andalso ?IS_PROFILE_ID(ProfileId) ->
     case emqx_s3_profile_conf:checkout_config(ProfileId) of
-        {ok, ClientConfig, _UploadConfig} ->
+        {Bucket, ClientConfig, _UploadOpts, _UploadConfig} ->
             try
-                Fun(emqx_s3_client:create(ClientConfig))
+                Fun(emqx_s3_client:create(Bucket, ClientConfig))
             after
                 emqx_s3_profile_conf:checkin_config(ProfileId)
             end;
@@ -103,9 +103,9 @@ with_client(ProfileId, Fun) when is_function(Fun, 1) andalso ?IS_PROFILE_ID(Prof
 %%
 
 -spec pre_config_update(
-    profile_id(), maybe(emqx_config:raw_config()), maybe(emqx_config:raw_config())
+    profile_id(), option(emqx_config:raw_config()), option(emqx_config:raw_config())
 ) ->
-    {ok, maybe(profile_config())} | {error, term()}.
+    {ok, option(profile_config())} | {error, term()}.
 pre_config_update(ProfileId, NewConfig = #{<<"transport_options">> := TransportOpts}, _OldConfig) ->
     case emqx_connector_ssl:convert_certs(mk_certs_dir(ProfileId), TransportOpts) of
         {ok, TransportOptsConv} ->
@@ -118,8 +118,8 @@ pre_config_update(_ProfileId, NewConfig, _OldConfig) ->
 
 -spec post_config_update(
     profile_id(),
-    maybe(emqx_config:config()),
-    maybe(emqx_config:config())
+    option(emqx_config:config()),
+    option(emqx_config:config())
 ) ->
     ok.
 post_config_update(_ProfileId, _NewConfig, _OldConfig) ->

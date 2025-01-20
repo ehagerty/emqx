@@ -4,6 +4,12 @@ set -euo pipefail
 # ensure dir
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
+log_red() {
+  local RED='\033[0;31m' # Red
+  local NC='\033[0m' # No Color
+  echo -e "${RED}${1}${NC}"
+}
+
 # match any official release tag 'e*' and 'v*'
 latest_release="$(env PREV_TAG_MATCH_PATTERN='*' ./scripts/find-prev-rel-tag.sh)"
 echo "Version check compare base: $latest_release"
@@ -15,6 +21,18 @@ no_comment_re='(^[^\s?%])'
 
 parse_semver() {
     echo "$1" | tr '.|-' ' '
+}
+
+is_allowed_non_strict() {
+    local src_file="$1"
+    local from="$2"
+    local to="$3"
+    if [ -f .emqx-platform ]; then
+        log_red "ERROR: $src_file vsn bump from $from to $to"
+        return 1
+    fi
+    log_red "WARN: $src_file vsn bump from $from to $to"
+    return 0
 }
 
 APPS="$(./scripts/find-apps.sh)"
@@ -47,7 +65,7 @@ for app in ${APPS}; do
                              -- "$app_path/priv" \
                              -- "$app_path/c_src" | wc -l ) "
         if [ "$changed_lines" -gt 0 ]; then
-            echo "ERROR: $src_file needs a vsn bump"
+            log_red "ERROR: $src_file needs a vsn bump"
             bad_app_count=$(( bad_app_count + 1))
         fi
     else
@@ -64,8 +82,10 @@ for app in ${APPS}; do
              [ "${now_app_version_semver[2]}" = "0" ]; then
             true
         else
-            echo "$src_file: non-strict semver version bump from $old_app_version to $now_app_version"
-            bad_app_count=$(( bad_app_count + 1))
+            if ! is_allowed_non_strict "$src_file" "$old_app_version" "$now_app_version"; then
+                echo "$src_file: non-strict semver version bump from $old_app_version to $now_app_version"
+                bad_app_count=$(( bad_app_count + 1))
+            fi
         fi
     fi
 done
@@ -73,5 +93,5 @@ done
 if [ $bad_app_count -gt 0 ]; then
     exit 1
 else
-    echo "apps version check successfully"
+    echo "apps version check passed successfully"
 fi

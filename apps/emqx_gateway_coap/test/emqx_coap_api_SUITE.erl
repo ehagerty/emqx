@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -57,14 +57,22 @@ all() ->
 
 init_per_suite(Config) ->
     application:load(emqx_gateway_coap),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_authn, emqx_gateway]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, ?CONF_DEFAULT},
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    _ = emqx_common_test_http:create_default_app(),
+    [{suite_apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    {ok, _} = emqx:remove_config([<<"gateway">>, <<"coap">>]),
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_authn]),
-    Config.
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    emqx_config:delete_override_conf_files().
 
 %%--------------------------------------------------------------------
 %% Cases
@@ -199,7 +207,8 @@ test_recv_coap_request(UdpSock) ->
 test_send_coap_response(UdpSock, Host, Port, Code, Content, Request) ->
     is_list(Host) orelse error("Host is not a string"),
     {ok, IpAddr} = inet:getaddr(Host, inet),
-    Response = emqx_coap_message:piggyback(Code, Content, Request),
+    Response0 = emqx_coap_message:piggyback(Code, Content, Request),
+    Response = Response0#coap_message{options = #{uri_query => [<<"clientid=client1">>]}},
     ?LOGT("test_send_coap_response Response=~p", [Response]),
     Binary = emqx_coap_frame:serialize_pkt(Response, undefined),
     ok = gen_udp:send(UdpSock, IpAddr, Port, Binary).

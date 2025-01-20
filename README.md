@@ -1,12 +1,15 @@
+English | [简体中文](./README-CN.md) | [Русский](./README-RU.md)
+
 # EMQX
 
 [![GitHub Release](https://img.shields.io/github/release/emqx/emqx?color=brightgreen&label=Release)](https://github.com/emqx/emqx/releases)
-[![Build Status](https://github.com/emqx/emqx/actions/workflows/run_test_cases.yaml/badge.svg)](https://github.com/emqx/emqx/actions/workflows/run_test_cases.yaml)
+[![Build Status](https://github.com/emqx/emqx/actions/workflows/_push-entrypoint.yaml/badge.svg)](https://github.com/emqx/emqx/actions/workflows/_push-entrypoint.yaml)
 [![Coverage Status](https://img.shields.io/coveralls/github/emqx/emqx/master?label=Coverage)](https://coveralls.io/github/emqx/emqx?branch=master)
 [![Docker Pulls](https://img.shields.io/docker/pulls/emqx/emqx?label=Docker%20Pulls)](https://hub.docker.com/r/emqx/emqx)
+[![OpenSSF Scorecard](https://img.shields.io/ossf-scorecard/github.com/emqx/emqx?label=OpenSSF%20Scorecard&style=flat)](https://securityscorecards.dev/viewer/?uri=github.com/emqx/emqx)
 [![Slack](https://img.shields.io/badge/Slack-EMQ-39AE85?logo=slack)](https://slack-invite.emqx.io/)
 [![Discord](https://img.shields.io/discord/931086341838622751?label=Discord&logo=discord)](https://discord.gg/xYGf3fQnES)
-[![Twitter](https://img.shields.io/badge/Follow-EMQ-1DA1F2?logo=twitter)](https://twitter.com/EMQTech)
+[![X](https://img.shields.io/badge/Follow-EMQ-1DA1F2?logo=x)](https://x.com/EMQTech)
 [![YouTube](https://img.shields.io/badge/Subscribe-EMQ-FF0000?logo=youtube)](https://www.youtube.com/channel/UC5FjR77ErAxvZENEWzQaO5Q)
 
 
@@ -16,9 +19,9 @@ EMQX supports multiple open standard protocols like MQTT, HTTP, QUIC, and WebSoc
 
 With the built-in powerful SQL-based [rules engine](https://www.emqx.com/en/solutions/iot-rule-engine), EMQX can extract, filter, enrich and transform IoT data in real-time. In addition, it ensures high availability and horizontal scalability with a masterless distributed architecture, and provides ops-friendly user experience and great observability.
 
-EMQX boasts more than 20K+ enterprise users across 50+ countries and regions, connecting 100M+ IoT devices worldwide, and is trusted by over 400 customers in mission-critical scenarios of IoT, IIoT, connected vehicles, and more, including over 70 Fortune 500 companies like HPE, VMware, Verifone, SAIC Volkswagen, and Ericsson.
+EMQX boasts more than 20K+ enterprise users across 60+ countries and regions, connecting 250M+ IoT devices worldwide, and is trusted by over 1000 customers in mission-critical scenarios of IoT, IIoT, connected vehicles, and more, including over 70 Fortune 500 companies like HPE, VMware, Verifone, SAIC Volkswagen, and Ericsson.
 
-For more information, please visit [EMQX homepage](https://www.emqx.io/).
+For more information, please visit [EMQX homepage](https://www.emqx.com/en).
 
 ## Get Started
 
@@ -32,11 +35,11 @@ The simplest way to set up EMQX is to create a managed deployment with EMQX Clou
 docker run -d --name emqx -p 1883:1883 -p 8083:8083 -p 8084:8084 -p 8883:8883 -p 18083:18083 emqx/emqx:latest
 ```
 
-Next, please follow the [Deploy with Docker](https://www.emqx.io/docs/en/v5.1/deploy/install-docker.html) guide for further instructions.
+Next, please follow the [Install EMQX Using Docker](https://docs.emqx.com/en/emqx/latest/deploy/install-docker-ce.html) guide for further instructions.
 
-#### Run EMQX cluster on kubernetes
+#### Run EMQX cluster on Kubernetes
 
-Please consult official [EMQX Operator](https://github.com/emqx/emqx-operator/blob/main/docs/en_US/getting-started/getting-started.md) documentation for details.
+Please consult official [EMQX Operator](https://docs.emqx.com/en/emqx-operator/latest/getting-started/getting-started.html) documentation for details.
 
 #### Run EMQX on macOS
 
@@ -49,19 +52,19 @@ emqx start
 
 #### More installation options
 
-If you prefer to install and manage EMQX yourself, you can download the latest version from [www.emqx.io/downloads](https://www.emqx.io/downloads).
+If you prefer to install and manage EMQX yourself, you can download the latest version from [the official site](https://www.emqx.com/en/downloads-and-install/broker).
 
-For more installation options, see the [EMQX installation documentation](https://www.emqx.io/docs/en/v5.1/deploy/install.html).
+For more installation options, see the [EMQX installation documentation](https://docs.emqx.com/en/emqx/latest/deploy/install-open-source.html).
 
 ## Documentation
 
-The EMQX documentation is available at [www.emqx.io/docs/en/latest/](https://www.emqx.io/docs/en/latest/).
+The EMQX documentation is available at [docs.emqx.com/en/emqx/latest](https://docs.emqx.com/en/emqx/latest/).
 
-The EMQX Enterprise documentation is available at [docs.emqx.com/en/](https://docs.emqx.com/en/).
+The EMQX Cloud documentation is available at [docs.emqx.com/en/cloud/latest](https://docs.emqx.com/en/cloud/latest/).
 
 ## Contributing
 
-Please see our [contributing.md](./CONTRIBUTING.md).
+Please see our [contributing guide](./CONTRIBUTING.md).
 
 For more organised improvement proposals, you can send pull requests to [EIP](https://github.com/emqx/eip).
 
@@ -75,7 +78,7 @@ For more organised improvement proposals, you can send pull requests to [EIP](ht
 
 ## Resources
 
-- [MQTT client programming](https://www.emqx.com/en/blog/tag/mqtt-client-programming)
+- [MQTT client programming](https://www.emqx.com/en/blog/category/mqtt-programming)
 
   A series of blogs to help developers get started quickly with MQTT in PHP, Node.js, Python, Golang, and other programming languages.
 
@@ -95,7 +98,9 @@ For more organised improvement proposals, you can send pull requests to [EIP](ht
 
 The `master` branch tracks the latest version 5. For version 4.4 checkout the `main-v4.4` branch.
 
-EMQX 4.4 requires OTP 24. EMQX 5.0 and 5.1 can be built with OTP 24 or 25.
+* EMQX 4.4 requires OTP 24.
+* EMQX 5.0 ~ 5.3 can be built with OTP 24 or 25.
+* EMQX 5.4 and newer can be built with OTP 25 or 26.
 
 ```bash
 git clone https://github.com/emqx/emqx.git
@@ -112,6 +117,36 @@ cd emqx-rel
 make
 _build/emqx/rel/emqx/bin/emqx console
 ```
+
+## Rolling Upgrade Paths Since 5.0
+
+Below is the matrix supported rolling upgrade paths since 5.0.
+
+- Version numbers end with `?` e.g. `6.0?` are future releases.
+- ✅: Supported, or planed to support.
+- ⚠️:  May experience issues, require manual resolution.
+- ❌: Not supported.
+- 🔄: Tentative support for future versions.
+
+See release notes for detailed information.
+
+| From\To  | 5.1  | 5.2  | 5.3  | 5.4  | 5.5  | 5.6  | 5.7  | 5.8  | 5.9?  | 5.10? | 6.0?  |
+|----------|------|------|------|------|------|------|------|------|-------|-------|-------|
+| 5.0      | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ⚠️[1]  | ❌[2] | ❌[2] |
+| 5.1      | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅    | ❌[2] | ❌[2] |
+| 5.2      |      | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅    | ❌[2] | ❌[2] |
+| 5.3      |      |      | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅    | ❌[2] | ❌[2] |
+| 5.4      |      |      |      | ✅   | ✅   | ⚠️    | ✅   | ✅   | ✅    | ✅    | 🔄    |
+| 5.5      |      |      |      |      | ✅   | ⚠️    | ✅   | ✅   | ✅    | ✅    | 🔄    |
+| 5.6      |      |      |      |      |      | ✅   | ✅   | ✅   | ✅    | ✅    | 🔄    |
+| 5.7      |      |      |      |      |      |      | ✅   | ✅   | ✅    | ✅    | 🔄    |
+| 5.8      |      |      |      |      |      |      |      | ✅   | ✅    | ✅    | 🔄    |
+| 5.9?     |      |      |      |      |      |      |      |      | ✅    | ✅    | ✅    |
+| 5.10?    |      |      |      |      |      |      |      |      |       | ✅    | ✅    |
+| 6.0?     |      |      |      |      |      |      |      |      |       |       | ✅    |
+
+- [1] Old limiter configs should be deleted from the config files (`etc/emqx.conf` and `data/configs/cluster-override.conf`) before upgrade.
+- [2] Pre-5.4 routing table will be deleted. Upgrade to 5.9 first, then perform a full-cluster restart (not rolling) before upgrade to 5.10 or later.
 
 ## License
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,23 +16,34 @@
 
 -module(emqx_bridge_http_connector).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
 
 -behaviour(emqx_resource).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
     on_query/3,
     on_query_async/4,
     on_get_status/2,
-    reply_delegator/3
+    on_get_status/3,
+    on_add_channel/4,
+    on_remove_channel/3,
+    on_get_channels/1,
+    on_get_channel_status/3,
+    on_format_query_result/1
 ]).
+
+-export([reply_delegator/3]).
+-export([render_template/2]).
 
 -export([
     roots/0,
@@ -41,26 +52,20 @@
     namespace/0
 ]).
 
-%% for other webhook-like connectors.
+%% for other http-like connectors.
 -export([redact_request/1]).
 
--export([validate_method/1, join_paths/2]).
-
--type connect_timeout() :: emqx_schema:duration() | infinity.
--type pool_type() :: random | hash.
-
--reflect_type([
-    connect_timeout/0,
-    pool_type/0
-]).
+-export([validate_method/1, join_paths/2, formalize_request/2, transform_result/1]).
 
 -define(DEFAULT_PIPELINE_SIZE, 100).
 -define(DEFAULT_REQUEST_TIMEOUT_MS, 30_000).
 
+-define(READACT_REQUEST_NOTE, "the request body is redacted due to security reasons").
+
 %%=====================================================================
 %% Hocon schema
 
-namespace() -> "connector-http".
+namespace() -> "connector_http".
 
 roots() ->
     fields(config).
@@ -87,7 +92,7 @@ fields(config) ->
             )},
         {pool_type,
             sc(
-                pool_type(),
+                hoconsc:enum([random, hash]),
                 #{
                     default => random,
                     desc => ?DESC("pool_type")
@@ -127,9 +132,10 @@ fields("request") ->
                 desc => ?DESC("method"),
                 validator => fun ?MODULE:validate_method/1
             })},
-        {path, hoconsc:mk(binary(), #{required => false, desc => ?DESC("path")})},
-        {body, hoconsc:mk(binary(), #{required => false, desc => ?DESC("body")})},
-        {headers, hoconsc:mk(map(), #{required => false, desc => ?DESC("headers")})},
+        {path, hoconsc:mk(emqx_schema:template(), #{required => false, desc => ?DESC("path")})},
+        {body, hoconsc:mk(emqx_schema:template(), #{required => false, desc => ?DESC("body")})},
+        {headers,
+            hoconsc:mk(map(), #{required => false, desc => ?DESC("headers"), is_template => true})},
         {max_retries,
             sc(
                 non_neg_integer(),
@@ -179,17 +185,17 @@ sc(Type, Meta) -> hoconsc:mk(Type, Meta).
 ref(Field) -> hoconsc:ref(?MODULE, Field).
 
 %% ===================================================================
+resource_type() -> webhook.
 
 callback_mode() -> async_if_possible.
 
 on_start(
     InstId,
     #{
-        base_url := #{
+        request_base := #{
             scheme := Scheme,
             host := Host,
-            port := Port,
-            path := BasePath
+            port := Port
         },
         connect_timeout := ConnectTimeout,
         pool_type := PoolType,
@@ -206,7 +212,9 @@ on_start(
             http ->
                 {tcp, []};
             https ->
-                SSLOpts = emqx_tls_lib:to_client_opts(maps:get(ssl, Config)),
+                SSLConf = maps:get(ssl, Config),
+                %% force enable ssl
+                SSLOpts = emqx_tls_lib:to_client_opts(SSLConf#{enable => true}),
                 {tls, SSLOpts}
         end,
     NTransportOpts = emqx_utils:ipv6_probe(TransportOpts),
@@ -221,14 +229,16 @@ on_start(
         {transport_opts, NTransportOpts},
         {enable_pipelining, maps:get(enable_pipelining, Config, ?DEFAULT_PIPELINE_SIZE)}
     ],
+
     State = #{
         pool_name => InstId,
         pool_type => PoolType,
         host => Host,
         port => Port,
         connect_timeout => ConnectTimeout,
-        base_path => BasePath,
-        request => preprocess_request(maps:get(request, Config, undefined))
+        scheme => Scheme,
+        request => preprocess_request(maps:get(request, Config, undefined)),
+        installed_actions => #{}
     },
     case start_pool(InstId, PoolOpts) of
         ok ->
@@ -250,12 +260,30 @@ start_pool(PoolName, PoolOpts) ->
         {error, {already_started, _}} ->
             ?SLOG(warning, #{
                 msg => "emqx_connector_on_start_already_started",
+                connector => PoolName,
                 pool_name => PoolName
             }),
             ok;
         Error ->
             Error
     end.
+
+on_add_channel(
+    _InstId,
+    OldState,
+    ActionId,
+    ActionConfig
+) ->
+    InstalledActions = maps:get(installed_actions, OldState, #{}),
+    {ok, ActionState} = do_create_http_action(ActionConfig),
+    RenderTmplFunc = maps:get(render_template_func, ActionConfig, fun ?MODULE:render_template/2),
+    ActionState1 = ActionState#{render_template_func => RenderTmplFunc},
+    NewInstalledActions = maps:put(ActionId, ActionState1, InstalledActions),
+    NewState = maps:put(installed_actions, NewInstalledActions, OldState),
+    {ok, NewState}.
+
+do_create_http_action(_ActionConfig = #{parameters := Params}) ->
+    {ok, preprocess_request(Params)}.
 
 on_stop(InstId, _State) ->
     ?SLOG(info, #{
@@ -266,6 +294,16 @@ on_stop(InstId, _State) ->
     ?tp(emqx_connector_http_stopped, #{instance_id => InstId}),
     Res.
 
+on_remove_channel(
+    _InstId,
+    OldState = #{installed_actions := InstalledActions},
+    ActionId
+) ->
+    NewInstalledActions = maps:remove(ActionId, InstalledActions),
+    NewState = maps:put(installed_actions, NewInstalledActions, OldState),
+    {ok, NewState}.
+
+%% BridgeV1 entrypoint
 on_query(InstId, {send_message, Msg}, State) ->
     case maps:get(request, State, undefined) of
         undefined ->
@@ -284,31 +322,64 @@ on_query(InstId, {send_message, Msg}, State) ->
             ClientId = maps:get(clientid, Msg, undefined),
             on_query(
                 InstId,
-                {ClientId, Method, {Path, Headers, Body}, Timeout, Retry},
+                {undefined, ClientId, Method, {Path, Headers, Body}, Timeout, Retry},
+                State
+            )
+    end;
+%% BridgeV2 entrypoint
+on_query(
+    InstId,
+    {ActionId, Msg},
+    State = #{installed_actions := InstalledActions}
+) when is_binary(ActionId) ->
+    case {maps:get(request, State, undefined), maps:get(ActionId, InstalledActions, undefined)} of
+        {undefined, _} ->
+            ?SLOG(error, #{msg => "arg_request_not_found", connector => InstId}),
+            {error, arg_request_not_found};
+        {_, undefined} ->
+            ?SLOG(error, #{msg => "action_not_found", connector => InstId, action_id => ActionId}),
+            {error, action_not_found};
+        {Request, ActionState} ->
+            #{
+                method := Method,
+                path := Path,
+                body := Body,
+                headers := Headers,
+                request_timeout := Timeout
+            } = process_request_and_action(Request, ActionState, Msg),
+            %% bridge buffer worker has retry, do not let ehttpc retry
+            Retry = 2,
+            ClientId = clientid(Msg),
+            on_query(
+                InstId,
+                {ActionId, ClientId, Method, {Path, Headers, Body}, Timeout, Retry},
                 State
             )
     end;
 on_query(InstId, {Method, Request}, State) ->
     %% TODO: Get retry from State
-    on_query(InstId, {undefined, Method, Request, 5000, _Retry = 2}, State);
+    on_query(InstId, {undefined, undefined, Method, Request, 5000, _Retry = 2}, State);
 on_query(InstId, {Method, Request, Timeout}, State) ->
     %% TODO: Get retry from State
-    on_query(InstId, {undefined, Method, Request, Timeout, _Retry = 2}, State);
+    on_query(InstId, {undefined, undefined, Method, Request, Timeout, _Retry = 2}, State);
 on_query(
     InstId,
-    {KeyOrNum, Method, Request, Timeout, Retry},
-    #{base_path := BasePath} = State
+    {ActionId, KeyOrNum, Method, Request, Timeout, Retry},
+    #{host := Host, port := Port, scheme := Scheme} = State
 ) ->
     ?TRACE(
         "QUERY",
         "http_connector_received",
         #{
-            request => redact(Request),
+            request => redact_request(Request),
+            note => ?READACT_REQUEST_NOTE,
             connector => InstId,
+            action_id => ActionId,
             state => redact(State)
         }
     ),
-    NRequest = formalize_request(Method, BasePath, Request),
+    NRequest = formalize_request(Method, Request),
+    trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout),
     Worker = resolve_pool_worker(State, KeyOrNum),
     Result0 = ehttpc:request(
         Worker,
@@ -328,8 +399,8 @@ on_query(
             {error, {recoverable_error, Reason}};
         {error, #{status_code := StatusCode}} ->
             ?SLOG(error, #{
-                msg => "http connector do request, received error response.",
-                note => "the body will be redacted due to security reasons",
+                msg => "http_connector_do_request_received_error_response",
+                note => ?READACT_REQUEST_NOTE,
                 request => redact_request(NRequest),
                 connector => InstId,
                 status_code => StatusCode
@@ -338,7 +409,8 @@ on_query(
         {error, Reason} ->
             ?SLOG(error, #{
                 msg => "http_connector_do_request_failed",
-                request => redact(NRequest),
+                note => ?READACT_REQUEST_NOTE,
+                request => redact_request(NRequest),
                 reason => Reason,
                 connector => InstId
             }),
@@ -347,6 +419,7 @@ on_query(
             Result
     end.
 
+%% BridgeV1 entrypoint
 on_query_async(InstId, {send_message, Msg}, ReplyFunAndArgs, State) ->
     case maps:get(request, State, undefined) of
         undefined ->
@@ -363,28 +436,60 @@ on_query_async(InstId, {send_message, Msg}, ReplyFunAndArgs, State) ->
             ClientId = maps:get(clientid, Msg, undefined),
             on_query_async(
                 InstId,
-                {ClientId, Method, {Path, Headers, Body}, Timeout},
+                {undefined, ClientId, Method, {Path, Headers, Body}, Timeout},
+                ReplyFunAndArgs,
+                State
+            )
+    end;
+%% BridgeV2 entrypoint
+on_query_async(
+    InstId,
+    {ActionId, Msg},
+    ReplyFunAndArgs,
+    State = #{installed_actions := InstalledActions}
+) when is_binary(ActionId) ->
+    case {maps:get(request, State, undefined), maps:get(ActionId, InstalledActions, undefined)} of
+        {undefined, _} ->
+            ?SLOG(error, #{msg => "arg_request_not_found", connector => InstId}),
+            {error, arg_request_not_found};
+        {_, undefined} ->
+            ?SLOG(error, #{msg => "action_not_found", connector => InstId, action_id => ActionId}),
+            {error, action_not_found};
+        {Request, ActionState} ->
+            #{
+                method := Method,
+                path := Path,
+                body := Body,
+                headers := Headers,
+                request_timeout := Timeout
+            } = process_request_and_action(Request, ActionState, Msg),
+            ClientId = clientid(Msg),
+            on_query_async(
+                InstId,
+                {ActionId, ClientId, Method, {Path, Headers, Body}, Timeout},
                 ReplyFunAndArgs,
                 State
             )
     end;
 on_query_async(
     InstId,
-    {KeyOrNum, Method, Request, Timeout},
+    {ActionId, KeyOrNum, Method, Request, Timeout},
     ReplyFunAndArgs,
-    #{base_path := BasePath} = State
+    #{host := Host, port := Port, scheme := Scheme} = State
 ) ->
     Worker = resolve_pool_worker(State, KeyOrNum),
     ?TRACE(
         "QUERY_ASYNC",
         "http_connector_received",
         #{
-            request => redact(Request),
+            request => redact_request(Request),
+            note => ?READACT_REQUEST_NOTE,
             connector => InstId,
             state => redact(State)
         }
     ),
-    NRequest = formalize_request(Method, BasePath, Request),
+    NRequest = formalize_request(Method, Request),
+    trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout),
     MaxAttempts = maps:get(max_attempts, State, 3),
     Context = #{
         attempt => 1,
@@ -393,7 +498,8 @@ on_query_async(
         key_or_num => KeyOrNum,
         method => Method,
         request => NRequest,
-        timeout => Timeout
+        timeout => Timeout,
+        trace_metadata => logger:get_process_metadata()
     },
     ok = ehttpc:request_async(
         Worker,
@@ -403,6 +509,71 @@ on_query_async(
         {fun ?MODULE:reply_delegator/3, [Context, ReplyFunAndArgs]}
     ),
     {ok, Worker}.
+
+trace_rendered_action_template(ActionId, Scheme, Host, Port, Method, NRequest, Timeout) ->
+    case NRequest of
+        {Path, Headers} ->
+            emqx_trace:rendered_action_template(
+                ActionId,
+                #{
+                    host => Host,
+                    port => Port,
+                    path => Path,
+                    method => Method,
+                    headers => #emqx_trace_format_func_data{
+                        function = fun emqx_utils_redact:redact_headers/1,
+                        data = Headers
+                    },
+                    timeout => Timeout,
+                    url => #emqx_trace_format_func_data{
+                        function = fun render_url/1,
+                        data = {Scheme, Host, Port, Path}
+                    }
+                }
+            );
+        {Path, Headers, Body} ->
+            emqx_trace:rendered_action_template(
+                ActionId,
+                #{
+                    host => Host,
+                    port => Port,
+                    path => Path,
+                    method => Method,
+                    headers => #emqx_trace_format_func_data{
+                        function = fun emqx_utils_redact:redact_headers/1,
+                        data = Headers
+                    },
+                    timeout => Timeout,
+                    body => #emqx_trace_format_func_data{
+                        function = fun log_format_body/1,
+                        data = Body
+                    },
+                    url => #emqx_trace_format_func_data{
+                        function = fun render_url/1,
+                        data = {Scheme, Host, Port, Path}
+                    }
+                }
+            )
+    end.
+
+render_url({Scheme, Host, Port, Path}) ->
+    SchemeStr =
+        case Scheme of
+            http ->
+                <<"http://">>;
+            https ->
+                <<"https://">>
+        end,
+    unicode:characters_to_binary([
+        SchemeStr,
+        Host,
+        <<":">>,
+        erlang:integer_to_binary(Port),
+        Path
+    ]).
+
+log_format_body(Body) ->
+    unicode:characters_to_binary(Body).
 
 resolve_pool_worker(State, undefined) ->
     resolve_pool_worker(State, self());
@@ -414,50 +585,86 @@ resolve_pool_worker(#{pool_name := PoolName} = State, Key) ->
             ehttpc_pool:pick_worker(PoolName, Key)
     end.
 
-on_get_status(_InstId, #{pool_name := PoolName, connect_timeout := Timeout} = State) ->
-    case do_get_status(PoolName, Timeout) of
+on_get_channels(ResId) ->
+    emqx_bridge_v2:get_channels_for_connector(ResId).
+
+on_get_status(InstId, State) ->
+    on_get_status(InstId, State, fun default_health_checker/2).
+
+on_get_status(InstId, #{pool_name := InstId, connect_timeout := Timeout}, DoPerWorker) ->
+    case do_get_status(InstId, Timeout, DoPerWorker) of
         ok ->
-            connected;
+            ?status_connected;
         {error, still_connecting} ->
-            connecting;
+            ?status_connecting;
         {error, Reason} ->
-            {disconnected, State, Reason}
+            {?status_disconnected, Reason}
     end.
 
 do_get_status(PoolName, Timeout) ->
+    do_get_status(PoolName, Timeout, fun default_health_checker/2).
+
+do_get_status(PoolName, Timeout, DoPerWorker) ->
     Workers = [Worker || {_WorkerName, Worker} <- ehttpc:workers(PoolName)],
-    DoPerWorker =
-        fun(Worker) ->
-            case ehttpc:health_check(Worker, Timeout) of
-                ok ->
-                    ok;
-                {error, Reason} = Error ->
-                    ?SLOG(error, #{
-                        msg => "http_connector_get_status_failed",
-                        reason => redact(Reason),
-                        worker => Worker
-                    }),
-                    Error
-            end
-        end,
-    try emqx_utils:pmap(DoPerWorker, Workers, Timeout) of
+    try emqx_utils:pmap(fun(Worker) -> DoPerWorker(Worker, Timeout) end, Workers, Timeout) of
         [] ->
             {error, still_connecting};
         [_ | _] = Results ->
             case [E || {error, _} = E <- Results] of
                 [] ->
                     ok;
-                Errors ->
-                    hd(Errors)
+                [{error, Reason} | _] ->
+                    ?SLOG(info, #{
+                        msg => "health_check_failed",
+                        reason => redact(Reason),
+                        connector => PoolName
+                    }),
+                    {error, Reason}
             end
     catch
         exit:timeout ->
-            ?SLOG(error, #{
-                msg => "http_connector_pmap_failed",
-                reason => timeout
+            ?SLOG(info, #{
+                msg => "health_check_failed",
+                reason => timeout,
+                connector => PoolName
             }),
             {error, timeout}
     end.
+
+default_health_checker(Worker, Timeout) ->
+    case ehttpc:health_check(Worker, Timeout) of
+        ok ->
+            ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+on_get_channel_status(
+    InstId,
+    _ChannelId,
+    State
+) ->
+    on_get_status(InstId, State, fun default_health_checker/2).
+
+on_format_query_result({ok, Status, Headers, Body}) ->
+    #{
+        result => ok,
+        response => #{
+            status => Status,
+            headers => Headers,
+            body => Body
+        }
+    };
+on_format_query_result({ok, Status, Headers}) ->
+    #{
+        result => ok,
+        response => #{
+            status => Status,
+            headers => Headers
+        }
+    };
+on_format_query_result(Result) ->
+    Result.
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -466,69 +673,51 @@ preprocess_request(undefined) ->
     undefined;
 preprocess_request(Req) when map_size(Req) == 0 ->
     undefined;
-preprocess_request(
+preprocess_request(#{method := Method} = Req) ->
+    Path = maps:get(path, Req, <<>>),
+    Headers = maps:get(headers, Req, []),
     #{
-        method := Method,
-        path := Path,
-        headers := Headers
-    } = Req
-) ->
-    #{
-        method => emqx_placeholder:preproc_tmpl(to_bin(Method)),
-        path => emqx_placeholder:preproc_tmpl(Path),
-        body => maybe_preproc_tmpl(body, Req),
-        headers => wrap_auth_header(preproc_headers(Headers)),
+        method => parse_template(to_bin(Method)),
+        path => parse_template(Path),
+        body => maybe_parse_template(body, Req),
+        headers => parse_headers(Headers),
         request_timeout => maps:get(request_timeout, Req, ?DEFAULT_REQUEST_TIMEOUT_MS),
         max_retries => maps:get(max_retries, Req, 2)
     }.
 
-preproc_headers(Headers) when is_map(Headers) ->
+parse_headers(Headers) when is_map(Headers) ->
     maps:fold(
-        fun(K, V, Acc) ->
-            [
-                {
-                    emqx_placeholder:preproc_tmpl(to_bin(K)),
-                    emqx_placeholder:preproc_tmpl(to_bin(V))
-                }
-                | Acc
-            ]
-        end,
+        fun(K, V, Acc) -> [parse_header(K, V) | Acc] end,
         [],
         Headers
     );
-preproc_headers(Headers) when is_list(Headers) ->
+parse_headers(Headers) when is_list(Headers) ->
     lists:map(
-        fun({K, V}) ->
-            {
-                emqx_placeholder:preproc_tmpl(to_bin(K)),
-                emqx_placeholder:preproc_tmpl(to_bin(V))
-            }
-        end,
+        fun({K, V}) -> parse_header(K, V) end,
         Headers
     ).
 
-wrap_auth_header(Headers) ->
-    lists:map(fun maybe_wrap_auth_header/1, Headers).
+parse_header(K, V) ->
+    KStr = to_bin(K),
+    VTpl = parse_template(to_bin(V)),
+    {parse_template(KStr), maybe_wrap_auth_header(KStr, VTpl)}.
 
-maybe_wrap_auth_header({[{str, Key}] = StrKey, Val}) ->
-    {_, MaybeWrapped} = maybe_wrap_auth_header({Key, Val}),
-    {StrKey, MaybeWrapped};
-maybe_wrap_auth_header({Key, Val} = Header) when
-    is_binary(Key), (size(Key) =:= 19 orelse size(Key) =:= 13)
+maybe_wrap_auth_header(Key, VTpl) when
+    (byte_size(Key) =:= 19 orelse byte_size(Key) =:= 13)
 ->
     %% We check the size of potential keys in the guard above and consider only
     %% those that match the number of characters of either "Authorization" or
     %% "Proxy-Authorization".
     case try_bin_to_lower(Key) of
         <<"authorization">> ->
-            {Key, emqx_secret:wrap(Val)};
+            emqx_secret:wrap(VTpl);
         <<"proxy-authorization">> ->
-            {Key, emqx_secret:wrap(Val)};
+            emqx_secret:wrap(VTpl);
         _Other ->
-            Header
+            VTpl
     end;
-maybe_wrap_auth_header(Header) ->
-    Header.
+maybe_wrap_auth_header(_Key, VTpl) ->
+    VTpl.
 
 try_bin_to_lower(Bin) ->
     try iolist_to_binary(string:lowercase(Bin)) of
@@ -537,50 +726,100 @@ try_bin_to_lower(Bin) ->
         _:_ -> Bin
     end.
 
-maybe_preproc_tmpl(Key, Conf) ->
+maybe_parse_template(Key, Conf) ->
     case maps:get(Key, Conf, undefined) of
         undefined -> undefined;
-        Val -> emqx_placeholder:preproc_tmpl(Val)
+        Val -> parse_template(Val)
     end.
+
+parse_template(String) ->
+    emqx_template:parse(String).
+
+process_request_and_action(Request, ActionState, Msg) ->
+    MethodTemplate = maps:get(method, ActionState),
+    RenderTmplFunc = maps:get(render_template_func, ActionState),
+    Method = make_method(render_template_string(MethodTemplate, RenderTmplFunc, Msg)),
+    PathPrefix = unicode:characters_to_list(RenderTmplFunc(maps:get(path, Request), Msg)),
+    PathSuffix = unicode:characters_to_list(RenderTmplFunc(maps:get(path, ActionState), Msg)),
+
+    Path =
+        case PathSuffix of
+            "" -> PathPrefix;
+            _ -> join_paths(PathPrefix, PathSuffix)
+        end,
+
+    ActionHaders = maps:get(headers, ActionState),
+    BaseHeaders = maps:get(headers, Request),
+    Headers = merge_headers(
+        render_headers(ActionHaders, RenderTmplFunc, Msg),
+        render_headers(BaseHeaders, RenderTmplFunc, Msg)
+    ),
+    BodyTemplate = maps:get(body, ActionState),
+    Body = render_request_body(BodyTemplate, RenderTmplFunc, Msg),
+    #{
+        method => Method,
+        path => Path,
+        body => Body,
+        headers => Headers,
+        request_timeout => maps:get(request_timeout, ActionState)
+    }.
+
+merge_headers([], Result) ->
+    Result;
+merge_headers([{K, V} | Rest], Result) ->
+    R = lists:keydelete(K, 1, Result),
+    merge_headers(Rest, [{K, V} | R]).
 
 process_request(
     #{
-        method := MethodTks,
-        path := PathTks,
-        body := BodyTks,
-        headers := HeadersTks,
+        method := MethodTemplate,
+        path := PathTemplate,
+        body := BodyTemplate,
+        headers := HeadersTemplate,
         request_timeout := ReqTimeout
     } = Conf,
     Msg
 ) ->
+    RenderTemplateFun = fun render_template/2,
     Conf#{
-        method => make_method(emqx_placeholder:proc_tmpl(MethodTks, Msg)),
-        path => emqx_placeholder:proc_tmpl(PathTks, Msg),
-        body => process_request_body(BodyTks, Msg),
-        headers => proc_headers(HeadersTks, Msg),
+        method => make_method(render_template_string(MethodTemplate, RenderTemplateFun, Msg)),
+        path => unicode:characters_to_list(RenderTemplateFun(PathTemplate, Msg)),
+        body => render_request_body(BodyTemplate, RenderTemplateFun, Msg),
+        headers => render_headers(HeadersTemplate, RenderTemplateFun, Msg),
         request_timeout => ReqTimeout
     }.
 
-process_request_body(undefined, Msg) ->
+render_request_body(undefined, _, Msg) ->
     emqx_utils_json:encode(Msg);
-process_request_body(BodyTks, Msg) ->
-    emqx_placeholder:proc_tmpl(BodyTks, Msg).
+render_request_body(BodyTks, RenderTmplFunc, Msg) ->
+    RenderTmplFunc(BodyTks, Msg).
 
-proc_headers(HeaderTks, Msg) ->
+render_headers(HeaderTks, RenderTmplFunc, Msg) ->
     lists:map(
         fun({K, V}) ->
             {
-                emqx_placeholder:proc_tmpl(K, Msg),
-                emqx_placeholder:proc_tmpl(emqx_secret:unwrap(V), Msg)
+                render_template_string(K, RenderTmplFunc, Msg),
+                render_template_string(emqx_secret:unwrap(V), RenderTmplFunc, Msg)
             }
         end,
         HeaderTks
     ).
 
+render_template(Template, Msg) ->
+    % NOTE: ignoring errors here, missing variables will be rendered as `"undefined"`.
+    {String, _Errors} = emqx_template:render(Template, {emqx_jsonish, Msg}),
+    String.
+
+render_template_string(Template, RenderTmplFunc, Msg) ->
+    unicode:characters_to_binary(RenderTmplFunc(Template, Msg)).
+
 make_method(M) when M == <<"POST">>; M == <<"post">> -> post;
 make_method(M) when M == <<"PUT">>; M == <<"put">> -> put;
 make_method(M) when M == <<"GET">>; M == <<"get">> -> get;
 make_method(M) when M == <<"DELETE">>; M == <<"delete">> -> delete.
+
+formalize_request(Method, Request) ->
+    formalize_request(Method, "/", Request).
 
 formalize_request(Method, BasePath, {Path, Headers, _Body}) when
     Method =:= get; Method =:= delete
@@ -595,27 +834,59 @@ formalize_request(_Method, BasePath, {Path, Headers}) ->
 %% because an HTTP server may handle paths like
 %% "/a/b/c/", "/a/b/c" and "/a//b/c" differently.
 %%
-%% So we try to avoid unneccessary path normalization.
+%% So we try to avoid unnecessary path normalization.
 %%
 %% See also: `join_paths_test_/0`
 join_paths(Path1, Path2) ->
-    do_join_paths(lists:reverse(to_list(Path1)), to_list(Path2)).
+    case is_start_with_question_mark(Path2) of
+        true ->
+            [Path1, Path2];
+        false ->
+            [without_trailing_slash(Path1), $/, without_starting_slash(Path2)]
+    end.
 
-%% "abc/" + "/cde"
-do_join_paths([$/ | Path1], [$/ | Path2]) ->
-    lists:reverse(Path1) ++ [$/ | Path2];
-%% "abc/" + "cde"
-do_join_paths([$/ | Path1], Path2) ->
-    lists:reverse(Path1) ++ [$/ | Path2];
-%% "abc" + "/cde"
-do_join_paths(Path1, [$/ | Path2]) ->
-    lists:reverse(Path1) ++ [$/ | Path2];
-%% "abc" + "cde"
-do_join_paths(Path1, Path2) ->
-    lists:reverse(Path1) ++ [$/ | Path2].
+is_start_with_question_mark([$? | _]) ->
+    true;
+is_start_with_question_mark(<<$?, _/binary>>) ->
+    true;
+is_start_with_question_mark(_) ->
+    false.
 
-to_list(List) when is_list(List) -> List;
-to_list(Bin) when is_binary(Bin) -> binary_to_list(Bin).
+without_starting_slash(Path) ->
+    case do_without_starting_slash(Path) of
+        empty -> <<>>;
+        Other -> Other
+    end.
+
+do_without_starting_slash([]) ->
+    empty;
+do_without_starting_slash(<<>>) ->
+    empty;
+do_without_starting_slash([$/ | Rest]) ->
+    Rest;
+do_without_starting_slash([C | _Rest] = Path) when is_integer(C) andalso C =/= $/ ->
+    Path;
+do_without_starting_slash(<<$/, Rest/binary>>) ->
+    Rest;
+do_without_starting_slash(<<C, _Rest/binary>> = Path) when is_integer(C) andalso C =/= $/ ->
+    Path;
+%% On actual lists the recursion should very quickly exhaust
+do_without_starting_slash([El | Rest]) ->
+    case do_without_starting_slash(El) of
+        empty -> do_without_starting_slash(Rest);
+        ElRest -> [ElRest | Rest]
+    end.
+
+without_trailing_slash(Path) ->
+    case iolist_to_binary(Path) of
+        <<>> ->
+            <<>>;
+        B ->
+            case binary:last(B) of
+                $/ -> binary_part(B, 0, byte_size(B) - 1);
+                _ -> B
+            end
+    end.
 
 to_bin(Bin) when is_binary(Bin) ->
     Bin;
@@ -624,9 +895,15 @@ to_bin(Str) when is_list(Str) ->
 to_bin(Atom) when is_atom(Atom) ->
     atom_to_binary(Atom, utf8).
 
-reply_delegator(Context, ReplyFunAndArgs, Result0) ->
+reply_delegator(
+    #{trace_metadata := TraceMetadata} = Context,
+    ReplyFunAndArgs,
+    Result0
+) ->
     spawn(fun() ->
+        logger:set_process_metadata(TraceMetadata),
         Result = transform_result(Result0),
+        logger:unset_process_metadata(),
         maybe_retry(Result, Context, ReplyFunAndArgs)
     end).
 
@@ -634,16 +911,16 @@ transform_result(Result) ->
     case Result of
         %% The normal reason happens when the HTTP connection times out before
         %% the request has been fully processed
+        {error, {shutdown, Reason}} ->
+            transform_result({error, Reason});
         {error, Reason} when
             Reason =:= econnrefused;
             Reason =:= timeout;
             Reason =:= normal;
-            Reason =:= {shutdown, normal};
-            Reason =:= {shutdown, closed}
+            Reason =:= closed;
+            %% {closed, "The connection was lost."}
+            element(1, Reason) =:= closed
         ->
-            {error, {recoverable_error, Reason}};
-        {error, {closed, _Message} = Reason} ->
-            %% _Message = "The connection was lost."
             {error, {recoverable_error, Reason}};
         {error, _Reason} ->
             Result;
@@ -653,9 +930,16 @@ transform_result(Result) ->
             Result;
         {ok, _TooManyRequests = StatusCode = 429, Headers} ->
             {error, {recoverable_error, #{status_code => StatusCode, headers => Headers}}};
+        {ok, _ServiceUnavailable = StatusCode = 503, Headers} ->
+            {error, {recoverable_error, #{status_code => StatusCode, headers => Headers}}};
         {ok, StatusCode, Headers} ->
             {error, {unrecoverable_error, #{status_code => StatusCode, headers => Headers}}};
         {ok, _TooManyRequests = StatusCode = 429, Headers, Body} ->
+            {error,
+                {recoverable_error, #{
+                    status_code => StatusCode, headers => Headers, body => Body
+                }}};
+        {ok, _ServiceUnavailable = StatusCode = 503, Headers, Body} ->
             {error,
                 {recoverable_error, #{
                     status_code => StatusCode, headers => Headers, body => Body
@@ -697,7 +981,7 @@ maybe_retry({error, Reason}, Context, ReplyFunAndArgs) ->
             true -> Context;
             false -> Context#{attempt := Attempt + 1}
         end,
-    ?tp(webhook_will_retry_async, #{}),
+    ?tp(http_will_retry_async, #{}),
     Worker = resolve_pool_worker(State, KeyOrNum),
     ok = ehttpc:request_async(
         Worker,
@@ -710,80 +994,95 @@ maybe_retry({error, Reason}, Context, ReplyFunAndArgs) ->
 maybe_retry(Result, _Context, ReplyFunAndArgs) ->
     emqx_resource:apply_reply_fun(ReplyFunAndArgs, Result).
 
-%% The HOCON schema system may generate sensitive keys with this format
-is_sensitive_key([{str, StringKey}]) ->
-    is_sensitive_key(StringKey);
-is_sensitive_key(Atom) when is_atom(Atom) ->
-    is_sensitive_key(erlang:atom_to_binary(Atom));
-is_sensitive_key(Bin) when is_binary(Bin), (size(Bin) =:= 19 orelse size(Bin) =:= 13) ->
-    %% We want to convert this to lowercase since the http header fields
-    %% are case insensitive, which means that a user of the Webhook bridge
-    %% can write this field name in many different ways.
-    case try_bin_to_lower(Bin) of
-        <<"authorization">> -> true;
-        <<"proxy-authorization">> -> true;
-        _ -> false
-    end;
-is_sensitive_key(_) ->
-    false.
-
 %% Function that will do a deep traversal of Data and remove sensitive
 %% information (i.e., passwords)
 redact(Data) ->
-    emqx_utils:redact(Data, fun is_sensitive_key/1).
+    emqx_utils:redact(Data).
 
 %% because the body may contain some sensitive data
 %% and at the same time the redact function will not scan the binary data
 %% and we also can't know the body format and where the sensitive data will be
 %% so the easy way to keep data security is redacted the whole body
 redact_request({Path, Headers}) ->
-    {Path, redact(Headers)};
+    {Path, emqx_utils_redact:redact_headers(Headers)};
 redact_request({Path, Headers, _Body}) ->
-    {Path, redact(Headers), <<"******">>}.
+    {Path, emqx_utils_redact:redact_headers(Headers), <<"******">>}.
+
+clientid(Msg) -> maps:get(clientid, Msg, undefined).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-redact_test_() ->
-    TestData1 = [
-        {<<"content-type">>, <<"application/json">>},
-        {<<"Authorization">>, <<"Basic YWxhZGRpbjpvcGVuc2VzYW1l">>}
-    ],
+iolists_equal(L1, L2) ->
+    iolist_to_binary(L1) =:= iolist_to_binary(L2).
 
-    TestData2 = #{
-        headers =>
-            [
-                {[{str, <<"content-type">>}], [{str, <<"application/json">>}]},
-                {[{str, <<"Authorization">>}], [{str, <<"Basic YWxhZGRpbjpvcGVuc2VzYW1l">>}]}
-            ]
+redact_test_() ->
+    TestData = #{
+        headers => [
+            {<<"content-type">>, <<"application/json">>},
+            {<<"Authorization">>, <<"Basic YWxhZGRpbjpvcGVuc2VzYW1l">>}
+        ]
     },
     [
-        ?_assert(is_sensitive_key(<<"Authorization">>)),
-        ?_assert(is_sensitive_key(<<"AuthoriZation">>)),
-        ?_assert(is_sensitive_key('AuthoriZation')),
-        ?_assert(is_sensitive_key(<<"PrOxy-authoRizaTion">>)),
-        ?_assert(is_sensitive_key('PrOxy-authoRizaTion')),
-        ?_assertNot(is_sensitive_key(<<"Something">>)),
-        ?_assertNot(is_sensitive_key(89)),
-        ?_assertNotEqual(TestData1, redact(TestData1)),
-        ?_assertNotEqual(TestData2, redact(TestData2))
+        ?_assertNotEqual(TestData, redact(TestData))
     ].
 
 join_paths_test_() ->
     [
-        ?_assertEqual("abc/cde", join_paths("abc", "cde")),
-        ?_assertEqual("abc/cde", join_paths("abc", "/cde")),
-        ?_assertEqual("abc/cde", join_paths("abc/", "cde")),
-        ?_assertEqual("abc/cde", join_paths("abc/", "/cde")),
+        ?_assert(iolists_equal("abc/cde", join_paths("abc", "cde"))),
+        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc">>, <<"cde">>))),
+        ?_assert(
+            iolists_equal(
+                "abc/cde",
+                join_paths([["a"], <<"b">>, <<"c">>], [
+                    [[[], <<>>], <<>>, <<"c">>], <<"d">>, <<"e">>
+                ])
+            )
+        ),
 
-        ?_assertEqual("/", join_paths("", "")),
-        ?_assertEqual("/cde", join_paths("", "cde")),
-        ?_assertEqual("/cde", join_paths("", "/cde")),
-        ?_assertEqual("/cde", join_paths("/", "cde")),
-        ?_assertEqual("/cde", join_paths("/", "/cde")),
+        ?_assert(iolists_equal("abc/cde", join_paths("abc", "/cde"))),
+        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc">>, <<"/cde">>))),
+        ?_assert(
+            iolists_equal(
+                "abc/cde",
+                join_paths([["a"], <<"b">>, <<"c">>], [
+                    [<<>>, [[], <<>>], <<"/c">>], <<"d">>, <<"e">>
+                ])
+            )
+        ),
 
-        ?_assertEqual("//cde/", join_paths("/", "//cde/")),
-        ?_assertEqual("abc///cde/", join_paths("abc//", "//cde/"))
+        ?_assert(iolists_equal("abc/cde", join_paths("abc/", "cde"))),
+        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc/">>, <<"cde">>))),
+        ?_assert(
+            iolists_equal(
+                "abc/cde",
+                join_paths([["a"], <<"b">>, <<"c">>, [<<"/">>]], [
+                    [[[], [], <<>>], <<>>, [], <<"c">>], <<"d">>, <<"e">>
+                ])
+            )
+        ),
+
+        ?_assert(iolists_equal("abc/cde", join_paths("abc/", "/cde"))),
+        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc/">>, <<"/cde">>))),
+        ?_assert(
+            iolists_equal(
+                "abc/cde",
+                join_paths([["a"], <<"b">>, <<"c">>, [<<"/">>]], [
+                    [[[], <<>>], <<>>, [[$/]], <<"c">>], <<"d">>, <<"e">>
+                ])
+            )
+        ),
+
+        ?_assert(iolists_equal("/", join_paths("", ""))),
+        ?_assert(iolists_equal("/cde", join_paths("", "cde"))),
+        ?_assert(iolists_equal("/cde", join_paths("", "/cde"))),
+        ?_assert(iolists_equal("/cde", join_paths("/", "cde"))),
+        ?_assert(iolists_equal("/cde", join_paths("/", "/cde"))),
+        ?_assert(iolists_equal("//cde/", join_paths("/", "//cde/"))),
+        ?_assert(iolists_equal("abc///cde/", join_paths("abc//", "//cde/"))),
+        ?_assert(iolists_equal("abc?v=1", join_paths("abc", "?v=1"))),
+        ?_assert(iolists_equal("abc?v=1", join_paths("abc", <<"?v=1">>))),
+        ?_assert(iolists_equal("abc/?v=1", join_paths("abc/", <<"?v=1">>)))
     ].
 
 -endif.
